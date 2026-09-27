@@ -64,6 +64,245 @@ class TestCache(unittest.TestCase):
         self.assertLessEqual(len(bot.search_cache), bot._SEARCH_CACHE_MAX)
 
 
+class TestResultDeduplication(unittest.TestCase):
+    def test_ranking_prefers_full_title_and_author_match(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="B-Movie Gothic", author="Johan Hoglund", isbn="other"),
+            make_book(title="Goth", author="Otsuichi", isbn="match"),
+            make_book(title="The Goth Guide", author="Unknown Author", isbn="partial"),
+        ]
+
+        result = bot._rank_search_results(books, "Goth Otsuichi")
+
+        self.assertEqual(result[0]["isbn"], "match")
+
+    def test_ranking_prefers_exact_work_title_over_a_longer_containing_title(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="Encyclopedia of Crime and Punishment", author="David Levinson"),
+            make_book(title="Crime and Punishment", author="Fyodor Dostoevsky"),
+        ]
+
+        result = bot._rank_search_results(books, "Crime and Punishment")
+
+        self.assertEqual(result[0]["title"], "Crime and Punishment")
+
+    def test_single_character_transliteration_variant_merges_with_matching_initials(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="A Shared Work", author="J.R.R. Tolkein", isbn="one"),
+            make_book(title="A Shared Work", author="J. R. R. Tolkien", isbn="two"),
+        ]
+
+        result = bot._deduplicate_search_results(books, "A Shared Work")
+
+        self.assertEqual(len(result), 1)
+
+    def test_transliterated_author_variants_and_exact_duplicates_collapse(self):
+        bot = _make_bot()
+        books = [
+            make_book(
+                title="Crime and Punishment by Fyodor Dostoevsky (Illustrated)",
+                author="Fyodor Dostoevsky",
+                isbn="illustrated",
+            ),
+            make_book(
+                title="Crime and Punishment",
+                author="Fyodor Dostoyevsky",
+                isbn="variant-spelling",
+                search_rating=0,
+                search_rating_count=0,
+            ),
+            make_book(
+                title="Crime and Punishment",
+                author="Fyodor Dostoevsky",
+                isbn="copy-one",
+                search_rating=4.27,
+                search_rating_count=1824,
+                search_rating_formatted="4.27",
+            ),
+            make_book(
+                title="Crime and Punishment",
+                author="Fyodor Dostoevsky",
+                isbn="copy-two",
+                search_rating=4.27,
+                search_rating_count=1824,
+                search_rating_formatted="4.27",
+            ),
+            make_book(
+                title="Crime and Punishment (The Unabridged Garnett Translation)",
+                author="Fyodor Dostoevsky",
+                isbn="unabridged",
+            ),
+            make_book(
+                title="Crime and Punishment by Fyodor Dostoyevsky",
+                author="Fyodor Dostoevsky",
+                isbn="suffix-variant",
+            ),
+            make_book(
+                title="Encyclopedia of Crime and Punishment",
+                author="David Levinson",
+                isbn="encyclopedia",
+            ),
+            make_book(
+                title="Crime and Punishment Annotated",
+                author="Fyodor Dostoevsky",
+                isbn="annotated",
+            ),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Crime and Punishment")
+
+        # Keep the illustrated/unabridged/annotated editions and encyclopedia,
+        # while merging spelling variants and repeated copies of the same work.
+        self.assertEqual(len(result), 5)
+        canonical = next(book for book in result if book["title"] == "Crime and Punishment")
+        self.assertEqual(canonical["search_rating"], 4.27)
+        self.assertEqual(canonical["search_rating_count"], 1824)
+
+    def test_exact_title_author_duplicate_collapses_across_distinct_source_ids(self):
+        bot = _make_bot()
+        books = [
+            make_book(
+                title="Crime and Punishment",
+                author="Fyodor Dostoevsky",
+                isbn="111",
+                search_rating=4.27,
+                search_rating_count=1824,
+                search_rating_formatted="4.27",
+            ),
+            make_book(
+                title="Crime and Punishment",
+                author="Fyodor Dostoevsky",
+                isbn="222",
+                search_rating=4.27,
+                search_rating_count=1824,
+                search_rating_formatted="4.27",
+            ),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Crime and Punishment")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "Crime and Punishment")
+        self.assertEqual(result[0]["author"], "Fyodor Dostoevsky")
+        self.assertEqual(result[0]["search_rating"], 4.27)
+        self.assertEqual(result[0]["search_rating_count"], 1824)
+
+    def test_author_suffix_and_missing_rating_duplicate_are_merged(self):
+        bot = _make_bot()
+        books = [
+            {
+                "title": "Crime and Punishment by Fyodor Dostoyevsky",
+                "author": "Fyodor Dostoyevsky",
+                "isbn": "111",
+                "description": "A full description.",
+                "cover_url": "https://example.com/cover.jpg",
+                "rating": 0.0,
+                "rating_count": 0,
+                "rating_formatted": "N/A",
+            },
+            {
+                "title": "Crime and Punishment",
+                "author": "Fyodor Dostoyevsky",
+                "cover_url": "",
+                "search_rating": 4.27,
+                "search_rating_count": 1824,
+                "search_rating_formatted": "4.27",
+            },
+        ]
+
+        result = bot._deduplicate_search_results(books, "Crime and Punishment")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "Crime and Punishment")
+        self.assertEqual(result[0]["author"], "Fyodor Dostoyevsky")
+        self.assertEqual(result[0]["cover_url"], "https://example.com/cover.jpg")
+        self.assertEqual(result[0]["search_rating"], 4.27)
+        self.assertEqual(result[0]["search_rating_count"], 1824)
+        self.assertEqual(result[0]["isbn"], "111")
+        self.assertEqual(result[0]["description"], "A full description.")
+
+    def test_title_credit_punctuation_and_duplicate_author_tokens_normalize_generically(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="Pride and Prejudice", author="Jane Austen", isbn="plain"),
+            make_book(
+                title="Pride and Prejudice",
+                author="Jane Jane Austen",
+                isbn="metadata-copy",
+                search_rating=4.17,
+                search_rating_count=3244,
+                search_rating_formatted="4.17",
+            ),
+            make_book(title="Pride and Prejudice.Novel by", author="Jane Austen", isbn="tail-noise"),
+            make_book(title="Jane Austen - Pride and Prejudice", author="Jane Austen", isbn="author-prefix"),
+            make_book(title="Pride and Prejudice (Collins Classics)", author="Jane Austen", isbn="edition"),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Pride and Prejudice")
+
+        self.assertEqual(len(result), 2)
+        standard = next(book for book in result if book["title"] == "Pride and Prejudice")
+        self.assertEqual(standard["author"], "Jane Austen")
+        self.assertEqual(standard["search_rating"], 4.17)
+        self.assertEqual(standard["search_rating_count"], 3244)
+        self.assertTrue(any("Collins Classics" in book["title"] for book in result))
+
+    def test_unknown_author_copy_merges_only_when_title_has_one_known_author(self):
+        bot = _make_bot()
+        one_author = [
+            make_book(title="Harry Potter", author="Unknown Author", isbn="unknown"),
+            make_book(
+                title="Harry Potter",
+                author="S. Gunelius",
+                isbn="known",
+                search_rating=3.0,
+                search_rating_count=8,
+                search_rating_formatted="3.00",
+            ),
+        ]
+        merged = bot._deduplicate_search_results(one_author, "Harry Potter")
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["author"], "S. Gunelius")
+        self.assertEqual(merged[0]["search_rating"], 3.0)
+
+        ambiguous = [
+            make_book(title="The Gift", author="Author One", isbn="one"),
+            make_book(title="The Gift", author="Author Two", isbn="two"),
+            make_book(title="The Gift", author="Unknown Author", isbn="unknown"),
+        ]
+        preserved = bot._deduplicate_search_results(ambiguous, "The Gift")
+        self.assertEqual(len(preserved), 3)
+
+    def test_author_order_variation_and_isbn_10_13_identity(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="Confessions", author="Kanae Minato", isbn="0141439513"),
+            make_book(title="Confessions", author="Minato Kanae", isbn="9780141439518"),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Confessions")
+
+        self.assertEqual(bot._isbn_key(books[0]), bot._isbn_key(books[1]))
+        self.assertEqual(len(result), 1)
+
+    def test_distinct_authors_and_subtitles_are_preserved(self):
+        bot = _make_bot()
+        books = [
+            make_book(title="Shared Title", author="Author One", isbn="111"),
+            make_book(title="Shared Title", author="Author Two", isbn="222"),
+            make_book(title="Same Surname", author="John Smith", isbn="444"),
+            make_book(title="Same Surname", author="Jane Smith", isbn="555"),
+            make_book(title="Shared Title: A Critical Edition", author="Author One", isbn="333"),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Shared Title")
+
+        self.assertEqual(len(result), 5)
+
+
 # ── Message building ───────────────────────────────────────────────────────────
 
 class TestBuildSearchResultsMessage(unittest.TestCase):

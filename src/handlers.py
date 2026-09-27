@@ -1,6 +1,7 @@
 """GoodreadsBot — all Telegram command and callback handlers."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import tempfile
 import time
 import requests
+import unicodedata
 from io import BytesIO
 from PIL import Image
 from urllib.parse import urlsplit
@@ -26,7 +28,7 @@ from telegram.error import NetworkError, TimedOut
 
 from src.utils import logger, HEADERS, html_escape, is_placeholder_image, is_english_description, translate_to_english
 from src.search import build_goodreads_url
-from src.aggregator import MultiSourceBookAggregator
+from src.aggregator import MultiSourceBookAggregator, GOOGLE_BOOKS_API_KEY
 
 
 class GoodreadsBot:
@@ -63,7 +65,565 @@ class GoodreadsBot:
         # Entries expire after _INLINE_CALLBACK_CACHE_TTL seconds.
         self._inline_callback_cache: dict = {}
         self._INLINE_CALLBACK_CACHE_TTL: int = 30 * 60  # 30 minutes
+        # Short-lived shared cache avoids repeating provider requests for the same query.
+        self._aggregate_search_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._AGGREGATE_SEARCH_CACHE_TTL: int = 120
+        self._AGGREGATE_SEARCH_CACHE_MAX: int = 128
+        # Clarification state: {user_id: (original_query, title_hint, author_hint)}
+        self._clarification: dict = {}
+        # Rate-limit: {(user_id, norm_query): timestamp}
+        self._clarification_rate_limit: dict = {}
+        # Suppress repeated cancellation follow-up messages per user.
+        self._clarification_cancel_notice_rate_limit: dict[int, float] = {}
+        # Escalating abuse controls for repeated clarification cancellations.
+        self._clarification_cancel_abuse: dict[int, dict] = {}
+        self._clarification_abuse_notice_rate_limit: dict[int, float] = {}
+        owner_id = os.getenv("BOT_OWNER_ID", "").strip()
+        try:
+            self._owner_user_id: int | None = int(owner_id) if owner_id else None
+        except ValueError:
+            self._owner_user_id = None
+            logger.warning("BOT_OWNER_ID must be a numeric Telegram user ID; owner exemption is disabled")
+        if not owner_id:
+            logger.warning("BOT_OWNER_ID is not configured; no user is exempt from cancellation abuse limits")
         self.setup_handlers()
+
+    _CANCEL_ABUSE_THRESHOLD = 3
+    _CANCEL_ABUSE_WINDOW_SECONDS = 60
+    _CANCEL_ABUSE_COOLDOWN_SECONDS = 5 * 60
+    _CANCEL_ABUSE_ESCALATION_WINDOW_SECONDS = 24 * 60 * 60
+    _CANCEL_ABUSE_BLOCK_SECONDS = 60 * 60
+
+    _STOPWORDS: set = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "up", "about", "into", "through", "during",
+        "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might",
+        "can", "this", "that", "these", "those", "i", "ii", "iii", "iv", "v",
+    }
+
+    # ------------------------------------------------------------------
+    # Clarification helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_for_matching(text: str) -> str:
+        # Lowercase; strip outer punctuation but preserve internal dots (initials).
+        return text.lower().strip(" ,;:!?'\"-()[]{}")
+
+    def _record_clarification_cancel(self, user_id: int) -> str | None:
+        """Count cancel cycles and return an escalation action when a limit is reached."""
+        if self._owner_user_id is not None and user_id == self._owner_user_id:
+            return None
+        now = time.time()
+        state = self._clarification_cancel_abuse.setdefault(
+            user_id,
+            {"count": 0, "window_start": now, "level": 0, "escalation_expires": 0},
+        )
+        if state.get("cooldown_until", 0) > now or state.get("blocked_until", 0) > now:
+            return None
+        if state.get("level", 0) == 1 and state.get("escalation_expires", 0) <= now:
+            state.update(level=0, count=0, window_start=now)
+        if now - state.get("window_start", now) > self._CANCEL_ABUSE_WINDOW_SECONDS:
+            state["count"] = 0
+            state["window_start"] = now
+        state["count"] += 1
+        if state["count"] < self._CANCEL_ABUSE_THRESHOLD:
+            return None
+        state["count"] = 0
+        state["window_start"] = now
+        if state.get("level", 0) == 0:
+            state["level"] = 1
+            state["cooldown_until"] = now + self._CANCEL_ABUSE_COOLDOWN_SECONDS
+            state["escalation_expires"] = now + self._CANCEL_ABUSE_ESCALATION_WINDOW_SECONDS
+            logger.warning("User %s reached clarification-cancel threshold; applying 5-minute cooldown", user_id)
+            return "cooldown"
+        state["level"] = 2
+        state["blocked_until"] = now + self._CANCEL_ABUSE_BLOCK_SECONDS
+        logger.warning("User %s repeated clarification cancellations after cooldown; blocking searches for 1 hour", user_id)
+        return "blocked"
+
+    def _active_clarification_restriction(self, user_id: int) -> tuple[str, int] | None:
+        """Return the active restriction and seconds remaining, if any."""
+        if self._owner_user_id is not None and user_id == self._owner_user_id:
+            return None
+        now = time.time()
+        state = self._clarification_cancel_abuse.get(user_id, {})
+        blocked_until = state.get("blocked_until", 0)
+        if blocked_until > now:
+            return "blocked", int(blocked_until - now)
+        cooldown_until = state.get("cooldown_until", 0)
+        if cooldown_until > now:
+            return "cooldown", int(cooldown_until - now)
+        return None
+
+    async def _reject_search_during_clarification_restriction(self, update: Update) -> bool:
+        user_id = update.effective_user.id
+        restriction = self._active_clarification_restriction(user_id)
+        if restriction is None:
+            return False
+        now = time.time()
+        last_notice = self._clarification_abuse_notice_rate_limit.get(user_id, 0)
+        if now - last_notice >= 30:
+            self._clarification_abuse_notice_rate_limit[user_id] = now
+            _, seconds_left = restriction
+            minutes_left = max(1, (seconds_left + 59) // 60)
+            await update.effective_message.reply_text(
+                f"⏳ Searches are temporarily paused after repeated clarification cancellations. "
+                f"Please try again in about {minutes_left} minute(s)."
+            )
+        return True
+
+    def _is_clarification_query(self, query: str) -> tuple[bool, str | None, str | None]:
+        # Returns (needs_clarification, title_hint, author_hint)
+        # Pattern 1 -- explicit "by":  Title by Author -> always clarify.
+        # Pattern 2 -- no "by":  Two+ meaningful parts.
+        #   - >=2 non-stopword parts -> attempt a non-by split (title + author)
+        query_lower = query.lower().strip()
+        if " by " in query_lower:
+            parts = query_lower.split(" by ", 1)
+            title_hint = parts[0].strip()
+            author_hint = parts[1].strip().rstrip(",")
+            if title_hint and author_hint:
+                return True, title_hint, author_hint
+            return False, None, None
+
+        tokens = query_lower.split()
+        meaningful = [t for t in tokens if t not in self._STOPWORDS and len(t) >= 2]
+        if len(meaningful) < 2:
+            return False, None, None
+
+        # Treat a two-token query as a possible title/author split, too. The
+        # candidate verifier rejects apparent author tokens copied from the
+        # title (for example, "Harry Potter" where "Potter" is not its author).
+        last_meaningful_idx = max(
+            (i for i, t in enumerate(tokens) if t in meaningful),
+            default=-1,
+        )
+        if last_meaningful_idx < 1:
+            return False, None, None
+        title_hint = " ".join(tokens[:last_meaningful_idx])
+        author_hint = " ".join(tokens[last_meaningful_idx:])
+        return True, title_hint, author_hint
+
+    def _generate_plausible_splits(self, query: str) -> list[tuple[str, str]]:
+        # Yield (title, author) pairs for a non-"by" query.
+        # Iterates author_word_count from 1 to 3.  The author section must
+        # start with a non-stopword word and contain at least one non-stopword
+        # word of 2+ chars.
+        tokens = query.strip().split()
+        if not tokens:
+            return []
+
+        splits = []
+        max_author_words = min(3, len(tokens) - 1)
+        for author_word_count in range(1, max_author_words + 1):
+            if author_word_count >= len(tokens):
+                break
+            title_words = tokens[:-author_word_count]
+            author_words = tokens[-author_word_count:]
+            stripped_author = [w.strip(".,;:!'?\"-()[]{}") for w in author_words]
+            meaningful_author = [w for w in stripped_author
+                                 if w.lower() not in self._STOPWORDS]
+            if not meaningful_author:
+                continue
+            if len(meaningful_author[0]) < 2:
+                continue
+            title = " ".join(title_words).strip()
+            if not title:
+                continue
+            author = " ".join(author_words).strip()
+            splits.append((title, author))
+        return splits
+
+    def _score_title_hint(self, hint_norm: str, candidate_norm: str) -> float:
+        # Fraction of hint tokens (excluding stopwords) found in candidate title.
+        if not hint_norm:
+            return 0.0
+        hint_tokens = [t for t in hint_norm.split()
+                       if t not in self._STOPWORDS and len(t) >= 2]
+        if not hint_tokens:
+            return 0.0
+        cand_tokens = candidate_norm.split()
+        matched = sum(1 for ht in hint_tokens if ht in cand_tokens)
+        return matched / len(hint_tokens)
+
+    def _score_author_hint(self, hint_norm: str, candidate_norm: str) -> float:
+        # Token coverage: fraction of hint tokens in candidate author.
+        # Single surname (1 token): full score if it appears anywhere.
+        # Multi-word hint (2+ tokens): require coverage, max 0.5 for partial.
+        if not hint_norm or not candidate_norm:
+            return 0.0
+        hint_tokens = [t for t in hint_norm.split() if t.strip()]
+        if not hint_tokens:
+            return 0.0
+        matched = sum(1 for ht in hint_tokens if ht in candidate_norm)
+        if matched == 0:
+            return 0.0
+        if matched / len(hint_tokens) > 0.5:
+            return matched / len(hint_tokens)
+        return 0.0
+
+    def _discover_candidate(
+        self, query: str, title_hint: str | None, author_hint: str | None
+    ) -> dict | None:
+        # Query Google Books with intitle:/inauthor: operators.
+        # Return first volume where both title_score and author_score >= 0.5.
+        parts = []
+        if title_hint:
+            parts.append(f"intitle:{title_hint}")
+        if author_hint:
+            parts.append(f"inauthor:{author_hint}")
+        gb_query = query if not parts else "+".join(parts)
+
+        resp = requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params={"q": gb_query, "maxResults": 6, "langRestrict": "en"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        items = resp.json().get("items", [])
+        if not items:
+            return None
+
+        hint_norm = self._normalize_for_matching(title_hint) if title_hint else ""
+        author_hint_norm = self._normalize_for_matching(author_hint) if author_hint else ""
+
+        for item in items:
+            vol = item.get("volumeInfo", {})
+            vol_title = vol.get("title", "")
+            vol_authors = vol.get("authors", [])
+            vol_author = vol_authors[0] if vol_authors else ""
+            title_score = self._score_title_hint(
+                hint_norm, self._normalize_for_matching(vol_title))
+            author_score = self._score_author_hint(
+                author_hint_norm, self._normalize_for_matching(vol_author))
+            if title_score >= 0.5 and author_score >= 0.5:
+                return {"title": vol_title, "author": vol_author, "source": "google_books"}
+        return None
+
+    async def _try_clarification(
+        self, update: Update, query: str
+    ) -> bool:
+        # Return True if caller should stop (clarification shown or rate-limited).
+        user_id = update.effective_user.id
+        norm_q = query.lower().strip()
+        key = (user_id, norm_q)
+        now = time.time()
+        last = self._clarification_rate_limit.get(key, 0)
+        is_owner = (
+            self._owner_user_id is not None and user_id == self._owner_user_id
+        )
+        if now - last < 30 and not is_owner:
+            await self.app.bot.send_message(
+                update.effective_chat.id,
+                "⏳ <b>Please wait</b> — you're being rate-limited on this query. "
+                "Try again in a few seconds.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True  # Stop caller; cooldown in effect
+
+        needs, title_hint, author_hint = self._is_clarification_query(query)
+        if not needs:
+            return False  # Not a clarification query
+
+        def do_discover():
+            return self._discover_candidate(query, title_hint, author_hint)
+
+        candidate = await asyncio.to_thread(do_discover)
+        if candidate is None:
+            return False  # No strong match
+
+        canonical_title = candidate["title"]
+        canonical_author = candidate["author"]
+
+        chat_id = update.effective_chat.id
+        message_id = update.message.message_id
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, correct!",
+                                 callback_data=f"clar_yes_{user_id}"),
+            InlineKeyboardButton("No, search my query",
+                                 callback_data=f"clar_no_{user_id}"),
+            InlineKeyboardButton("Cancel",
+                                 callback_data=f"clar_cancel_{user_id}"),
+        ]])
+        prompt_text = (
+            f"Did you mean {html_escape(canonical_title)} "
+            f"by {html_escape(canonical_author)}?"
+        )
+        if update.effective_chat.type != "private":
+            prompt_msg = await update.message.reply_text(
+                prompt_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                reply_to_message_id=message_id,
+            )
+        else:
+            prompt_msg = await self.app.bot.send_message(
+                chat_id,
+                prompt_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        self._clarification[user_id] = {
+            "query": query,
+            "title_hint": title_hint,
+            "author_hint": author_hint,
+            "canonical_title": canonical_title,
+            "canonical_author": canonical_author,
+            "chat_id": chat_id,
+            "message_id": prompt_msg.message_id,
+            "source_message_id": message_id,
+            "chat_type": update.effective_chat.type,
+            "requester_id": user_id,
+        }
+        # Record rate-limit BEFORE showing prompt (so test can verify immediately)
+        self._record_clarification_rate_limit((user_id, norm_q), now)
+        return True  # Stop caller; wait for button
+
+    def _handle_clarification_response(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, confirmed: bool,
+        entry: dict | None = None,
+    ) -> None:
+        """Consume a validated Yes/No response and start its search."""
+        user_id = update.effective_user.id
+        entry = entry or self._clarification.get(user_id)
+        if not entry:
+            return
+        self._clarification.pop(user_id, None)
+        query = entry["query"]
+        norm_q = query.lower().strip()
+        self._record_clarification_rate_limit((user_id, norm_q), time.time())
+        if confirmed:
+            title_hint = entry.get("canonical_title", entry.get("title_hint", ""))
+            author_hint = entry.get("canonical_author", entry.get("author_hint", ""))
+            original_query = None
+        else:
+            # No means search the exact query the user entered. It is not a cancel.
+            title_hint = author_hint = ""
+            original_query = query
+        asyncio.create_task(
+            self._run_clarified_search(
+                update, query, title_hint, author_hint,
+                original_query=original_query, entry=entry, context=context,
+            )
+        )
+
+    async def _run_clarified_search(
+        self, update: Update, query: str, title_hint: str, author_hint: str,
+        original_query: str | None = None, entry: dict | None = None,
+        context: ContextTypes.DEFAULT_TYPE | None = None,
+    ) -> None:
+        # Perform search using the confirmed title+author hints (Yes) or
+        # the original query (No).
+        search_q = original_query if original_query else f"{title_hint} {author_hint}".strip()
+        user_id = update.effective_user.id
+        entry = entry or self._clarification.get(user_id, {})
+        chat_id = entry.get("chat_id", update.effective_chat.id)
+        reply_to_id = (
+            entry.get("source_message_id")
+            if entry.get("chat_type", update.effective_chat.type) != "private"
+            else None
+        )
+        bot = self.app.bot
+
+        async def send_result(text: str, reply_markup=None) -> None:
+            kwargs = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": reply_markup,
+            }
+            if reply_to_id:
+                kwargs["reply_to_message_id"] = reply_to_id
+            try:
+                await bot.send_message(**kwargs)
+            except Exception:
+                # A group may have deleted the source message while the search ran.
+                if "reply_to_message_id" not in kwargs:
+                    raise
+                kwargs.pop("reply_to_message_id", None)
+                await bot.send_message(**kwargs)
+
+        try:
+            books = await self._aggregate_search_results(search_q, limit=10)
+            books = self._rank_search_results(
+                self._deduplicate_search_results(books, search_q), search_q
+            )
+            self._set_cached_books(user_id, books)
+            self._search_page_cache[user_id] = 1
+            self._search_query_cache[user_id] = search_q
+            if not books:
+                await send_result(
+                    f"No books found for '{html_escape(search_q)}'. Try a different search."
+                )
+                return
+            # Preload Hardcover ratings for page 1 BEFORE building the UI.
+            await self._preload_hardcover_ratings_for_page(books, 1, 5)
+            results_text, keyboard = self._build_search_results_message(
+                books, search_q, user_id, 1, 5)
+            await send_result(results_text, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error in _run_clarified_search: {e}", exc_info=True)
+
+    async def _aggregate_search_results(self, query: str, limit: int = 10) -> list[dict]:
+        """Cached search via the aggregator; short TTL to avoid stale multi-source results."""
+        cache_key = f"{query.lower().strip()}|{limit}"
+        cache = getattr(self, "_aggregate_search_cache", {})
+        ttl = getattr(self, "_AGGREGATE_SEARCH_CACHE_TTL", 120)
+        now = time.time()
+        entry = cache.get(cache_key)
+        if entry is not None:
+            cached_at, books = entry
+            if now - cached_at <= ttl:
+                logger.info("Search result cache hit for query=%r", query)
+                return copy.deepcopy(books)
+            cache.pop(cache_key, None)
+        books = await self.aggregator.aggregate_book_data(query, limit=limit)
+        if isinstance(books, list) and books:
+            max_entries = getattr(self, "_AGGREGATE_SEARCH_CACHE_MAX", 128)
+            if len(cache) >= max_entries and cache_key not in cache:
+                oldest_key = min(cache, key=lambda key: cache[key][0])
+                cache.pop(oldest_key, None)
+            cache[cache_key] = (time.time(), copy.deepcopy(books))
+        return books
+
+    def _record_clarification_rate_limit(self, key: tuple[int, str], timestamp: float) -> None:
+        """Keep the short clarification debounce map bounded and semantically fresh."""
+        cache = self._clarification_rate_limit
+        for old_key, old_time in list(cache.items()):
+            if timestamp - old_time >= 30:
+                cache.pop(old_key, None)
+        if key not in cache and len(cache) >= 2000:
+            oldest_key = min(cache, key=cache.get)
+            cache.pop(oldest_key, None)
+        cache[key] = timestamp
+
+    @staticmethod
+    def _author_hint_is_complete(author_hint: str | None, candidate_author: str | None) -> bool:
+        """Check whether a supplied author is already as specific as the match."""
+        hint_tokens = re.findall(r"[a-z0-9]+", (author_hint or "").casefold())
+        candidate_tokens = re.findall(r"[a-z0-9]+", (candidate_author or "").casefold())
+        if not hint_tokens or not candidate_tokens:
+            return False
+        if set(hint_tokens) == set(candidate_tokens):
+            return True
+        if hint_tokens[-1] != candidate_tokens[-1]:
+            return False
+
+        def given_name_initials(tokens: list[str]) -> set[str]:
+            return {token[0] for token in tokens[:-1] if token}
+
+        hint_initials = given_name_initials(hint_tokens)
+        candidate_initials = given_name_initials(candidate_tokens)
+        return bool(hint_initials) and hint_initials == candidate_initials
+
+    def _discover_candidate(
+        self, query: str, title_hint: str | None, author_hint: str | None,
+        _log: str = "",
+    ) -> dict | None:
+        parts = []
+        if title_hint:
+            parts.append(f"intitle:{title_hint}")
+        if author_hint:
+            parts.append(f"inauthor:{author_hint}")
+        gb_query = query if not parts else " ".join(parts)
+
+        log_prefix = f"[discover] {_log} " if _log else "[discover] "
+        logger.info(
+            f"[clarification] input query={query!r} "
+            f"title_hint={title_hint!r} author_hint={author_hint!r}"
+        )
+
+        def fetch_items(search_query: str, label: str, max_results: int) -> list:
+            try:
+                params = {"q": search_query, "maxResults": max_results, "langRestrict": "en"}
+                if GOOGLE_BOOKS_API_KEY:
+                    params["key"] = GOOGLE_BOOKS_API_KEY
+                response = requests.get(
+                    "https://www.googleapis.com/books/v1/volumes",
+                    params=params, timeout=10,
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        f"{log_prefix}{label} request: status={response.status_code} "
+                        f"totalItems=unknown query={search_query!r}"
+                    )
+                    return []
+                data = response.json()
+                items = data.get("items", []) or []
+                logger.info(
+                    f"{log_prefix}{label} request: status={response.status_code} "
+                    f"totalItems={data.get('totalItems', 0)} items={len(items)} "
+                    f"query={search_query!r}"
+                )
+                return items
+            except Exception as exc:
+                logger.warning(
+                    f"{log_prefix}{label} request failed for query={search_query!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return []
+
+        items = fetch_items(gb_query, "structured", 6)
+
+        hint_norm = self._normalize_for_matching(title_hint) if title_hint else ""
+        author_hint_norm = self._normalize_for_matching(author_hint) if author_hint else ""
+
+        if not hint_norm and not author_hint_norm:
+            query_norm = self._normalize_for_matching(query)
+            hint_norm = query_norm
+            tokens = [t for t in query_norm.split()
+                      if t not in self._STOPWORDS and len(t) >= 2]
+            author_hint_norm = tokens[-1] if tokens else ""
+
+        def matching_candidate(candidate_items: list, label: str) -> dict | None:
+            for item in candidate_items:
+                vol = item.get("volumeInfo", {})
+                vol_title = vol.get("title", "")
+                vol_authors = vol.get("authors", [])
+                vol_author = vol_authors[0] if vol_authors else ""
+                vol_title_norm = self._normalize_for_matching(vol_title)
+                vol_author_norm = self._normalize_for_matching(vol_author)
+                title_score = self._score_title_hint(hint_norm, vol_title_norm)
+                author_hint_tokens = [
+                    token for token in re.findall(r"[a-z0-9]+", author_hint_norm)
+                    if token not in self._STOPWORDS and len(token) >= 2
+                ]
+                candidate_title_tokens = set(re.findall(r"[a-z0-9]+", vol_title_norm))
+                author_is_independently_identified = (
+                    " by " in query.lower()
+                    or not author_hint_tokens
+                    or any(token not in candidate_title_tokens for token in author_hint_tokens)
+                )
+                author_score = (
+                    self._score_author_hint(author_hint_norm, vol_author_norm)
+                    if author_hint_norm and author_is_independently_identified else 0.0
+                )
+                passed = title_score >= 0.5 and author_score > 0
+                logger.info(
+                    f"{log_prefix}{label} candidate title={vol_title!r} author={vol_author!r} "
+                    f"title_score={title_score:.2f} author_score={author_score:.2f} "
+                    f"pass={passed}"
+                )
+                if passed:
+                    return {"title": vol_title, "author": vol_author, "source": "google_books"}
+            return None
+
+        cand = matching_candidate(items, "structured")
+        if cand:
+            return cand
+
+        # Fallback: broader split query when structured search found nothing
+        if title_hint and author_hint:
+            fallback_query = f"{title_hint} {author_hint}"
+            fb_items = fetch_items(fallback_query, "fallback", 6)
+            if fb_items:
+                cand = matching_candidate(fb_items, "fallback")
+                if cand:
+                    return cand
+        return None
 
     def _get_cached_books(self, user_id: int) -> list | None:
         """Return cached search results for *user_id*, or None if missing/expired."""
@@ -261,6 +821,331 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
         return f"bk_{h}"
 
+    @staticmethod
+    def _dedup_tokens(value: str) -> list[str]:
+        folded = unicodedata.normalize("NFKD", value or "")
+        normalized = "".join(
+            char for char in folded
+            if not unicodedata.combining(char)
+        ).casefold()
+        # Keep letters from non-Latin scripts too; only punctuation and symbols
+        # separate words. This avoids making every non-English title empty.
+        tokens: list[str] = []
+        current: list[str] = []
+        for char in normalized:
+            if char.isalnum():
+                current.append(char)
+            elif current:
+                tokens.append("".join(current))
+                current = []
+        if current:
+            tokens.append("".join(current))
+        return tokens
+
+    @classmethod
+    def _author_tokens(cls, value: str) -> list[str]:
+        """Normalize common duplicated-token noise without changing title tokens."""
+        tokens = cls._dedup_tokens(value)
+        collapsed: list[str] = []
+        for token in tokens:
+            if not collapsed or token != collapsed[-1]:
+                collapsed.append(token)
+        return collapsed
+
+    @classmethod
+    def _is_unknown_author(cls, value: str) -> bool:
+        tokens = cls._author_tokens(value)
+        return not tokens or " ".join(tokens) in {
+            "unknown", "unknown author", "author unknown", "not known",
+            "unspecified", "unspecified author", "n a", "na", "none",
+        }
+
+    @staticmethod
+    def _one_edit_apart(left: str, right: str) -> bool:
+        """Match a single typo/transposition in a sufficiently long surname."""
+        if left == right:
+            return True
+        if min(len(left), len(right)) < 7 or abs(len(left) - len(right)) > 1:
+            return False
+        if len(left) == len(right):
+            differences = [i for i, (a, b) in enumerate(zip(left, right)) if a != b]
+            if len(differences) == 1:
+                return True
+            return (
+                len(differences) == 2
+                and differences[1] == differences[0] + 1
+                and left[differences[0]] == right[differences[1]]
+                and left[differences[1]] == right[differences[0]]
+            )
+        shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+        i = j = edits = 0
+        while i < len(shorter) and j < len(longer):
+            if shorter[i] == longer[j]:
+                i += 1
+                j += 1
+            else:
+                edits += 1
+                j += 1
+                if edits > 1:
+                    return False
+        return True
+
+    @classmethod
+    def _same_author_for_dedup(cls, left: str, right: str) -> bool:
+        a = cls._author_tokens(left)
+        b = cls._author_tokens(right)
+        if cls._is_unknown_author(left) or cls._is_unknown_author(right):
+            return False
+
+        if sorted(a) == sorted(b):
+            # Handles providers that return Eastern names in opposite orders.
+            return True
+
+        def names_match(a_names: list[str], b_names: list[str]) -> bool:
+            if a_names == b_names:
+                return True
+            if not a_names or not b_names:
+                return False
+            if all(len(token) == 1 for token in a_names):
+                return len(a_names) <= len(b_names) and all(
+                    initial == full[0] for initial, full in zip(a_names, b_names)
+                )
+            if all(len(token) == 1 for token in b_names):
+                return len(b_names) <= len(a_names) and all(
+                    initial == full[0] for initial, full in zip(b_names, a_names)
+                )
+            return False
+
+        # Try both conventional and reversed name order. A spelling-tolerant
+        # surname comparison is accepted only with independent given-name data.
+        for surname_a, given_a in ((a[-1], a[:-1]), (a[0], a[1:])):
+            for surname_b, given_b in ((b[-1], b[:-1]), (b[0], b[1:])):
+                if not names_match(given_a, given_b):
+                    continue
+                if surname_a == surname_b:
+                    return True
+                if given_a and given_b and cls._one_edit_apart(surname_a, surname_b):
+                    return True
+        return False
+
+    @classmethod
+    def _isbn_key(cls, book: dict) -> str:
+        raw = next((book.get(key) for key in ("isbn", "isbn13", "isbn_13", "isbn10", "isbn_10")
+                    if book.get(key)), "")
+        value = "".join(char for char in str(raw).upper() if char.isalnum())
+        if value.startswith("ISBN"):
+            value = value[4:]
+        if len(value) == 10 and value[:9].isdigit():
+            stem = "978" + value[:9]
+            weighted_sum = sum(
+                int(digit) * (1 if index % 2 == 0 else 3)
+                for index, digit in enumerate(stem)
+            )
+            checksum = (10 - weighted_sum % 10) % 10
+            value = stem + str(checksum)
+        return value
+
+    @classmethod
+    def _normalized_work_title(cls, book: dict) -> str:
+        raw_title = (book.get("title", "") or "").strip()
+        author = book.get("author", "") or ""
+        if not raw_title:
+            return ""
+
+        # Remove author credits attached to a title by some metadata providers,
+        # but only when the credit matches the record's separate author field.
+        parts = re.split(r"\s+(?:-|–|—|:|\|)\s+", raw_title, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts
+            if cls._same_author_for_dedup(left, author):
+                raw_title = right
+            elif cls._same_author_for_dedup(right, author):
+                raw_title = left
+
+        tokens = cls._dedup_tokens(raw_title)
+        author_tokens = cls._author_tokens(author)
+        # Remove "by Author" only when the suffix matches the author field.
+        for index, token in enumerate(tokens):
+            if token == "by" and index > 0:
+                suffix_author = " ".join(tokens[index + 1:])
+                if (cls._same_author_for_dedup(suffix_author, author)
+                        or (cls._is_unknown_author(suffix_author)
+                            and cls._is_unknown_author(author))):
+                    tokens = tokens[:index]
+                    break
+
+        # Broken catalog strings sometimes leave the generic tail "Novel by".
+        # Strip only this incomplete attribution tail; meaningful subtitles and
+        # edition labels remain part of the title key.
+        if len(tokens) >= 3 and tokens[-2:] == ["novel", "by"]:
+            tokens = tokens[:-2]
+        return " ".join(tokens)
+
+    @staticmethod
+    def _is_useful_dedup_value(value) -> bool:
+        if value is None or value == "" or value == "N/A":
+            return False
+        if isinstance(value, (int, float)):
+            return value > 0
+        return True
+
+    @staticmethod
+    def _dedup_number(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _merge_duplicate_book_data(self, target: dict, other: dict) -> None:
+        """Merge duplicates while preferring the more informative record."""
+        target_title = target.get("title", "") or ""
+        other_title = other.get("title", "") or ""
+        if len(self._dedup_tokens(other_title)) < len(self._dedup_tokens(target_title)):
+            target["title"] = other_title
+        target_author = target.get("author", "") or ""
+        other_author = other.get("author", "") or ""
+        if self._is_unknown_author(target_author) and not self._is_unknown_author(other_author):
+            target["author"] = other_author
+        elif not self._is_unknown_author(target_author) and not self._is_unknown_author(other_author):
+            if len(" ".join(self._author_tokens(other_author))) > len(" ".join(self._author_tokens(target_author))):
+                target["author"] = other_author
+
+        for key, value in other.items():
+            if key in {"title", "author", "rating", "rating_count", "rating_formatted",
+                       "search_rating", "search_rating_count",
+                       "search_rating_formatted"}:
+                continue
+            current = target.get(key)
+            if not self._is_useful_dedup_value(current) and self._is_useful_dedup_value(value):
+                target[key] = value
+            elif key == "description" and value and current:
+                if len(str(value)) > len(str(current)):
+                    target[key] = value
+            elif key == "categories" and value:
+                target[key] = list(dict.fromkeys((current or []) + value))
+
+        for prefix in ("search_", ""):
+            rating_key = f"{prefix}rating"
+            count_key = f"{prefix}rating_count"
+            formatted_key = f"{prefix}rating_formatted"
+            current_rating = self._dedup_number(target.get(rating_key))
+            other_rating = self._dedup_number(other.get(rating_key))
+            current_count = self._dedup_number(target.get(count_key))
+            other_count = self._dedup_number(other.get(count_key))
+            if other_rating > 0 and (
+                current_rating <= 0
+                or other_count > current_count
+                or (other_count == current_count and other_rating > current_rating)
+            ):
+                for key in (rating_key, count_key, formatted_key):
+                    if other.get(key) is not None:
+                        target[key] = other[key]
+
+    def _deduplicate_search_results(self, books: list[dict],
+                                     query: str) -> list[dict]:
+        """Merge duplicate work records using ISBN, normalized title and author evidence.
+
+        Edition/subtitle text is retained in the title key. Unknown-author records
+        join a known-author cluster only when that title has a single unambiguous
+        author cluster in the result set.
+        """
+        records = [dict(book) for book in (books or [])]
+        count = len(records)
+        parents = list(range(count))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            root_left, root_right = find(left), find(right)
+            if root_left != root_right:
+                parents[root_right] = root_left
+
+        title_keys = [self._normalized_work_title(book) for book in records]
+        isbn_keys = [self._isbn_key(book) for book in records]
+
+        # First merge only strong identity matches, independent of provider order.
+        for left in range(count):
+            for right in range(left + 1, count):
+                if isbn_keys[left] and isbn_keys[left] == isbn_keys[right]:
+                    union(left, right)
+                    continue
+                if not title_keys[left] or title_keys[left] != title_keys[right]:
+                    continue
+                author_left = records[left].get("author", "") or ""
+                author_right = records[right].get("author", "") or ""
+                if (not self._is_unknown_author(author_left)
+                        and not self._is_unknown_author(author_right)
+                        and self._same_author_for_dedup(author_left, author_right)):
+                    union(left, right)
+                elif (self._is_unknown_author(author_left)
+                      and self._is_unknown_author(author_right)):
+                    union(left, right)
+
+        # Attach unknown-author copies only if the normalized title has exactly
+        # one known author cluster; if authors conflict, preserve ambiguity.
+        title_groups: dict[str, list[int]] = {}
+        for index, title_key in enumerate(title_keys):
+            if title_key:
+                title_groups.setdefault(title_key, []).append(index)
+        for indices in title_groups.values():
+            known_roots: set[int] = set()
+            unknown_roots: set[int] = set()
+            for index in indices:
+                root = find(index)
+                if self._is_unknown_author(records[index].get("author", "")):
+                    unknown_roots.add(root)
+                else:
+                    known_roots.add(root)
+            if len(known_roots) == 1 and unknown_roots:
+                known_root = next(iter(known_roots))
+                for unknown_root in unknown_roots:
+                    union(known_root, unknown_root)
+
+        clusters: dict[int, dict] = {}
+        for index, book in enumerate(records):
+            root = find(index)
+            if root not in clusters:
+                clusters[root] = dict(book)
+            else:
+                self._merge_duplicate_book_data(clusters[root], book)
+
+        merged = list(clusters.values())
+        removed = count - len(merged)
+        if removed:
+            logger.info("Removed %s duplicate title/author results for query=%r", removed, query)
+        return merged
+
+    def _rank_search_results(self, books: list[dict], query: str) -> list[dict]:
+        """Stable relevance ordering using query token coverage in title and author."""
+        query_tokens = [token for token in self._dedup_tokens(query)
+                        if token not in self._STOPWORDS]
+        if not query_tokens or len(books or []) < 2:
+            return list(books or [])
+
+        def score(book: dict) -> float:
+            all_title_tokens = self._dedup_tokens(book.get("title", ""))
+            title_tokens = {
+                token for token in all_title_tokens if token not in self._STOPWORDS
+            }
+            author_tokens = set(self._dedup_tokens(book.get("author", "")))
+            matched = sum(1 for token in query_tokens
+                          if token in title_tokens or token in author_tokens)
+            title_coverage = sum(1 for token in query_tokens if token in title_tokens)
+            title_precision = title_coverage / max(1, len(title_tokens))
+            exact_title = all_title_tokens == self._dedup_tokens(query)
+            return (
+                (matched / len(query_tokens)) * 2
+                + (title_coverage / len(query_tokens))
+                + title_precision * 0.5
+                + (0.5 if exact_title else 0.0)
+            )
+
+        return sorted(books, key=score, reverse=True)
+
     async def inline_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline queries with debounce.
 
@@ -273,6 +1158,11 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         query = (update.inline_query.query or "").strip()
         user_id = update.inline_query.from_user.id
         query_id = update.inline_query.id
+
+        # Inline mode is another search entry point; apply the same user cooldown.
+        if self._active_clarification_restriction(user_id) is not None:
+            await update.inline_query.answer([], cache_time=1, is_personal=True)
+            return
 
         # ── 1. Short queries: return empty immediately ────────────────────────────
         if len(query) < 3:
@@ -1023,10 +1913,21 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             await update.message.chat.send_action("typing")
             logger.info(f"👤 User search: {query_text}")
 
-            # Get aggregator results first, then preload Hardcover ratings for visible books.
+            if await self._reject_search_during_clarification_restriction(update):
+                return
+
+            # Check if clarification is needed BEFORE calling the aggregator.
+            stop = await self._try_clarification(update, query_text)
+            if stop:
+                return
+
+            # Get aggregator results, then preload Hardcover ratings for visible books.
             # Hardcover is the single source of truth for list ratings; each book on the
             # current page is looked up individually via _get_hardcover_cached (cached, concurrent).
-            books = await self.aggregator.aggregate_book_data(query_text, limit=10)
+            books = await self._aggregate_search_results(query_text, limit=10)
+            books = self._rank_search_results(
+                self._deduplicate_search_results(books, query_text), query_text
+            )
 
             if not books:
                 logger.warning(f"No books found for: {query_text}")
@@ -1065,7 +1966,6 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         """Handle all inline button presses."""
         try:
             query = update.callback_query
-            await query.answer()
             callback_data = query.data
 
             # ── Pagination ───────────────────────────────────────────────────
@@ -1295,6 +2195,68 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     except Exception as e2:
                         logger.error(f"Failed to edit inline message: {e2}")
                         await query.answer("Failed to update message.", show_alert=True)
+                return
+
+            # ── Clarification callbacks ──────────────────────────────────────
+            if callback_data.startswith(("clar_yes_", "clar_no_", "clar_cancel_")):
+                action, owner_text = callback_data.rsplit("_", 1)
+                try:
+                    user_id = int(owner_text)
+                except ValueError:
+                    await query.answer("This clarification prompt has expired.", show_alert=True)
+                    return
+                entry = self._clarification.get(user_id)
+                if not entry:
+                    await query.answer("This clarification prompt has expired.", show_alert=True)
+                    return
+
+                callback_user_id = update.effective_user.id
+                callback_chat_id = update.effective_chat.id
+                callback_message_id = query.message.message_id if query.message else None
+                if (callback_user_id != user_id
+                        or callback_user_id != entry.get("requester_id")
+                        or callback_chat_id != entry.get("chat_id")
+                        or callback_message_id != entry.get("message_id")):
+                    await query.answer(
+                        "This clarification prompt is for another user.", show_alert=True
+                    )
+                    return
+
+                self._clarification.pop(user_id, None)
+                try:
+                    await query.delete_message()
+                except Exception as exc:
+                    # Continue the selected action if the prompt was already removed.
+                    logger.info("Clarification prompt could not be deleted: %s", exc)
+
+                if action == "clar_cancel":
+                    abuse_action = self._record_clarification_cancel(user_id)
+                    reply_text = (
+                        "❌ Search cancelled. Please start a new search with a different query using /search."
+                    )
+                    if abuse_action == "cooldown":
+                        reply_text += "\n\n⏳ You have reached the cancellation limit. Searches are paused for 5 minutes."
+                    elif abuse_action == "blocked":
+                        reply_text += "\n\n🚫 Repeated cancellations have paused your searches for 1 hour."
+                    send_kwargs = {
+                        "chat_id": entry["chat_id"],
+                        "text": reply_text,
+                        "reply_to_message_id": entry.get("source_message_id"),
+                    }
+                    try:
+                        await self.app.bot.send_message(**send_kwargs)
+                    except Exception:
+                        # Fall back to a normal chat message if the source was removed.
+                        send_kwargs.pop("reply_to_message_id", None)
+                        await self.app.bot.send_message(**send_kwargs)
+                    await query.answer()
+                    return
+
+                confirmed = action == "clar_yes"
+                self._handle_clarification_response(update, context, confirmed, entry=entry)
+                await query.answer(
+                    "Searching for that book..." if confirmed else "Searching your query..."
+                )
                 return
 
             # ── Book selection ────────────────────────────────────────────────

@@ -70,4 +70,14 @@ def make_bot():
     bot._inline_callback_cache = {}
     bot._INLINE_CALLBACK_CACHE_TTL = 30 * 60
     bot.aggregator = MagicMock()
+    # New attributes added by recent changes
+    bot._owner_user_id = None
+    bot._clarification = {}
+    bot._clarification_rate_limit = {}
+    bot._clarification_cancel_abuse = {}
+    bot._clarification_abuse_notice_rate_limit = {}
+    bot._clarification_cancel_notice_rate_limit = {}
+    bot._cached_books = {}
+    bot._cached_users = {}
+    bot._set_cached_books = MagicMock()
     return bot
