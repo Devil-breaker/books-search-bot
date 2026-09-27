@@ -85,6 +85,33 @@ class TestAggregatorNetworkPaths(unittest.TestCase):
         self.assertTrue(callable(MultiSourceBookAggregator.aggregate_book_data))
 
 
+
+class TestAggregatorItunesFallback(unittest.IsolatedAsyncioTestCase):
+    @patch.object(MultiSourceBookAggregator, "search_google_books", return_value=[])
+    @patch.object(MultiSourceBookAggregator, "search_itunes")
+    async def test_all_itunes_results_are_kept_when_google_books_is_unavailable(
+        self, mock_itunes, _mock_google
+    ):
+        mock_itunes.return_value = [
+            {"title": "Harry Potter and the Sorcerer's Stone", "author": "J.K. Rowling"},
+            {"title": "Harry Potter and the Chamber of Secrets", "author": "J.K. Rowling"},
+            {"title": "The Unofficial Harry Potter Cookbook", "author": "Dinah Bucholz"},
+        ]
+
+        books = await MultiSourceBookAggregator.aggregate_book_data("Harry Potter", limit=10)
+
+        self.assertEqual(
+            [book["title"] for book in books],
+            [
+                "Harry Potter and the Sorcerer's Stone",
+                "Harry Potter and the Chamber of Secrets",
+                "The Unofficial Harry Potter Cookbook",
+            ],
+        )
+        self.assertTrue(all(book["cover_source"] == "itunes" for book in books))
+        self.assertTrue(all(book["search_rating"] == 0.0 for book in books))
+
+
 class TestAggregatorInternalMethods(unittest.TestCase):
     """Internal method signatures — verify they exist and have the expected structure."""
 
