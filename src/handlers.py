@@ -21,6 +21,7 @@ from telegram import (
     InlineQueryResultArticle,
     InputTextMessageContent,
     InputMediaPhoto,
+    ReplyParameters,
 )
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -80,11 +81,23 @@ class GoodreadsBot:
         self._clarification: dict = {}
         # Rate-limit: {(user_id, norm_query): timestamp}
         self._clarification_rate_limit: dict = {}
+        self._clarification_discovery_cache: dict = {}
+        self._clarification_discovery_inflight: dict = {}
         # Suppress repeated cancellation follow-up messages per user.
         self._clarification_cancel_notice_rate_limit: dict[int, float] = {}
         # Escalating abuse controls for repeated clarification cancellations.
         self._clarification_cancel_abuse: dict[int, dict] = {}
         self._clarification_abuse_notice_rate_limit: dict[int, float] = {}
+        # Cache group-admin checks briefly so restriction checks do not add a
+        # Telegram API call to every search/cancel interaction.
+        self._group_admin_status_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+        self._group_search_rate_limit: dict[tuple[int, int], float] = {}
+        self._group_search_notice_rate_limit: dict[tuple[int, int], float] = {}
+        self._group_search_inflight: set[tuple[int, int]] = set()
+        # Current visible results per (chat, requester), used to prevent late
+        # rating updates from overwriting a newer page or selected book.
+        self._active_result_messages: dict[tuple[int, int], dict] = {}
+        self._rating_refresh_tasks: set[asyncio.Task] = set()
         owner_id = os.getenv("BOT_OWNER_ID", "").strip()
         try:
             self._owner_user_id: int | None = int(owner_id) if owner_id else None
@@ -118,9 +131,148 @@ class GoodreadsBot:
         # Lowercase; strip outer punctuation but preserve internal dots (initials).
         return text.lower().strip(" ,;:!?'\"-()[]{}")
 
-    def _record_clarification_cancel(self, user_id: int) -> str | None:
-        """Count cancel cycles and return an escalation action when a limit is reached."""
+    async def _is_owner_or_group_admin(self, user_id: int, chat) -> bool:
+        """Return whether the user is the configured owner or an admin in this group."""
         if self._owner_user_id is not None and user_id == self._owner_user_id:
+            return True
+        if chat is None or getattr(chat, "type", "private") not in ("group", "supergroup"):
+            return False
+        key = (chat.id, user_id)
+        now = time.monotonic()
+        cached = self._group_admin_status_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        try:
+            member = await self.app.bot.get_chat_member(chat.id, user_id)
+            is_admin = getattr(member, "status", "") in ("administrator", "creator")
+        except Exception as exc:
+            logger.debug("Could not verify group admin status for user %s: %s", user_id, exc)
+            is_admin = False
+        self._group_admin_status_cache[key] = (now + 60, is_admin)
+        return is_admin
+
+    async def _group_search_is_rate_limited(self, update: Update) -> bool:
+        """Apply a small per-user, per-group cooldown to repeated /search commands."""
+        chat = update.effective_chat
+        if chat is None or getattr(chat, "type", "private") not in ("group", "supergroup"):
+            return False
+        user_id = update.effective_user.id
+        key = (chat.id, user_id)
+        now = time.monotonic()
+        last = self._group_search_rate_limit.get(key, 0)
+        limited = (
+            key in self._group_search_inflight
+            or now - last < self._GROUP_SEARCH_COOLDOWN_SECONDS
+        )
+        if not limited:
+            self._group_search_rate_limit[key] = now
+            return False
+        if await self._is_owner_or_group_admin(user_id, chat):
+            self._group_search_rate_limit[key] = now
+            return False
+
+        last_notice = self._group_search_notice_rate_limit.get(key, 0)
+        if now - last_notice >= self._GROUP_SEARCH_NOTICE_INTERVAL_SECONDS:
+            self._group_search_notice_rate_limit[key] = now
+            message = update.effective_message
+            if message is not None:
+                await message.reply_text(
+                    "⏳ Please wait a few seconds before searching again.",
+                    reply_parameters=ReplyParameters(
+                        message_id=message.message_id,
+                        allow_sending_without_reply=True,
+                    ),
+                )
+        return True
+
+    async def _discover_candidate_cached(
+        self, query: str, title_hint: str | None, author_hint: str | None
+    ) -> dict | None:
+        """Reuse and coalesce clarification discovery for identical normalized queries."""
+        key = (
+            self._normalize_for_matching(query),
+            self._normalize_for_matching(title_hint or ""),
+            self._normalize_for_matching(author_hint or ""),
+        )
+        now = time.monotonic()
+        cache_entry = self._clarification_discovery_cache.get(key)
+        if cache_entry and cache_entry[0] > now:
+            return copy.deepcopy(cache_entry[1])
+        if cache_entry:
+            self._clarification_discovery_cache.pop(key, None)
+
+        task = self._clarification_discovery_inflight.get(key)
+        if task is None:
+            def discover():
+                return self._discover_candidate(query, title_hint, author_hint)
+
+            task = asyncio.create_task(asyncio.to_thread(discover))
+            self._clarification_discovery_inflight[key] = task
+
+        try:
+            candidate = await asyncio.shield(task)
+        finally:
+            if self._clarification_discovery_inflight.get(key) is task:
+                self._clarification_discovery_inflight.pop(key, None)
+
+        ttl = (
+            self._CLARIFICATION_DISCOVERY_CACHE_TTL_SECONDS
+            if candidate is not None
+            else self._CLARIFICATION_DISCOVERY_MISS_TTL_SECONDS
+        )
+        self._clarification_discovery_cache[key] = (time.monotonic() + ttl, candidate)
+        if len(self._clarification_discovery_cache) > self._CLARIFICATION_DISCOVERY_CACHE_MAX:
+            oldest = min(
+                self._clarification_discovery_cache,
+                key=lambda cache_key: self._clarification_discovery_cache[cache_key][0],
+            )
+            self._clarification_discovery_cache.pop(oldest, None)
+        return copy.deepcopy(candidate)
+
+    async def _refresh_result_ratings(
+        self, books: list, query_text: str, user_id: int, page_num: int,
+        chat_id: int, message_id: int, bot,
+    ) -> None:
+        """Load list ratings in the background and refresh only the still-active page."""
+        try:
+            await self._preload_hardcover_ratings_for_page(books, page_num, 5)
+            session_key = (chat_id, user_id)
+            session = self._active_result_messages.get(session_key)
+            if not session or session.get("message_id") != message_id or session.get("page") != page_num:
+                return
+            text, keyboard = self._build_search_results_message(
+                books, query_text, user_id, page_num, 5
+            )
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            # The user may already have selected a book, deleted the list, or
+            # navigated away while ratings were loading.
+            logger.debug("Deferred list rating refresh skipped: %s", exc)
+
+    def _schedule_result_rating_refresh(
+        self, books: list, query_text: str, user_id: int, page_num: int,
+        chat_id: int, message_id: int, bot,
+    ) -> None:
+        task = asyncio.create_task(self._refresh_result_ratings(
+            books, query_text, user_id, page_num, chat_id, message_id, bot
+        ))
+        self._rating_refresh_tasks.add(task)
+        task.add_done_callback(self._rating_refresh_tasks.discard)
+
+    def _clear_active_result_message(self, session_key: tuple[int, int], message_id: int) -> None:
+        session = self._active_result_messages.get(session_key)
+        if session and session.get("message_id") == message_id:
+            self._active_result_messages.pop(session_key, None)
+
+    def _record_clarification_cancel(self, user_id: int, exempt: bool = False) -> str | None:
+        """Count cancel cycles and return an escalation action when a limit is reached."""
+        if exempt or (self._owner_user_id is not None and user_id == self._owner_user_id):
             return None
         now = time.time()
         state = self._clarification_cancel_abuse.setdefault(
@@ -168,6 +320,8 @@ class GoodreadsBot:
         user_id = update.effective_user.id
         restriction = self._active_clarification_restriction(user_id)
         if restriction is None:
+            return False
+        if await self._is_owner_or_group_admin(user_id, update.effective_chat):
             return False
         now = time.time()
         last_notice = self._clarification_abuse_notice_rate_limit.get(user_id, 0)
@@ -323,6 +477,9 @@ class GoodreadsBot:
             self._owner_user_id is not None and user_id == self._owner_user_id
         )
         if now - last < 30 and not is_owner:
+            if await self._is_owner_or_group_admin(user_id, update.effective_chat):
+                is_owner = True
+        if now - last < 30 and not is_owner:
             await self.app.bot.send_message(
                 update.effective_chat.id,
                 "⏳ <b>Please wait</b> — you're being rate-limited on this query. "
@@ -371,7 +528,10 @@ class GoodreadsBot:
                 prompt_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
-                reply_to_message_id=message_id,
+                reply_parameters=ReplyParameters(
+                    message_id=message_id,
+                    allow_sending_without_reply=True,
+                ),
             )
         else:
             prompt_msg = await self.app.bot.send_message(
@@ -1960,15 +2120,39 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
         return "\n".join(parts), InlineKeyboardMarkup(keyboard)
 
+    @staticmethod
+    def _build_detail_keyboard(user_id: int, book_idx: int, chat_type: str) -> InlineKeyboardMarkup:
+        """Build detail actions, keeping cover downloads private and group output closable."""
+        actions = []
+        if chat_type == "private":
+            actions.append([InlineKeyboardButton(
+                "📥 Download Cover", callback_data=f"download_{user_id}_{book_idx}"
+            )])
+        else:
+            actions.append([InlineKeyboardButton(
+                "✖️ Close", callback_data=f"close_{user_id}"
+            )])
+        actions.append([InlineKeyboardButton(
+            "🔙 Back to Results", callback_data=f"back_{user_id}"
+        )])
+        return InlineKeyboardMarkup(actions)
+
     # ── Search ────────────────────────────────────────────────────────────────
     async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /search command."""
+        status_message = None
+        session_key = None
+        group_search_key = None
         try:
             if not context.args:
                 await update.message.reply_text(
                     "Please provide a book title or author name.\n\n"
                     "Example: <code>/search Harry Potter</code>",
                     parse_mode=ParseMode.HTML,
+                    reply_parameters=ReplyParameters(
+                        message_id=update.message.message_id,
+                        allow_sending_without_reply=True,
+                    ),
                 )
                 return
 
@@ -2040,6 +2224,29 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             query = update.callback_query
             callback_data = query.data
 
+            # All normal search-result controls carry the original requester's
+            # ID. Reject another group member before any cache/state is touched.
+            if callback_data.startswith(("page_", "book_", "back_", "download_", "close_")):
+                try:
+                    requester_id = int(callback_data.split("_")[1])
+                except (IndexError, ValueError):
+                    await query.answer("This button has expired.", show_alert=True)
+                    return
+                if update.effective_user.id != requester_id:
+                    await query.answer("These search results belong to another user.", show_alert=True)
+                    return
+
+            if callback_data.startswith("close_"):
+                self._clear_active_result_message(
+                    (query.message.chat_id, update.effective_user.id), query.message.message_id
+                )
+                try:
+                    await query.delete_message()
+                except Exception as exc:
+                    logger.info("Group result message could not be deleted: %s", exc)
+                await query.answer()
+                return
+
             # ── Pagination ───────────────────────────────────────────────────
             if callback_data.startswith("page_"):
                 parts = callback_data.split("_")
@@ -2086,17 +2293,32 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
                 # Delete the current message (could be a photo or text) and send
                 # a clean, fresh text-only message with the results list.
+                self._clear_active_result_message(
+                    (query.message.chat_id, user_id), query.message.message_id
+                )
                 await query.delete_message()
-                await context.bot.send_message(
+                result_message = await context.bot.send_message(
                     chat_id=query.message.chat_id,
                     text=results_text,
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML,
                 )
+                self._active_result_messages[(query.message.chat_id, user_id)] = {
+                    "message_id": result_message.message_id,
+                    "query": query_text,
+                    "page": page_num,
+                }
+                self._schedule_result_rating_refresh(
+                    books, query_text, user_id, page_num, query.message.chat_id,
+                    result_message.message_id, context.bot,
+                )
                 return
 
             # ── Download cover ────────────────────────────────────────────────
             if callback_data.startswith("download_"):
+                if getattr(query.message.chat, "type", "private") != "private":
+                    await query.answer("Cover downloads are available in private chat only.", show_alert=True)
+                    return
                 parts = callback_data.split("_")
                 user_id = int(parts[1])
                 book_idx = int(parts[2])
@@ -2294,6 +2516,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     )
                     return
 
+                cancel_exempt = (
+                    action == "clar_cancel"
+                    and await self._is_owner_or_group_admin(user_id, update.effective_chat)
+                )
                 self._clarification.pop(user_id, None)
                 try:
                     await query.delete_message()
@@ -2302,7 +2528,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     logger.info("Clarification prompt could not be deleted: %s", exc)
 
                 if action == "clar_cancel":
-                    abuse_action = self._record_clarification_cancel(user_id)
+                    abuse_action = self._record_clarification_cancel(user_id, exempt=cancel_exempt)
                     reply_text = (
                         "❌ Search cancelled. Please start a new search with a different query using /search."
                     )
@@ -2442,21 +2668,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 # ── END DIAGNOSTICS ──
 
                 try:
-                    keyboard = [
-                        [
-                            InlineKeyboardButton(
-                                "📥 Download Cover",
-                                callback_data=f"download_{user_id}_{book_idx}",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "🔙 Back to Results",
-                                callback_data=f"back_{user_id}",
-                            )
-                        ],
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    reply_markup = self._build_detail_keyboard(
+                        user_id, book_idx, getattr(query.message.chat, "type", "private")
+                    )
 
                     logger.info(f"ABOUT TO SEND COVER: path={_fpath} size={_fsize} position={_fpos_after_open}")
                     with open(temp_file, "rb") as f:
@@ -2471,15 +2685,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     logger.info(f"✅ Sent book: {book['title']}")
                 except Exception as e:
                     logger.warning(f"Could not send photo: {e}")
-                    keyboard = [
-                        [
-                            InlineKeyboardButton(
-                                "🔙 Back to Results",
-                                callback_data=f"back_{user_id}",
-                            )
-                        ]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    reply_markup = self._build_detail_keyboard(
+                        user_id, book_idx, getattr(query.message.chat, "type", "private")
+                    )
                     await context.bot.send_message(
                         chat_id=query.message.chat_id,
                         text=text_info,
@@ -2489,15 +2697,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 finally:
                     self.cleanup_temp_file(temp_file)
             else:
-                keyboard = [
-                    [
-                        InlineKeyboardButton(
-                            "🔙 Back to Results",
-                            callback_data=f"back_{user_id}",
-                        )
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                reply_markup = self._build_detail_keyboard(
+                    user_id, book_idx, getattr(query.message.chat, "type", "private")
+                )
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
                     text=text_info,
