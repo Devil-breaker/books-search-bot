@@ -3,9 +3,13 @@
 import asyncio
 import os
 import json
+import time
 import requests
 
-from src.utils import HEADERS, logger, is_placeholder_image, is_unreliable_gb_cover, translate_to_english
+from src.utils import (
+    HEADERS, get_http_session, logger, is_placeholder_image,
+    is_unreliable_gb_cover, translate_to_english,
+)
 from src.search import scrape_goodreads
 
 # Google Books API key is optional; without it the API still works, just unauthenticated.
@@ -41,7 +45,7 @@ class MultiSourceBookAggregator:
             if GOOGLE_BOOKS_API_KEY:
                 params["key"] = GOOGLE_BOOKS_API_KEY
 
-            response = requests.get(url, params=params, timeout=8)
+            response = get_http_session().get(url, params=params, timeout=8)
             if response.status_code != 200:
                 logger.warning(f"Google Books API error: {response.status_code}")
                 return []
@@ -179,7 +183,7 @@ class MultiSourceBookAggregator:
                 "limit": 8,
             }
 
-            response = requests.get(url, params=params, timeout=8)
+            response = get_http_session().get(url, params=params, timeout=8)
             if response.status_code != 200:
                 return []
 
@@ -226,7 +230,7 @@ class MultiSourceBookAggregator:
             }
             """
             variables = {"q": search_query, "limit": limit}
-            resp = requests.post(
+            resp = get_http_session().post(
                 "https://api.hardcover.app/v1/graphql",
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -361,15 +365,38 @@ class MultiSourceBookAggregator:
         """
         logger.info(f"📚 Aggregating data from multiple sources for: {query}")
 
+        async def timed_provider(name, search_fn, *args):
+            started = time.perf_counter()
+            results = []
+            try:
+                results = await asyncio.to_thread(search_fn, *args)
+                return results
+            finally:
+                count = len(results) if isinstance(results, list) else 0
+                logger.info(
+                    "[perf] provider=%s elapsed_ms=%d results=%d",
+                    name,
+                    round((time.perf_counter() - started) * 1000),
+                    count,
+                )
+
         # Run independent searches concurrently (both are pure I/O)
-        google_task = asyncio.to_thread(
-            MultiSourceBookAggregator.search_google_books, query, limit, False
+        google_task = timed_provider(
+            "google_books", MultiSourceBookAggregator.search_google_books,
+            query, limit, False,
         )
-        itunes_task = asyncio.to_thread(
-            MultiSourceBookAggregator.search_itunes, query
+        itunes_task = timed_provider(
+            "itunes", MultiSourceBookAggregator.search_itunes, query,
         )
+        aggregate_started = time.perf_counter()
         google_books, itunes_books = await asyncio.gather(
             google_task, itunes_task
+        )
+        logger.info(
+            "[perf] providers_complete elapsed_ms=%d google_books=%d itunes=%d",
+            round((time.perf_counter() - aggregate_started) * 1000),
+            len(google_books or []),
+            len(itunes_books or []),
         )
 
         # ── If the first Google Books result has no reliable cover, look for a later
@@ -563,7 +590,7 @@ class MultiSourceBookAggregator:
             }
             """
             variables = {"q": search_query, "limit": 10}
-            resp = requests.post(
+            resp = get_http_session().post(
                 "https://api.hardcover.app/v1/graphql",
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -778,7 +805,7 @@ class MultiSourceBookAggregator:
             return ""
         check_url = f"https://covers.openlibrary.org/b/isbn/{clean}-L.jpg?default=false"
         try:
-            r = requests.get(check_url, headers=HEADERS, timeout=10)
+            r = get_http_session().get(check_url, headers=HEADERS, timeout=10)
             if r.status_code == 200 and len(r.content) > 3000 and not is_placeholder_image(r.content):
                 logger.info(f"🖼️ Open Library cover found for ISBN {clean}")
                 return f"https://covers.openlibrary.org/b/isbn/{clean}-L.jpg"

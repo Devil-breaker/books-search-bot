@@ -26,7 +26,10 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Inli
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut
 
-from src.utils import logger, HEADERS, html_escape, is_placeholder_image, is_english_description, translate_to_english
+from src.utils import (
+    logger, HEADERS, get_http_session, html_escape, is_placeholder_image,
+    is_english_description, translate_to_english,
+)
 from src.search import build_goodreads_url
 from src.aggregator import MultiSourceBookAggregator, GOOGLE_BOOKS_API_KEY
 
@@ -69,6 +72,7 @@ class GoodreadsBot:
         self._aggregate_search_cache: dict[str, tuple[float, list[dict]]] = {}
         self._AGGREGATE_SEARCH_CACHE_TTL: int = 120
         self._AGGREGATE_SEARCH_CACHE_MAX: int = 128
+        self._aggregate_search_inflight: dict[str, asyncio.Task] = {}
         # Clarification state: {user_id: (original_query, title_hint, author_hint)}
         self._clarification: dict = {}
         # Rate-limit: {(user_id, norm_query): timestamp}
@@ -276,7 +280,7 @@ class GoodreadsBot:
             parts.append(f"inauthor:{author_hint}")
         gb_query = query if not parts else "+".join(parts)
 
-        resp = requests.get(
+        resp = get_http_session().get(
             "https://www.googleapis.com/books/v1/volumes",
             params={"q": gb_query, "maxResults": 6, "langRestrict": "en"},
             timeout=10,
@@ -331,7 +335,14 @@ class GoodreadsBot:
         def do_discover():
             return self._discover_candidate(query, title_hint, author_hint)
 
+        discovery_started = time.perf_counter()
         candidate = await asyncio.to_thread(do_discover)
+        logger.info(
+            "[perf] clarification_discovery elapsed_ms=%d matched=%s query=%r",
+            round((time.perf_counter() - discovery_started) * 1000),
+            candidate is not None,
+            query,
+        )
         if candidate is None:
             return False  # No strong match
 
@@ -468,7 +479,7 @@ class GoodreadsBot:
             logger.error(f"Error in _run_clarified_search: {e}", exc_info=True)
 
     async def _aggregate_search_results(self, query: str, limit: int = 10) -> list[dict]:
-        """Cached search via the aggregator; short TTL to avoid stale multi-source results."""
+        """Reuse cached and in-flight provider searches without changing results."""
         cache_key = f"{query.lower().strip()}|{limit}"
         cache = getattr(self, "_aggregate_search_cache", {})
         ttl = getattr(self, "_AGGREGATE_SEARCH_CACHE_TTL", 120)
@@ -480,6 +491,35 @@ class GoodreadsBot:
                 logger.info("Search result cache hit for query=%r", query)
                 return copy.deepcopy(books)
             cache.pop(cache_key, None)
+
+        inflight = getattr(self, "_aggregate_search_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._aggregate_search_inflight = inflight
+        task = inflight.get(cache_key)
+        if task is None or task.done():
+            logger.info("Search result cache miss for query=%r", query)
+            task = asyncio.create_task(
+                self._fetch_and_cache_aggregate_search(cache_key, query, limit, cache)
+            )
+            inflight[cache_key] = task
+
+            def clear_inflight(completed_task):
+                if inflight.get(cache_key) is completed_task:
+                    inflight.pop(cache_key, None)
+
+            task.add_done_callback(clear_inflight)
+        else:
+            logger.info("Search request joined in-flight fetch for query=%r", query)
+
+        # One cancelled Telegram update must not cancel a fetch shared by others.
+        books = await asyncio.shield(task)
+        return copy.deepcopy(books)
+
+    async def _fetch_and_cache_aggregate_search(
+        self, cache_key: str, query: str, limit: int, cache: dict
+    ) -> list[dict]:
+        started = time.perf_counter()
         books = await self.aggregator.aggregate_book_data(query, limit=limit)
         if isinstance(books, list) and books:
             max_entries = getattr(self, "_AGGREGATE_SEARCH_CACHE_MAX", 128)
@@ -487,6 +527,12 @@ class GoodreadsBot:
                 oldest_key = min(cache, key=lambda key: cache[key][0])
                 cache.pop(oldest_key, None)
             cache[cache_key] = (time.time(), copy.deepcopy(books))
+        logger.info(
+            "[perf] aggregate_search elapsed_ms=%d results=%d query=%r",
+            round((time.perf_counter() - started) * 1000),
+            len(books) if isinstance(books, list) else 0,
+            query,
+        )
         return books
 
     def _record_clarification_rate_limit(self, key: tuple[int, str], timestamp: float) -> None:
@@ -541,7 +587,7 @@ class GoodreadsBot:
                 params = {"q": search_query, "maxResults": max_results, "langRestrict": "en"}
                 if GOOGLE_BOOKS_API_KEY:
                     params["key"] = GOOGLE_BOOKS_API_KEY
-                response = requests.get(
+                response = get_http_session().get(
                     "https://www.googleapis.com/books/v1/volumes",
                     params=params, timeout=10,
                 )
@@ -1380,7 +1426,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             "next_offset": "",
         }
         try:
-            resp = requests.post(api_url, json=payload, timeout=5)
+            resp = get_http_session().post(api_url, json=payload, timeout=5)
             if resp.status_code != 200 or not resp.json().get("ok"):
                 logger.warning(f"answerInlineQuery failed: {resp.text}")
             else:
@@ -1628,7 +1674,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
         def _download_one(url: str):
             """Attempt one cover download. Returns (bytes, status, ctype, clen, final_url, width, height)."""
-            response = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+            response = get_http_session().get(url, headers=HEADERS, timeout=15, allow_redirects=True)
             response.raise_for_status()
             final_url = response.url
             ctype = response.headers.get("Content-Type", "")
@@ -1792,6 +1838,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         end_idx = min(page_num * page_size, len(books))
         visible = books[start_idx:end_idx]
 
+        preload_started = time.perf_counter()
         logger.info(f"Normal search Hardcover preload started: page={page_num}, books={len(visible)}")
 
         tasks = [
@@ -1829,7 +1876,11 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             else:
                 logger.info(f"Normal search Hardcover rating unavailable: {title}")
 
-        logger.info(f"Normal search Hardcover preload completed: page={page_num}")
+        logger.info(
+            "Normal search Hardcover preload completed: page=%s elapsed_ms=%d",
+            page_num,
+            round((time.perf_counter() - preload_started) * 1000),
+        )
 
     def _build_search_results_message(
         self, books: list, query_text: str, user_id: int, page_num: int, page_size: int

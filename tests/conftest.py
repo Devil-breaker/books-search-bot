@@ -80,4 +80,8 @@ def make_bot():
     bot._cached_books = {}
     bot._cached_users = {}
     bot._set_cached_books = MagicMock()
+    bot._aggregate_search_cache = {}
+    bot._AGGREGATE_SEARCH_CACHE_TTL = 120
+    bot._AGGREGATE_SEARCH_CACHE_MAX = 128
+    bot._aggregate_search_inflight = {}
     return bot

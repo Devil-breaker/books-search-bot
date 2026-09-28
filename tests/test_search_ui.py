@@ -5,7 +5,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Patch env before importing handlers
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "TEST_TOKEN")
@@ -28,6 +28,10 @@ def _make_bot():
     bot._inline_callback_cache = {}
     bot._INLINE_CALLBACK_CACHE_TTL = 30 * 60
     bot.aggregator = MagicMock()
+    bot._aggregate_search_cache = {}
+    bot._AGGREGATE_SEARCH_CACHE_TTL = 120
+    bot._AGGREGATE_SEARCH_CACHE_MAX = 128
+    bot._aggregate_search_inflight = {}
     return bot
 
 
@@ -62,6 +66,63 @@ class TestCache(unittest.TestCase):
             bot._set_cached_books(uid, [make_book()])
         # At most MAX entries should remain
         self.assertLessEqual(len(bot.search_cache), bot._SEARCH_CACHE_MAX)
+
+
+class TestAggregateSearchSingleFlight(unittest.IsolatedAsyncioTestCase):
+    async def test_simultaneous_identical_queries_share_one_fetch_and_isolate_results(self):
+        bot = _make_bot()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        result = [make_book(title="Shared result")]
+
+        async def delayed_aggregate(query, limit):
+            started.set()
+            await release.wait()
+            return result
+
+        bot.aggregator.aggregate_book_data = AsyncMock(side_effect=delayed_aggregate)
+        first = asyncio.create_task(bot._aggregate_search_results("Harry Potter"))
+        await started.wait()
+        second = asyncio.create_task(bot._aggregate_search_results("harry potter"))
+        await asyncio.sleep(0)
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        bot.aggregator.aggregate_book_data.assert_awaited_once_with(
+            "Harry Potter", limit=10
+        )
+        self.assertEqual(first_result[0]["title"], "Shared result")
+        self.assertEqual(second_result[0]["title"], "Shared result")
+        self.assertIsNot(first_result, second_result)
+        self.assertIsNot(first_result[0], second_result[0])
+
+    async def test_cancelled_waiter_does_not_cancel_shared_fetch(self):
+        bot = _make_bot()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_aggregate(query, limit):
+            started.set()
+            await release.wait()
+            return [make_book(title="Shared result")]
+
+        bot.aggregator.aggregate_book_data = AsyncMock(side_effect=delayed_aggregate)
+        cancelled_waiter = asyncio.create_task(
+            bot._aggregate_search_results("Dune")
+        )
+        await started.wait()
+        remaining_waiter = asyncio.create_task(
+            bot._aggregate_search_results("Dune")
+        )
+        await asyncio.sleep(0)
+        cancelled_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_waiter
+        release.set()
+        books = await remaining_waiter
+
+        self.assertEqual(books[0]["title"], "Shared result")
+        bot.aggregator.aggregate_book_data.assert_awaited_once()
 
 
 class TestResultDeduplication(unittest.TestCase):

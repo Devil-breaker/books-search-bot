@@ -4,7 +4,15 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import unittest
 
-from src.utils import html_escape, is_placeholder_image, is_unreliable_gb_cover, is_english_description
+from src.utils import (
+    get_http_session, html_escape, is_placeholder_image,
+    is_unreliable_gb_cover, is_english_description,
+)
+
+
+class TestReusableHttpSession(unittest.TestCase):
+    def test_session_is_reused_within_the_same_worker_thread(self):
+        self.assertIs(get_http_session(), get_http_session())
 
 
 class TestHtmlEscape(unittest.TestCase):

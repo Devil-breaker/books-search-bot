@@ -3,9 +3,20 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import unittest
+import requests
 from unittest.mock import patch
 
 from src.aggregator import MultiSourceBookAggregator
+
+_session_patch = patch("src.aggregator.get_http_session", return_value=requests)
+
+
+def setUpModule():
+    _session_patch.start()
+
+
+def tearDownModule():
+    _session_patch.stop()
 
 
 class TestAggregatorSearchRatingFields(unittest.TestCase):

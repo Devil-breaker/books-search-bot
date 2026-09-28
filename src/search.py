@@ -7,7 +7,7 @@ import json
 import requests
 from bs4 import BeautifulSoup
 
-from src.utils import logger
+from src.utils import get_http_session, logger
 
 # ── Rate limiting ────────────────────────────────────────────────────────────────
 MIN_REQUEST_INTERVAL = 2.0   # seconds between any two requests
@@ -36,14 +36,14 @@ def _polite_get(url: str):
         time.sleep(wait)
 
     try:
-        resp = requests.get(url, headers=_GR_HEADERS, timeout=12)
+        resp = get_http_session().get(url, headers=_GR_HEADERS, timeout=12)
         _last_request_ts = time.time()
         if resp.status_code == 200:
             return resp
         # 429 or 503 → back off a bit more and retry once
         if resp.status_code in (429, 503, 502, 504):
             time.sleep(5.0 + random.uniform(0, 2))
-            resp2 = requests.get(url, headers=_GR_HEADERS, timeout=12)
+            resp2 = get_http_session().get(url, headers=_GR_HEADERS, timeout=12)
             _last_request_ts = time.time()
             if resp2.status_code == 200:
                 return resp2

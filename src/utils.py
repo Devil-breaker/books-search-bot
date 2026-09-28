@@ -3,6 +3,8 @@
 import logging
 import hashlib
 import struct
+import threading
+import requests as _requests
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -21,6 +23,22 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
+
+_http_session_local = threading.local()
+
+
+def get_http_session():
+    """Return a reusable Requests session scoped to the current worker thread.
+
+    Search and metadata providers run in worker threads. Thread-local sessions
+    reuse keep-alive connections without sharing mutable Session state across
+    concurrent threads.
+    """
+    session = getattr(_http_session_local, "session", None)
+    if session is None:
+        session = _requests.Session()
+        _http_session_local.session = session
+    return session
 
 # ── HTML / Markdown helpers ─────────────────────────────────────────────────────
 from telegram import helpers
@@ -84,9 +102,6 @@ def is_unreliable_gb_cover(volume_id: str) -> bool:
 # Uses the same requests library already imported — no extra dependencies.
 # Handles 429 rate limits with a single retry after a short delay.
 
-import requests as _requests
-
-
 def translate_to_english(text: str) -> str:
     """Translate *text* to English. Returns original on failure."""
     if not text or not text.strip():
@@ -111,7 +126,7 @@ def _translate_chunk(text: str) -> str:
     """Translate a single short chunk. Internal — always called by the public fn."""
     for attempt in range(2):
         try:
-            resp = _requests.get(
+            resp = get_http_session().get(
                 "https://translate.googleapis.com/translate_a/single",
                 params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text},
                 headers={"User-Agent": "Mozilla/5.0"},

@@ -7,11 +7,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asyncio
 import unittest
 import time
+import requests
 from unittest.mock import patch, MagicMock, AsyncMock
 
 # Patch environment before imports
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "TEST_TOKEN")
 os.environ.setdefault("GOOGLE_BOOKS_API_KEY", "TEST_GB_KEY")
+
+import src.handlers
+
+_session_patch = patch("src.handlers.get_http_session", return_value=requests)
+
+
+def setUpModule():
+    _session_patch.start()
+
+
+def tearDownModule():
+    _session_patch.stop()
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
