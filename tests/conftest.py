@@ -77,6 +77,15 @@ def make_bot():
     bot._clarification_cancel_abuse = {}
     bot._clarification_abuse_notice_rate_limit = {}
     bot._clarification_cancel_notice_rate_limit = {}
+    bot._group_admin_status_cache = {}
+    bot._group_search_rate_limit = {}
+    bot._group_search_notice_rate_limit = {}
+    bot._group_search_inflight = set()
+    bot._active_result_messages = {}
+    bot._rating_refresh_tasks = set()
+    bot._clarification_discovery_cache = {}
+    bot._clarification_discovery_inflight = {}
+    bot._started_at = 0
     bot._cached_books = {}
     bot._cached_users = {}
     bot._set_cached_books = MagicMock()

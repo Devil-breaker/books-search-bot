@@ -5,13 +5,14 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Patch env before importing handlers
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "TEST_TOKEN")
 os.environ.setdefault("HARDCOVER_API_KEY", "TEST_KEY")
 
-from src.handlers import GoodreadsBot
+from src.handlers import GoodreadsBot, Update
 from src.aggregator import MultiSourceBookAggregator
 from tests.conftest import make_book
 
@@ -32,7 +33,216 @@ def _make_bot():
     bot._AGGREGATE_SEARCH_CACHE_TTL = 120
     bot._AGGREGATE_SEARCH_CACHE_MAX = 128
     bot._aggregate_search_inflight = {}
+    bot._owner_user_id = None
+    bot._group_admin_status_cache = {}
+    bot._started_at = time.time()
+    bot._clarification = {}
+    bot._clarification_cancel_abuse = {}
+    bot._clarification_abuse_notice_rate_limit = {}
+    bot._group_search_rate_limit = {}
+    bot._group_search_notice_rate_limit = {}
+    bot._group_search_inflight = set()
+    bot._active_result_messages = {}
+    bot._rating_refresh_tasks = set()
+    bot._clarification_discovery_cache = {}
+    bot._clarification_discovery_inflight = {}
     return bot
+
+
+def _callback_update(user_id, data, chat_type="group"):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_chat.id = -100
+    update.effective_chat.type = chat_type
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.delete_message = AsyncMock()
+    update.callback_query.message.chat_id = -100
+    update.callback_query.message.chat.type = chat_type
+    return update
+
+
+class TestGroupResultOwnership(unittest.IsolatedAsyncioTestCase):
+    async def test_non_requester_cannot_use_any_result_control(self):
+        bot = _make_bot()
+        for data in ("page_42_2", "book_42_0_1", "back_42", "close_42", "download_42_0"):
+            with self.subTest(data=data):
+                update = _callback_update(77, data)
+                await bot.button_callback(update, MagicMock())
+                update.callback_query.answer.assert_awaited_once()
+                self.assertTrue(update.callback_query.answer.await_args.kwargs["show_alert"])
+                update.callback_query.delete_message.assert_not_awaited()
+
+    async def test_requester_can_close_group_detail_message(self):
+        bot = _make_bot()
+        update = _callback_update(42, "close_42")
+
+        await bot.button_callback(update, MagicMock())
+
+        update.callback_query.delete_message.assert_awaited_once()
+        update.callback_query.answer.assert_awaited_once()
+
+    def test_group_detail_keyboard_has_close_and_no_cover_download(self):
+        keyboard = GoodreadsBot._build_detail_keyboard(42, 3, "supergroup")
+        labels = [button.text for row in keyboard.inline_keyboard for button in row]
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertEqual(labels, ["✖️ Close", "🔙 Back to Results"])
+        self.assertEqual(callbacks, ["close_42", "back_42"])
+
+    def test_private_detail_keyboard_keeps_cover_download(self):
+        keyboard = GoodreadsBot._build_detail_keyboard(42, 3, "private")
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        self.assertEqual(callbacks, ["download_42_3", "back_42"])
+
+
+class TestStartupUpdateHandling(unittest.IsolatedAsyncioTestCase):
+    def test_polling_drops_updates_queued_before_startup(self):
+        bot = _make_bot()
+        bot.app = MagicMock()
+        with patch("src.handlers.asyncio.get_running_loop", return_value=MagicMock()):
+            bot.run()
+        bot.app.run_polling.assert_called_once_with(drop_pending_updates=True)
+
+    def test_webhook_discards_a_command_from_before_startup(self):
+        bot = _make_bot()
+        bot._started_at = time.time()
+        bot.app = MagicMock()
+        old_command = MagicMock()
+        old_command.text = "/search old query"
+        old_command.date = datetime.fromtimestamp(bot._started_at - 60, timezone.utc)
+        update = MagicMock()
+        update.effective_message = old_command
+        update.update_id = 101
+
+        with patch.object(Update, "de_json", return_value=update):
+            processed = bot.process_update({"update_id": 101})
+
+        self.assertTrue(processed)
+        bot.app.process_update.assert_not_called()
+
+
+class TestSearchResponsiveness(unittest.IsolatedAsyncioTestCase):
+    async def test_clarification_discovery_cache_reuses_match(self):
+        bot = _make_bot()
+        candidate = {"title": "Goth", "author": "Otsuichi"}
+        with patch.object(bot, "_discover_candidate", return_value=candidate) as discover:
+            first = await bot._discover_candidate_cached("Goth by Otsu", "Goth", "Otsu")
+            second = await bot._discover_candidate_cached("Goth by Otsu", "Goth", "Otsu")
+
+        self.assertEqual(first, candidate)
+        self.assertEqual(second, candidate)
+        discover.assert_called_once_with("Goth by Otsu", "Goth", "Otsu")
+
+    async def test_repeated_group_search_is_limited_and_notice_is_throttled(self):
+        bot = _make_bot()
+        bot.app = MagicMock()
+        bot.app.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="member"))
+        update = _callback_update(42, "noop")
+        update.effective_message.reply_text = AsyncMock()
+        key = (-100, 42)
+        bot._group_search_rate_limit[key] = time.monotonic()
+
+        self.assertTrue(await bot._group_search_is_rate_limited(update))
+        self.assertTrue(await bot._group_search_is_rate_limited(update))
+        update.effective_message.reply_text.assert_awaited_once()
+
+    async def test_initial_results_render_before_rating_preload(self):
+        bot = _make_bot()
+        bot._reject_search_during_clarification_restriction = AsyncMock(return_value=False)
+        bot._group_search_is_rate_limited = AsyncMock(return_value=False)
+        bot._try_clarification = AsyncMock(return_value=False)
+        bot._aggregate_search_results = AsyncMock(return_value=[make_book(title="Dune")])
+        bot._rank_search_results = MagicMock(side_effect=lambda books, query: books)
+        bot._set_cached_books = MagicMock()
+        bot._build_search_results_message = MagicMock(return_value=("Results", "keyboard"))
+        bot._preload_hardcover_ratings_for_page = AsyncMock()
+        bot._schedule_result_rating_refresh = MagicMock()
+
+        status = MagicMock()
+        status.message_id = 500
+        status.edit_text = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 42
+        update.effective_chat.id = -100
+        update.message.message_id = 400
+        update.message.reply_text = AsyncMock(return_value=status)
+        update.message.chat.send_action = AsyncMock()
+        update.message.chat.type = "supergroup"
+        context = MagicMock()
+        context.args = ["Dune"]
+
+        await bot.search_command(update, context)
+
+        update.message.reply_text.assert_awaited_once()
+        self.assertIn("Searching for", update.message.reply_text.await_args.args[0])
+        status.edit_text.assert_awaited_once_with(
+            text="Results", reply_markup="keyboard", parse_mode="HTML"
+        )
+        bot._preload_hardcover_ratings_for_page.assert_not_awaited()
+        bot._schedule_result_rating_refresh.assert_called_once_with(
+            bot._set_cached_books.call_args.args[1],
+            "Dune", 42, 1, -100, 500, context.bot,
+        )
+
+    async def test_late_rating_refresh_does_not_overwrite_a_different_page(self):
+        bot = _make_bot()
+        books = [make_book(title="Dune")]
+        bot._active_result_messages[(-100, 42)] = {
+            "message_id": 500,
+            "query": "Dune",
+            "page": 2,
+        }
+        bot._preload_hardcover_ratings_for_page = AsyncMock()
+        bot._build_search_results_message = MagicMock()
+        telegram_bot = MagicMock()
+        telegram_bot.edit_message_text = AsyncMock()
+
+        await bot._refresh_result_ratings(
+            books, "Dune", 42, 1, -100, 500, telegram_bot
+        )
+
+        bot._preload_hardcover_ratings_for_page.assert_awaited_once_with(books, 1, 5)
+        bot._build_search_results_message.assert_not_called()
+        telegram_bot.edit_message_text.assert_not_awaited()
+
+    async def test_group_admin_is_exempt_from_an_active_restriction(self):
+        bot = _make_bot()
+        bot._clarification_cancel_abuse[42] = {
+            "blocked_until": time.time() + 3600,
+        }
+        bot._clarification_abuse_notice_rate_limit = {}
+        bot.app = MagicMock()
+        bot.app.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="administrator"))
+        update = MagicMock()
+        update.effective_user.id = 42
+        update.effective_chat.id = -100
+        update.effective_chat.type = "supergroup"
+
+        rejected = await bot._reject_search_during_clarification_restriction(update)
+
+        self.assertFalse(rejected)
+        bot.app.bot.get_chat_member.assert_awaited_once_with(-100, 42)
+
+    async def test_group_admin_cancel_does_not_increment_abuse_state(self):
+        bot = _make_bot()
+        bot._owner_user_id = None
+        bot.app = MagicMock()
+        bot.app.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="creator"))
+        bot.app.bot.send_message = AsyncMock()
+        update = _callback_update(42, "clar_cancel_42")
+        bot._clarification = {42: {
+            "requester_id": 42,
+            "chat_id": -100,
+            "message_id": 1001,
+            "source_message_id": 1000,
+            "chat_type": "supergroup",
+            "query": "example",
+        }}
+        update.callback_query.message.message_id = 1001
+
+        await bot.button_callback(update, MagicMock())
+
+        self.assertNotIn(42, bot._clarification_cancel_abuse)
 
 
 # ── Cache ──────────────────────────────────────────────────────────────────────

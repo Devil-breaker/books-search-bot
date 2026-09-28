@@ -113,6 +113,11 @@ class GoodreadsBot:
     _CANCEL_ABUSE_COOLDOWN_SECONDS = 5 * 60
     _CANCEL_ABUSE_ESCALATION_WINDOW_SECONDS = 24 * 60 * 60
     _CANCEL_ABUSE_BLOCK_SECONDS = 60 * 60
+    _GROUP_SEARCH_COOLDOWN_SECONDS = 3
+    _GROUP_SEARCH_NOTICE_INTERVAL_SECONDS = 15
+    _CLARIFICATION_DISCOVERY_CACHE_TTL_SECONDS = 5 * 60
+    _CLARIFICATION_DISCOVERY_MISS_TTL_SECONDS = 60
+    _CLARIFICATION_DISCOVERY_CACHE_MAX = 256
 
     _STOPWORDS: set = {
         "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -492,11 +497,8 @@ class GoodreadsBot:
         if not needs:
             return False  # Not a clarification query
 
-        def do_discover():
-            return self._discover_candidate(query, title_hint, author_hint)
-
         discovery_started = time.perf_counter()
-        candidate = await asyncio.to_thread(do_discover)
+        candidate = await self._discover_candidate_cached(query, title_hint, author_hint)
         logger.info(
             "[perf] clarification_discovery elapsed_ms=%d matched=%s query=%r",
             round((time.perf_counter() - discovery_started) * 1000),
@@ -2163,23 +2165,54 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     "Please provide a valid search query (at least 2 characters).\n\n"
                     "Example: <code>/search Harry Potter</code>",
                     parse_mode=ParseMode.HTML,
+                    reply_parameters=ReplyParameters(
+                        message_id=update.message.message_id,
+                        allow_sending_without_reply=True,
+                    ),
                 )
                 return
 
-            await update.message.chat.send_action("typing")
             logger.info(f"👤 User search: {query_text}")
 
             if await self._reject_search_during_clarification_restriction(update):
                 return
 
+            if await self._group_search_is_rate_limited(update):
+                return
+
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            session_key = (chat_id, user_id)
+            if update.effective_chat.type in ("group", "supergroup"):
+                group_search_key = session_key
+                self._group_search_inflight.add(group_search_key)
+            await update.message.chat.send_action("typing")
+            status_message = await update.message.reply_text(
+                f"🔎 Searching for <i>{html_escape(query_text)}</i>…",
+                parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(
+                    message_id=update.message.message_id,
+                    allow_sending_without_reply=True,
+                ),
+            )
+            self._active_result_messages[session_key] = {
+                "message_id": status_message.message_id,
+                "query": query_text,
+                "page": 1,
+            }
+
             # Check if clarification is needed BEFORE calling the aggregator.
             stop = await self._try_clarification(update, query_text)
             if stop:
+                self._clear_active_result_message(session_key, status_message.message_id)
+                try:
+                    await status_message.delete()
+                except Exception:
+                    pass
                 return
 
-            # Get aggregator results, then preload Hardcover ratings for visible books.
-            # Hardcover is the single source of truth for list ratings; each book on the
-            # current page is looked up individually via _get_hardcover_cached (cached, concurrent).
+            # Keep matching and ranking synchronous with the original search flow.
+            # Only the slow list-rating preload moves after the first result render.
             books = await self._aggregate_search_results(query_text, limit=10)
             books = self._rank_search_results(
                 self._deduplicate_search_results(books, query_text), query_text
@@ -2187,34 +2220,55 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
             if not books:
                 logger.warning(f"No books found for: {query_text}")
-                await update.message.reply_text(
+                self._clear_active_result_message(session_key, status_message.message_id)
+                await status_message.edit_text(
                     f"❌ <b>No books found</b> for '<b>{html_escape(query_text)}</b>'\n\n"
                     "<i>Try different keywords or check spelling.</i>",
                     parse_mode=ParseMode.HTML,
                 )
                 return
 
-            user_id = update.effective_user.id
             self._set_cached_books(user_id, books)
             self._search_page_cache[user_id] = 1
             self._search_query_cache[user_id] = query_text
 
-            # Preload Hardcover ratings for page 1 BEFORE building the UI.
-            # Hardcover must be available so ratings appear in the result list.
-            # _preload_hardcover_ratings_for_page is async; internally it runs concurrent
-            # Hardcover lookups via asyncio.gather() inside asyncio.to_thread().
-            await self._preload_hardcover_ratings_for_page(books, 1, 5)
-            logger.info("Normal search result list building AFTER Hardcover preload")
             results_text, keyboard = self._build_search_results_message(
                 books, query_text, user_id, 1, 5
             )
-            await update.message.reply_text(results_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            await status_message.edit_text(
+                text=results_text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
+            self._schedule_result_rating_refresh(
+                books, query_text, user_id, 1, chat_id,
+                status_message.message_id, context.bot,
+            )
 
         except Exception as e:
             logger.error(f"Error in search_command: {e}", exc_info=True)
+            if status_message is not None:
+                if session_key is not None:
+                    self._clear_active_result_message(session_key, status_message.message_id)
+                try:
+                    await status_message.edit_text(
+                        "❌ An error occurred while searching.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                except Exception:
+                    pass
             await update.message.reply_text(
-                "❌ An error occurred while searching.", parse_mode=ParseMode.HTML
+                "❌ An error occurred while searching.",
+                parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(
+                    message_id=update.message.message_id,
+                    allow_sending_without_reply=True,
+                ),
             )
+        finally:
+            if group_search_key is not None:
+                self._group_search_inflight.discard(group_search_key)
 
     # ── Button callbacks ────────────────────────────────────────────────────────
 
@@ -2260,18 +2314,22 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
                 self._search_page_cache[user_id] = page_num
                 query_text = self._search_query_cache.get(user_id, "")
-
-                # Preload Hardcover ratings for this page BEFORE rebuilding the message.
-                # Hardcover must be available so ratings appear in the list.
-                # _preload_hardcover_ratings_for_page is async; internally it runs concurrent
-                # Hardcover lookups via asyncio.gather() inside asyncio.to_thread().
-                await self._preload_hardcover_ratings_for_page(books, page_num, 5)
-                logger.info(f"Building result list page {page_num} AFTER Hardcover preload")
+                chat_id = query.message.chat_id
+                message_id = query.message.message_id
+                self._active_result_messages[(chat_id, user_id)] = {
+                    "message_id": message_id,
+                    "query": query_text,
+                    "page": page_num,
+                }
                 results_text, keyboard = self._build_search_results_message(
                     books, query_text, user_id, page_num, 5
                 )
                 await query.edit_message_text(
                     text=results_text, reply_markup=keyboard, parse_mode=ParseMode.HTML
+                )
+                self._schedule_result_rating_refresh(
+                    books, query_text, user_id, page_num, chat_id,
+                    message_id, context.bot,
                 )
                 return
 
@@ -2567,6 +2625,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             # page_num is encoded in callback as 4th part (for Back to Results restoration)
             page_num = int(parts[3]) if len(parts) > 3 else 1
             self._search_page_cache[user_id] = page_num
+            self._active_result_messages.pop(
+                (query.message.chat_id, user_id), None
+            )
 
             books = self._get_cached_books(user_id)
             if books is None:

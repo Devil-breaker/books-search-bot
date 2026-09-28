@@ -72,6 +72,14 @@ def make_bot():
     bot._owner_user_id = None
     bot._clarification_cancel_abuse = {}
     bot._clarification_abuse_notice_rate_limit = {}
+    bot._group_admin_status_cache = {}
+    bot._group_search_rate_limit = {}
+    bot._group_search_notice_rate_limit = {}
+    bot._group_search_inflight = set()
+    bot._active_result_messages = {}
+    bot._rating_refresh_tasks = set()
+    bot._clarification_discovery_cache = {}
+    bot._clarification_discovery_inflight = {}
     bot._clarification_cancel_notice_rate_limit = {}
     bot._cached_books = {}
     bot._cached_users = {}
@@ -1234,9 +1242,9 @@ class TestGroupChatClarificationBinding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["source_message_id"], 111)
         self.assertEqual(state["message_id"], 222)
         update.message.reply_text.assert_awaited_once()
-        self.assertEqual(
-            update.message.reply_text.await_args.kwargs["reply_to_message_id"], 111
-        )
+        reply_parameters = update.message.reply_text.await_args.kwargs["reply_parameters"]
+        self.assertEqual(reply_parameters.message_id, 111)
+        self.assertTrue(reply_parameters.allow_sending_without_reply)
 
         # The callback reports the prompt's ID (222), not the search's ID (111).
         callback = _make_callback_update(
