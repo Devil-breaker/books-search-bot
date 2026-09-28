@@ -125,6 +125,50 @@ class TestAggregateSearchSingleFlight(unittest.IsolatedAsyncioTestCase):
         bot.aggregator.aggregate_book_data.assert_awaited_once()
 
 
+class TestCoverFallback(unittest.TestCase):
+    def test_valid_hardcover_fallback_is_saved_after_google_books_placeholder(self):
+        bot = _make_bot()
+        primary = MagicMock()
+        primary.content = b"google-placeholder"
+        primary.status_code = 200
+        primary.headers = {"Content-Type": "image/png"}
+        primary.url = "https://books.google.com/placeholder"
+        primary.raise_for_status.return_value = None
+
+        fallback = MagicMock()
+        fallback.content = b"valid-hardcover-cover-bytes"
+        fallback.status_code = 200
+        fallback.headers = {"Content-Type": "image/jpeg"}
+        fallback.url = "https://assets.hardcover.app/cover.jpg"
+        fallback.raise_for_status.return_value = None
+
+        session = MagicMock()
+        session.get.side_effect = [primary, fallback]
+        book = {
+            "title": "Do Epic Shit",
+            "author": "Ankur Warikoo",
+            "cover_source": "google_books",
+            "_hardcover_match": {
+                "cover_url": "https://assets.hardcover.app/cover.jpg"
+            },
+        }
+
+        with patch("src.handlers.get_http_session", return_value=session), patch(
+            "src.handlers.is_placeholder_image", side_effect=[True, False]
+        ):
+            temp_path = bot.download_and_save_image(
+                "https://books.google.com/placeholder", book
+            )
+
+        try:
+            self.assertIsNotNone(temp_path)
+            with open(temp_path, "rb") as cover_file:
+                self.assertEqual(cover_file.read(), fallback.content)
+            self.assertEqual(session.get.call_count, 2)
+        finally:
+            bot.cleanup_temp_file(temp_path)
+
+
 class TestResultDeduplication(unittest.TestCase):
     def test_ranking_prefers_full_title_and_author_match(self):
         bot = _make_bot()

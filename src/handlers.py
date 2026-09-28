@@ -1662,17 +1662,17 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         """
         cover_source = (book or {}).get("cover_source", "unknown")
 
-        def _log_cover_diagnostic(url, status, ctype, clen, final_url, width, height):
+        def _log_cover_diagnostic(source, url, status, ctype, clen, final_url, width, height):
             """Log diagnostic info for a cover download (PART 4)."""
             domain = urlsplit(url).netloc
             final_domain = urlsplit(final_url).netloc if final_url != url else domain
             logger.info(
-                f"Cover diag: source={cover_source} url={url[:70]} "
+                f"Cover diag: source={source} url={url[:70]} "
                 f"status={status} type={ctype} len={clen} "
                 f"domain={final_domain} dims={width}x{height}"
             )
 
-        def _download_one(url: str):
+        def _download_one(url: str, source: str = cover_source):
             """Attempt one cover download. Returns (bytes, status, ctype, clen, final_url, width, height)."""
             response = get_http_session().get(url, headers=HEADERS, timeout=15, allow_redirects=True)
             response.raise_for_status()
@@ -1685,11 +1685,12 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 width, height = img.size
             except Exception:
                 pass
-            _log_cover_diagnostic(url, response.status_code, ctype, clen, final_url, width, height)
+            _log_cover_diagnostic(source, url, response.status_code, ctype, clen, final_url, width, height)
             return response.content, response.status_code, ctype, clen, final_url, width, height
 
         try:
             title = (book or {}).get("title", "")
+            result_source = cover_source
             logger.info(f"📥 Downloading cover: {cover_url[:60]}... source={cover_source} title={title}")
             content, status, ctype, clen, final_url, width, height = _download_one(cover_url)
 
@@ -1702,7 +1703,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                         logger.info(f"Cover fallback: source=hardcover title={title}")
                         try:
                             content, status, ctype, clen, final_url, width, height = (
-                                _download_one(hc_cover)
+                                _download_one(hc_cover, source="hardcover")
                             )
                             if is_placeholder_image(content):
                                 logger.warning(
@@ -1711,18 +1712,21 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                                 return None
                             logger.info(f"✅ Cover fallback OK: source=hardcover title={title} bytes={clen}")
                             # Fall through — content now holds the valid fallback bytes.
+                            result_source = "hardcover"
                         except Exception as e:
                             logger.warning(f"Fallback cover download failed: {e} title={title}")
                             return None
                     else:
                         logger.info(f"No Hardcover cover available for fallback. title={title}")
-                return None
+                        return None
+                else:
+                    return None
 
             # ── Write temp file (reached by both primary and fallback paths) ──────
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             temp_file.write(content)
             temp_file.close()
-            logger.info(f"✅ Downloaded: source={cover_source} title={title} bytes={clen}")
+            logger.info(f"✅ Downloaded: source={result_source} title={title} bytes={clen}")
             return temp_file.name
         except Exception as e:
             logger.error(f"Error downloading image: {e}")
