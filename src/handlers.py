@@ -37,6 +37,9 @@ from src.aggregator import MultiSourceBookAggregator, GOOGLE_BOOKS_API_KEY
 class GoodreadsBot:
     def __init__(self, token: str, webhook_mode: bool = False):
         self.token = token
+        # Used by webhook deployments to reject commands Telegram redelivers
+        # from before this process started. Polling also drops its backlog.
+        self._started_at = time.time()
         # Generous timeouts make the long-polling loop more tolerant of slow or
         # flaky networks (the source of the httpx.ReadError on getUpdates).
         self.app = (
@@ -734,6 +737,20 @@ class GoodreadsBot:
         """
         try:
             update = Update.de_json(raw_update, self.app.bot)
+            message = update.effective_message
+            if (
+                message is not None
+                and getattr(message, "text", None)
+                and message.text.lstrip().startswith("/")
+                and getattr(message, "date", None) is not None
+                and message.date.timestamp() < int(self._started_at)
+            ):
+                logger.info(
+                    "Ignoring pre-startup command update_id=%s message_date=%s",
+                    getattr(update, "update_id", "unknown"),
+                    message.date.isoformat(),
+                )
+                return True
             loop = None
             try:
                 loop = asyncio.get_event_loop()
@@ -2664,7 +2681,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        self.app.run_polling()
+        # Telegram retains updates while long polling is disconnected. Discard
+        # that backlog on startup so commands sent while the bot was down are
+        # not unexpectedly executed after it recovers.
+        self.app.run_polling(drop_pending_updates=True)
 
 
 # ── Vercel singleton (survives warm starts) ─────────────────────────────────
