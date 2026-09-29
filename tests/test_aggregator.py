@@ -258,6 +258,78 @@ class TestAggregatorInternalMethods(unittest.TestCase):
         self.assertTrue(callable(MultiSourceBookAggregator._ensure_cover))
 
 
+class TestHardcoverCoverMatching(unittest.TestCase):
+    def _mock_response(self, docs):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "data": {"search": {"results": {
+                "hits": [{"document": doc} for doc in docs]
+            }}}
+        }
+        return response
+
+    @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-key"})
+    @patch("src.aggregator.get_http_session")
+    def test_cover_accepts_punctuation_variant_with_exact_title_and_author(self, mock_session):
+        mock_session.return_value.post.return_value = self._mock_response([{
+            "title": "Angels and Demons",
+            "author_names": ["Dan Brown"],
+            "rating": 4.0,
+            "ratings_count": 1000,
+            "image": {"url": "https://assets.hardcover.app/angels.jpg"},
+        }])
+
+        result = MultiSourceBookAggregator._get_hardcover_data(
+            "", "Angels & Demons", "Dan Brown"
+        )
+
+        self.assertEqual(result[3], "https://assets.hardcover.app/angels.jpg")
+
+    @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-key"})
+    @patch("src.aggregator.get_http_session")
+    def test_cover_rejects_unrelated_fallback_hit(self, mock_session):
+        mock_session.return_value.post.return_value = self._mock_response([{
+            "title": "The Da Vinci Code",
+            "author_names": ["Dan Brown"],
+            "rating": 4.2,
+            "ratings_count": 5000,
+            "image": {"url": "https://assets.hardcover.app/davinci.jpg"},
+        }])
+
+        result = MultiSourceBookAggregator._get_hardcover_data(
+            "", "Angels & Demons", "Dan Brown"
+        )
+
+        # The fallback can still provide legacy rating data, but not its cover.
+        self.assertEqual(result[0], 4.2)
+        self.assertEqual(result[3], "")
+
+
+class TestHardcoverCoverPreference(unittest.TestCase):
+    def test_verified_hardcover_cover_replaces_google_books_cover(self):
+        book = {
+            "title": "Angels & Demons",
+            "author": "Dan Brown",
+            "rating": 0,
+            "cover_url": "https://books.google.com/incorrect.jpg",
+            "cover_source": "google_books",
+        }
+        hardcover = (
+            4.0, 1000, [], "https://assets.hardcover.app/angels.jpg"
+        )
+
+        with patch.object(
+            MultiSourceBookAggregator,
+            "_get_hardcover_cached",
+            return_value=hardcover,
+        ):
+            updated, hc_data = MultiSourceBookAggregator._ensure_ratings(book)
+
+        self.assertEqual(updated["cover_url"], hardcover[3])
+        self.assertEqual(updated["cover_source"], "hardcover")
+        self.assertEqual(hc_data, hardcover)
+
+
 class TestPairMatchesUnicode(unittest.TestCase):
     """Regression tests for pair_matches Unicode handling in Google Books fallback.
 

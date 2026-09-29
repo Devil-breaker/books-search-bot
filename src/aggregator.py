@@ -3,6 +3,7 @@
 import asyncio
 import os
 import json
+import re
 import time
 import requests
 
@@ -763,10 +764,46 @@ class MultiSourceBookAggregator:
 
             doc = best_hit.get("document", {})
 
+            # A search fallback may be useful for ratings, but it must not
+            # provide a cover unless Hardcover's record exactly matches both
+            # the requested title and author. Normalize punctuation so common
+            # catalog variants such as "Angels & Demons" / "Angels and Demons"
+            # compare equally.
+            def _cover_match_key(value):
+                value = str(value or "").casefold().replace("&", " and ")
+                return " ".join(re.findall(r"[^\W_]+", value, flags=re.UNICODE))
+
+            requested_title_key = _cover_match_key(title)
+            requested_author_key = _cover_match_key(author)
+            exact_cover_hits = []
+            if requested_title_key and requested_author_key:
+                for hit in hits:
+                    candidate = hit.get("document", {})
+                    candidate_title_key = _cover_match_key(candidate.get("title", ""))
+                    candidate_authors = candidate.get("author_names", [])
+                    if isinstance(candidate_authors, list):
+                        candidate_author_key = _cover_match_key(" ".join(candidate_authors))
+                    else:
+                        candidate_author_key = _cover_match_key(candidate_authors)
+                    if (candidate_title_key == requested_title_key
+                            and candidate_author_key == requested_author_key):
+                        exact_cover_hits.append(hit)
+
+            exact_cover_hits = [
+                hit for hit in exact_cover_hits
+                if (hit.get("document", {}).get("image", {}) or {}).get("url")
+            ]
+
+            cover_doc = max(
+                exact_cover_hits,
+                key=lambda h: h.get("document", {}).get("ratings_count") or 0,
+                default={},
+            ).get("document", {})
+
             rating = doc.get("rating") or 0.0
             ratings_count = doc.get("ratings_count") or 0
             genres = doc.get("genres", []) or []
-            image_data = doc.get("image", {}) or {}
+            image_data = cover_doc.get("image", {}) or {}
             image_url = image_data.get("url", "")
 
             if rating and ratings_count:
@@ -774,7 +811,8 @@ class MultiSourceBookAggregator:
                 return round(float(rating), 2), int(ratings_count), genres, image_url
             else:
                 logger.debug(f"Hardcover hit has no rating: rating={rating}, count={ratings_count}")
-                return 0.0, 0, [], ""
+                # The exact-match cover remains useful even without ratings.
+                return 0.0, 0, [], image_url
 
         except Exception as e:
             logger.debug(f"Hardcover.app data lookup failed: {e}")
@@ -855,7 +893,7 @@ class MultiSourceBookAggregator:
                 book["rating_formatted"] = f"{hc_rating:.2f}"
                 if hc_genres:
                     book["categories"] = hc_genres
-                if hc_cover and not book.get("cover_url"):
+                if hc_cover:
                     book["cover_url"] = hc_cover
                     book["cover_source"] = "hardcover"
                 logger.info(f"Reusing cached Hardcover data for: {book.get('title', '')}")
@@ -866,6 +904,9 @@ class MultiSourceBookAggregator:
             hc_data = MultiSourceBookAggregator._get_hardcover_cached(
                 book.get("isbn", ""), book.get("title", ""), book.get("author", "")
             )
+            if hc_data[3]:
+                book["cover_url"] = hc_data[3]
+                book["cover_source"] = "hardcover"
             return book, hc_data
 
         # 3) Hardcover API lookup (cached to avoid repeat calls)
@@ -880,7 +921,7 @@ class MultiSourceBookAggregator:
             # Store Hardcover genres and cover for later use
             if hc_genres:
                 book["categories"] = hc_genres
-            if hc_cover and not book.get("cover_url"):
+            if hc_cover:
                 book["cover_url"] = hc_cover
                 book["cover_source"] = "hardcover"
             return book, (hc_rating, hc_count, hc_genres, hc_cover)
@@ -894,6 +935,12 @@ class MultiSourceBookAggregator:
             book["rating_count"] = sg_count
             book["rating_source"] = "storygraph"
             book["rating_formatted"] = f"{sg_rating:.2f}"
+
+        # A verified Hardcover cover can improve on a potentially misassigned
+        # Google Books image even when neither source has a rating.
+        if hc_cover:
+            book["cover_url"] = hc_cover
+            book["cover_source"] = "hardcover"
 
         return book, (hc_rating, hc_count, hc_genres, hc_cover)
 
