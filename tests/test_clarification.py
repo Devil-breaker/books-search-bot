@@ -145,6 +145,21 @@ class TestIsClarificationQuery(unittest.TestCase):
         """'harry potter j.k. rowling' (2+2) should match."""
         self._check("harry potter j.k. rowling", True)
 
+    def test_plain_titles_ending_in_connectors_are_not_split(self):
+        """Don't treat the final title word as an author after a connector."""
+        for query in (
+            "Crime and Punishment",
+            "Angels & Demons",
+            "War or Peace",
+            "The Old Man and the Sea",
+        ):
+            with self.subTest(query=query):
+                self._check(query, False)
+
+    def test_title_plus_author_after_connector_still_matches(self):
+        """A connector inside the complete title must not block its author suffix."""
+        self._check("Crime and Punishment Dostoevsky", True)
+
     def test_short_title_not_matched(self):
         """Single-char or 2-char title hints should not match."""
         self._check("a smith", False)
@@ -401,6 +416,57 @@ class TestDiscoverCandidate(unittest.TestCase):
             self.assertIn("Harry Potter", result["title"])
             self.assertIn("Rowling", result["author"])
             self.assertEqual(mock_get.call_count, 2)
+
+    def test_fallback_searches_other_catalog_languages(self):
+        """Language-neutral fallback can discover titles catalogued outside English."""
+        bot = make_bot()
+        bot._STOPWORDS = frozenset({"the", "a", "an", "of", "in", "for", "with", "on", "at", "to", "by", "and", "or", "is", "are"})
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [
+                make_gb_response([]),
+                make_gb_response([
+                    {"title": "Starting Over 重啟人生", "author": "Sugaru Miaki"}
+                ]),
+            ]
+            result = bot._discover_candidate(
+                "Starting over by Sugaru",
+                title_hint="Starting over",
+                author_hint="Sugaru",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["author"], "Sugaru Miaki")
+        fallback_params = mock_get.call_args_list[1].kwargs["params"]
+        self.assertNotIn("langRestrict", fallback_params)
+        self.assertEqual(
+            fallback_params["q"],
+            'intitle:"Starting over" inauthor:"Sugaru"',
+        )
+        self.assertEqual(fallback_params["maxResults"], 40)
+
+    def test_combined_plain_query_recovers_misindexed_translated_edition(self):
+        """Keep title+author constraints while retrying without field operators."""
+        bot = make_bot()
+        bot._STOPWORDS = frozenset({"the", "a", "an", "of", "in", "for", "with", "on", "at", "to", "by", "and", "or", "is", "are"})
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [
+                make_gb_response([]),  # structured English search
+                make_gb_response([]),  # structured all-language search
+                make_gb_response([   # unstructured combined search
+                    {"title": "Starting Over 重啟人生", "author": "Sugaru Miaki"}
+                ]),
+            ]
+            result = bot._discover_candidate(
+                "Starting Over by Sugaru",
+                title_hint="Starting Over",
+                author_hint="Sugaru",
+            )
+
+        self.assertEqual(result["title"], "Starting Over 重啟人生")
+        self.assertEqual(result["author"], "Sugaru Miaki")
+        combined_params = mock_get.call_args_list[2].kwargs["params"]
+        self.assertEqual(combined_params["q"], '"Starting Over" "Sugaru"')
+        self.assertNotIn("langRestrict", combined_params)
 # ── Test: cooldown / rate-limiting ───────────────────────────────────────────
 
 class TestCooldown(unittest.IsolatedAsyncioTestCase):
@@ -543,6 +609,40 @@ def _make_callback_update(user_id: int, callback_data: str, chat_id: int = 99,
 class TestClarificationButtonActions(unittest.IsolatedAsyncioTestCase):
     """Yes/No/Cancel buttons: delete message, correct search dispatch."""
 
+    async def test_yes_search_includes_supplementary_non_english_books(self):
+        bot = make_bot()
+        bot.aggregator = MagicMock()
+        bot.aggregator.aggregate_book_data = AsyncMock(return_value=[
+            {
+                "title": "Three Days of Happiness",
+                "author": "Sugaru Miaki",
+                "language": "ja",
+            },
+        ])
+        bot._aggregate_search_results = AsyncMock(return_value=[
+            {"title": "Starting Over 重啟人生", "author": "三秋縋", "language": "zh"},
+        ])
+        bot._set_cached_books = MagicMock()
+        bot._preload_hardcover_ratings_for_page = AsyncMock()
+        bot._build_search_results_message = MagicMock(return_value=("results", None))
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock()
+        update = make_mock_update("Starting Over by Sugaru Miaki")
+
+        await bot._run_clarified_search(
+            update,
+            "Starting Over by Sugaru Miaki",
+            "Starting Over",
+            "Sugaru Miaki",
+        )
+
+        cached_books = bot._set_cached_books.call_args.args[1]
+        self.assertEqual(
+            {book["title"] for book in cached_books},
+            {"Starting Over 重啟人生", "Three Days of Happiness"},
+        )
+        self.assertIn("ja", {book["language"] for book in cached_books})
+
     async def test_yes_deletes_and_searches_title_plus_author(self):
         """Yes: deletes prompt, sends result via chat_id from effective_chat."""
         bot = make_bot()
@@ -559,7 +659,8 @@ class TestClarificationButtonActions(unittest.IsolatedAsyncioTestCase):
             "requester_id": 42,
         }}
         bot._clarification_rate_limit = {}
-        sample_books = [{"title": "Harry Potter and the Philosopher's Stone", "author": "J.K. Rowling", "cover_url": "http://img"}]
+        sample_books = [{"title": "Harry Potter and the Philosopher's Stone",
+                         "author": "J.K. Rowling", "cover_url": "http://img", "language": "en"}]
         bot.aggregator = MagicMock()
         bot.aggregator.aggregate_book_data = AsyncMock(return_value=sample_books)
         bot._set_cached_books = MagicMock()
@@ -590,10 +691,15 @@ class TestClarificationButtonActions(unittest.IsolatedAsyncioTestCase):
         update.callback_query.delete_message.assert_awaited_once()
         self.assertNotIn(42, bot._clarification)
         self.assertIn((42, "harry potter rowling"), bot._clarification_rate_limit)
-        # The aggregator must be called with the canonical title and author
-        bot.aggregator.aggregate_book_data.assert_awaited_once_with("Harry Potter J.K. Rowling", limit=10)
-        # Caches must be populated after Yes
-        bot._set_cached_books.assert_called_once_with(42, sample_books)
+        # Both primary (title by author) and supplementary (author-only) calls expected.
+        calls = bot.aggregator.aggregate_book_data.call_args_list
+        self.assertEqual(len(calls), 2, f"Expected 2 calls, got {calls}")
+        call_queries = {c[0][0] for c in calls}
+        self.assertIn("Harry Potter by J.K. Rowling", call_queries)
+        self.assertIn('inauthor:"J.K. Rowling"', call_queries)
+        # Caches must be populated after Yes (merged primary + supplementary, deduped).
+        cached_books = bot._set_cached_books.call_args[0][1]
+        self.assertTrue(len(cached_books) >= 1)
         self.assertEqual(bot._search_page_cache.get(42), 1)
         self.assertEqual(bot._search_query_cache.get(42), "Harry Potter J.K. Rowling")
         bot._preload_hardcover_ratings_for_page.assert_awaited_once_with(sample_books, 1, 5)
@@ -922,6 +1028,27 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
     _discover_candidate failed to match J.K. Rowling against the hint "rowling".
     """
 
+    async def test_partial_sugaru_author_uses_full_name_in_prompt(self):
+        bot = make_bot()
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock()
+        update = make_mock_update("Starting Over by Sugaru", user_id=42, chat_id=99)
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [
+                make_gb_response([]),
+                make_gb_response([
+                    {"title": "Starting Over 重啟人生", "author": "Sugaru Miaki"}
+                ]),
+            ]
+            shown = await bot._try_clarification(update, "Starting Over by Sugaru")
+
+        self.assertTrue(shown)
+        self.assertEqual(
+            bot.app.bot.send_message.await_args.args[1],
+            "Did you mean Starting Over by Sugaru Miaki?",
+        )
+
     async def test_harry_potter_rowling_clarification_triggered(self):
         """_try_clarification("Harry Potter Rowling") sends a confirmation prompt.
 
@@ -1054,11 +1181,10 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_fallback_empty_structured_items_triggers_clarification(self):
-        """When structured GB query returns 200 with empty items, raw fallback finds the match.
+        """When structured GB query returns no items, title-only fallback finds the match.
 
-        Regression: previously the condition `if parts and items:` skipped fallback
-        when the structured query returned an empty items list. Now `if parts:` runs
-        the raw query, which successfully finds J.K. Rowling.
+        The fallback should search the title independently, then verify the author
+        against candidate metadata instead of letting a raw all-terms query bury it.
         """
         import time
         from src.handlers import GoodreadsBot
@@ -1074,7 +1200,7 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
             # Structured query -> 200, empty items
             params = kwargs.get("params", {}) or {}
             q = params.get("q", "")
-            if "intitle" in q or "inauthor" in q:
+            if "inauthor:" in q:
                 resp = MagicMock()
                 resp.status_code = 200
                 resp.json.return_value = {"items": []}
@@ -1323,6 +1449,174 @@ class TestGroupChatClarificationBinding(unittest.IsolatedAsyncioTestCase):
             update.callback_query.answer.call_args[0][0],
             "This clarification prompt is for another user.",
         )
+
+
+class TestUnicodeRegression(unittest.TestCase):
+    """Regression tests for non-ASCII title and author name handling.
+
+    Before the Unicode fix, handlers.py used [a-z0-9]+ for token extraction,
+    which only matched ASCII characters. This caused:
+    - _author_hint_is_complete to reject non-Latin author names (empty token sets)
+    - _discover_candidate to fail matching on CJK, Cyrillic, Arabic author names
+
+    These tests verify the \\w+ fix (Unicode-aware word token extraction).
+    """
+
+    def test_author_hint_is_complete_english(self):
+        """English author: token sets must match exactly."""
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("sugaru miaki", "sugaru miaki")
+        self.assertTrue(result)
+
+    def test_author_hint_is_complete_english_partial(self):
+        """Partial English hint: last token "sugaru" != last token "miaki" → not complete."""
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("sugaru", "sugaru miaki")
+        self.assertFalse(result)
+
+    def test_author_hint_is_complete_native_japanese_script(self):
+        """Non-ASCII Japanese author name (hiragana/kanji) must not return False.
+
+        Before the fix, re.findall(r'[a-z0-9]+', '三秋縋') → []  → early-return False.
+        With \\w+, tokens are extracted correctly and comparison proceeds.
+        """
+        from src.handlers import GoodreadsBot
+        # Both identical → complete
+        result = GoodreadsBot._author_hint_is_complete("三秋縋", "三秋縋")
+        self.assertTrue(result)
+
+    def test_author_hint_is_complete_native_japanese_partial(self):
+        """Partial Japanese hint: '三秋' (2 tokens) vs '三秋縋' (3 tokens).
+        Last tokens differ ('三秋' vs '三秋縋') so not complete. Confirms Unicode
+        tokenisation works without crashing.
+        """
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("三秋", "三秋縋")
+        self.assertFalse(result)
+
+    def test_author_hint_is_complete_native_chinese(self):
+        """Chinese author name in native hanzi must be accepted."""
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("劉慈欣", "劉慈欣")
+        self.assertTrue(result)
+
+    def test_author_hint_is_complete_native_cyrillic(self):
+        """Cyrillic: 'достоевский' vs 'фёдор достоевский' — hint has no initials,
+        candidate has one. Returns False. Confirms Unicode tokenisation works.
+        """
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("достоевский", "фёдор достоевский")
+        self.assertFalse(result)
+
+    def test_author_hint_is_complete_empty_candidate(self):
+        """When candidate author is empty, must return False (not crash)."""
+        from src.handlers import GoodreadsBot
+        result = GoodreadsBot._author_hint_is_complete("sugaru", "")
+        self.assertFalse(result)
+
+
+class TestDiscoverCandidateUnicode(unittest.TestCase):
+    """_discover_candidate must handle non-ASCII author names via cross-script detection.
+
+    When Google Books returns a native-script author (CJK, Cyrillic, etc.) in response
+    to a Romanized author query, _discover_candidate's cross-script fix boosts
+    author_score to 1.0 — trusting Google Books' own transliteration — so that
+    results are not incorrectly rejected.
+    """
+
+    def _discover(self, query: str, title_hint: str | None, author_hint: str | None,
+                  gb_volumes: list[dict]) -> dict | None:
+        bot = make_bot()
+        bot._STOPWORDS = frozenset({
+            "the", "a", "an", "of", "in", "for", "with",
+            "on", "at", "to", "by", "and", "or", "is", "are",
+        })
+        items = [
+            {
+                "id": f"vol{i}",
+                "volumeInfo": {
+                    "title": v["title"],
+                    "authors": [v["author"]],
+                    "language": "en",
+                },
+            }
+            for i, v in enumerate(gb_volumes)
+        ]
+        empty_resp = MagicMock()
+        empty_resp.status_code = 200
+        empty_resp.json.return_value = {"items": []}
+        match_resp = MagicMock()
+        match_resp.status_code = 200
+        match_resp.json.return_value = {"items": items}
+        # Mock get_http_session to return a session whose .get() cycles through responses.
+        mock_session = MagicMock()
+        mock_session.get.side_effect = [empty_resp, match_resp, match_resp,
+                                        match_resp, match_resp]
+        with patch("src.handlers.get_http_session", return_value=mock_session):
+            return bot._discover_candidate(query, title_hint, author_hint)
+
+    def test_discover_with_native_japanese_author(self):
+        """Native-script Japanese author matched via cross-script detection.
+
+        'sugaru miaki' (ASCII) → GB finds '三秋縋' → cross_script=True →
+        author_score boosted to 1.0 → title_score 1.0 → result accepted.
+        """
+        result = self._discover(
+            query="Starting Over by Sugaru",
+            title_hint="Starting Over",
+            author_hint="sugaru miaki",
+            gb_volumes=[
+                {"title": "Starting Over 重啟人生", "author": "三秋縋"},
+            ],
+        )
+        self.assertIsNotNone(result, "Cross-script author should be accepted")
+        self.assertEqual(result["author"], "三秋縋")
+        self.assertIn("Starting Over", result["title"])
+
+    def test_discover_with_native_chinese_author(self):
+        """Native-script Chinese author matched via cross-script detection."""
+        result = self._discover(
+            query="Three-Body Problem by Liu",
+            title_hint="Three-Body Problem",
+            author_hint="liu",
+            gb_volumes=[
+                # Include English in title so title_score >= 0.5; author_score comes
+                # from cross-script detection (ASCII hint → non-ASCII result author).
+                {"title": "The Three-Body Problem 三體", "author": "劉慈欣"},
+            ],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["author"], "劉慈欣")
+
+    def test_discover_with_native_cyrillic_author(self):
+        """Cyrillic author name matched via cross-script detection."""
+        result = self._discover(
+            query="Crime and Punishment by Dostoevsky",
+            title_hint="Crime and Punishment",
+            author_hint="dostoevsky",
+            gb_volumes=[
+                # Include English in title so title_score >= 0.5; author_score comes
+                # from cross-script detection (ASCII hint → non-ASCII result author).
+                {"title": "Crime and Punishment Преступление и наказание", "author": "Фёдор Михайлович Достоевский"},
+            ],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["author"], "Фёдор Михайлович Достоевский")
+
+    def test_discover_with_mixed_script_title(self):
+        """Mixed Latin/CJK title correctly tokenised and scored."""
+        result = self._discover(
+            query="Starting Over by Sugaru",
+            title_hint="Starting Over",
+            author_hint="sugaru miaki",
+            gb_volumes=[
+                {"title": "Starting Over 重啟人生", "author": "三秋縋"},
+            ],
+        )
+        self.assertIsNotNone(result)
+        # Title: 'starting' + 'over' in 'starting over 重啟人生' → 2/2 = 1.0
+        # Author: cross-script → 1.0
+        self.assertIn("Starting Over", result["title"])
 
 
 if __name__ == "__main__":

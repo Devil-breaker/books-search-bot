@@ -368,7 +368,22 @@ class GoodreadsBot:
         )
         if last_meaningful_idx < 1:
             return False, None, None
-        title_hint = " ".join(tokens[:last_meaningful_idx])
+        title_tokens = tokens[:last_meaningful_idx]
+        # A guessed title boundary must not leave a conjunction, article, or
+        # preposition at the end of the title. For example, the plain title
+        # "Crime and Punishment" would otherwise become title="crime and",
+        # author="punishment", triggering several expensive false discovery
+        # requests. This is a boundary check only; explicit "by" queries and
+        # complete title-plus-author queries retain their existing behavior.
+        trailing_title_token = next(
+            (token.strip(".,;:!?\"'()[]{}") for token in reversed(title_tokens)
+             if token.strip(".,;:!?\"'()[]{}")),
+            "",
+        )
+        if trailing_title_token in self._STOPWORDS or trailing_title_token == "&":
+            return False, None, None
+
+        title_hint = " ".join(title_tokens)
         author_hint = " ".join(tokens[last_meaningful_idx:])
         return True, title_hint, author_hint
 
@@ -444,7 +459,7 @@ class GoodreadsBot:
 
         resp = get_http_session().get(
             "https://www.googleapis.com/books/v1/volumes",
-            params={"q": gb_query, "maxResults": 6, "langRestrict": "en"},
+            params={"q": gb_query, "maxResults": 6},
             timeout=10,
         )
         if resp.status_code != 200:
@@ -465,6 +480,20 @@ class GoodreadsBot:
                 hint_norm, self._normalize_for_matching(vol_title))
             author_score = self._score_author_hint(
                 author_hint_norm, self._normalize_for_matching(vol_author))
+            # Cross-script author matching: when the hint is ASCII/Latin but the
+            # candidate author contains non-ASCII characters (CJK, Cyrillic, etc.),
+            # the local _score_author_hint can't connect Romanized names to native
+            # script. Since the Google Books structured query (with inauthor:) already
+            # matched the author name, trust the title_score as sufficient evidence.
+            if author_score == 0 and author_hint_norm:
+                try:
+                    ascii_hint = author_hint_norm.encode("ascii").decode("ascii")
+                    has_non_ascii = any(ord(c) > 127 for c in vol_author)
+                    cross_script = bool(ascii_hint) and has_non_ascii
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    cross_script = False
+                if cross_script:
+                    author_score = 1.0
             if title_score >= 0.5 and author_score >= 0.5:
                 return {"title": vol_title, "author": vol_author, "source": "google_books"}
         return None
@@ -521,8 +550,20 @@ class GoodreadsBot:
             InlineKeyboardButton("Cancel",
                                  callback_data=f"clar_cancel_{user_id}"),
         ]])
+        display_title = canonical_title
+        if title_hint and self._score_title_hint(
+            self._normalize_for_matching(title_hint),
+            self._normalize_for_matching(canonical_title),
+        ) >= 1.0:
+            # Preserve the user's title spelling when the verified record
+            # contains every requested title term (even with a translated alias).
+            display_title = (
+                query.split(" by ", 1)[0].strip()
+                if " by " in query.lower()
+                else title_hint
+            )
         prompt_text = (
-            f"Did you mean {html_escape(canonical_title)} "
+            f"Did you mean {html_escape(display_title)} "
             f"by {html_escape(canonical_author)}?"
         )
         if update.effective_chat.type != "private":
@@ -594,6 +635,14 @@ class GoodreadsBot:
         # Perform search using the confirmed title+author hints (Yes) or
         # the original query (No).
         search_q = original_query if original_query else f"{title_hint} {author_hint}".strip()
+        # Preserve the verified title/author boundary for providers. In
+        # particular, don't turn a confirmed match into an unstructured AND
+        # query that can lose alternate-language editions again.
+        provider_query = (
+            f"{title_hint} by {author_hint}"
+            if original_query is None and title_hint and author_hint
+            else search_q
+        )
         user_id = update.effective_user.id
         entry = entry or self._clarification.get(user_id, {})
         chat_id = entry.get("chat_id", update.effective_chat.id)
@@ -623,10 +672,77 @@ class GoodreadsBot:
                 await bot.send_message(**kwargs)
 
         try:
-            books = await self._aggregate_search_results(search_q, limit=10)
-            books = self._rank_search_results(
-                self._deduplicate_search_results(books, search_q), search_q
-            )
+            # Run primary (title+author) and supplementary (author-only) searches
+            # concurrently. The supplementary search finds other books by the same
+            # author; deduplication keeps only distinct works.
+            if original_query is None and title_hint and author_hint:
+                safe_author = author_hint.replace('"', " ").strip()
+                author_query = f'inauthor:"{safe_author}"'
+                logger.info("🔍 Clarification supplementary author search: %s", author_query)
+                primary_books, extra_books = await asyncio.gather(
+                    self._aggregate_search_results(provider_query, limit=10),
+                    self.aggregator.aggregate_book_data(author_query, limit=10),
+                )
+                # Normalise empty results to empty list.
+                primary_books = primary_books or []
+                extra_books = extra_books or []
+
+                def is_confirmed_primary(book: dict) -> bool:
+                    """True if this is the confirmed title by the confirmed author."""
+                    t = (book.get("title") or "").lower()
+                    a = (book.get("author") or "").lower()
+                    return (
+                        title_hint.lower() in t
+                        and safe_author.lower() in a
+                        and not self._is_free_sample(book.get("title", ""))
+                    )
+
+                # ── Primary: keep all books (including unknown language).
+                # Language is optional in aggregator output; missing means unknown,
+                # not "non-English". Free samples are always discarded.
+                primary_clean = [
+                    b for b in primary_books
+                    if not self._is_free_sample(b.get("title", ""))
+                ]
+                logger.info(
+                    "🔍 Supplementary author search: primary=%d primary_clean=%d extra=%d",
+                    len(primary_books), len(primary_clean), len(extra_books),
+                )
+                # ── Supplementary: retain books in every catalog language.
+                # The author match is the relevance check; language metadata
+                # must not hide Chinese/Japanese or unknown-language editions.
+                extra_filtered = [
+                    b for b in extra_books
+                    if self._author_matches_canonical(b.get("author", ""), author_hint)
+                    and not self._is_free_sample(b.get("title", ""))
+                ]
+                # ── Merge: confirmed primary matches first, then supplementary. ────
+                confirmed = [b for b in primary_clean if is_confirmed_primary(b)]
+                other_primary = [b for b in primary_clean if not is_confirmed_primary(b)]
+                merged = confirmed + other_primary + extra_filtered
+                # For Latin-script searches, prefer English editions when a
+                # matching edition exists. Keep other languages available so
+                # books without an English edition remain discoverable.
+                has_latin_query = any(ch.isascii() and ch.isalpha() for ch in search_q)
+                has_non_latin_query = any(ch.isalpha() and not ch.isascii() for ch in search_q)
+                preferred_language = (
+                    "en" if has_latin_query and not has_non_latin_query else None
+                )
+                deduped = self._deduplicate_search_results(
+                    merged, search_q, preferred_language=preferred_language
+                )
+                books = self._rank_search_results(
+                    deduped, search_q, preferred_language=preferred_language
+                )
+                logger.info("DEBUG RANK books=%d titles=%s", len(books),
+                            [(b.get("title","")[:15], b.get("author","")[:10]) for b in books[:8]])
+                logger.info("DEBUG post-rank books=%d titles=%s", len(books),
+                            [b.get("title","")[:20] for b in books])
+            else:
+                books = await self._aggregate_search_results(provider_query, limit=10)
+                books = self._rank_search_results(
+                    self._deduplicate_search_results(books, search_q), search_q
+                )
             self._set_cached_books(user_id, books)
             self._search_page_cache[user_id] = 1
             self._search_query_cache[user_id] = search_q
@@ -711,11 +827,36 @@ class GoodreadsBot:
             cache.pop(oldest_key, None)
         cache[key] = timestamp
 
+    def _author_matches_canonical(self, result_author: str, canonical_author: str) -> bool:
+        """Check if result author matches the canonical author (case-insensitive token overlap).
+
+        Used to validate supplementary author-only search results.
+        Rejects books by unrelated or similarly-named authors.
+        """
+        if not result_author or not canonical_author:
+            return False
+        hint_tokens = set(re.findall(r"\w+", canonical_author.casefold()))
+        result_tokens = set(re.findall(r"\w+", result_author.casefold()))
+        # Must share at least one non-trivial token (>= 2 chars).
+        significant_hint = {t for t in hint_tokens if len(t) >= 2}
+        significant_result = {t for t in result_tokens if len(t) >= 2}
+        return bool(significant_hint & significant_result)
+
+    @staticmethod
+    def _is_free_sample(title: str) -> bool:
+        """Return True if the title indicates a free/sample edition.
+
+        Free samples show as separate entries from the main work and should be
+        filtered out so they don't crowd distinct books.
+        """
+        t = title.casefold()
+        return "read a free sample" in t or "free sample" in t or t.startswith("sample -")
+
     @staticmethod
     def _author_hint_is_complete(author_hint: str | None, candidate_author: str | None) -> bool:
         """Check whether a supplied author is already as specific as the match."""
-        hint_tokens = re.findall(r"[a-z0-9]+", (author_hint or "").casefold())
-        candidate_tokens = re.findall(r"[a-z0-9]+", (candidate_author or "").casefold())
+        hint_tokens = re.findall(r"\w+", (author_hint or "").casefold())
+        candidate_tokens = re.findall(r"\w+", (candidate_author or "").casefold())
         if not hint_tokens or not candidate_tokens:
             return False
         if set(hint_tokens) == set(candidate_tokens):
@@ -747,9 +888,14 @@ class GoodreadsBot:
             f"title_hint={title_hint!r} author_hint={author_hint!r}"
         )
 
-        def fetch_items(search_query: str, label: str, max_results: int) -> list:
+        def fetch_items(
+            search_query: str, label: str, max_results: int,
+            english_only: bool = True,
+        ) -> list:
             try:
-                params = {"q": search_query, "maxResults": max_results, "langRestrict": "en"}
+                # Do not restrict catalog language: the title may be English
+                # while the edition/metadata is indexed in Chinese or Japanese.
+                params = {"q": search_query, "maxResults": max_results}
                 if GOOGLE_BOOKS_API_KEY:
                     params["key"] = GOOGLE_BOOKS_API_KEY
                 response = get_http_session().get(
@@ -799,10 +945,10 @@ class GoodreadsBot:
                 vol_author_norm = self._normalize_for_matching(vol_author)
                 title_score = self._score_title_hint(hint_norm, vol_title_norm)
                 author_hint_tokens = [
-                    token for token in re.findall(r"[a-z0-9]+", author_hint_norm)
+                    token for token in re.findall(r"\w+", author_hint_norm)
                     if token not in self._STOPWORDS and len(token) >= 2
                 ]
-                candidate_title_tokens = set(re.findall(r"[a-z0-9]+", vol_title_norm))
+                candidate_title_tokens = set(re.findall(r"\w+", vol_title_norm))
                 author_is_independently_identified = (
                     " by " in query.lower()
                     or not author_hint_tokens
@@ -812,6 +958,19 @@ class GoodreadsBot:
                     self._score_author_hint(author_hint_norm, vol_author_norm)
                     if author_hint_norm and author_is_independently_identified else 0.0
                 )
+                # Cross-script author matching: when the query author is ASCII but the
+                # result author contains non-ASCII characters (CJK, Cyrillic, etc.),
+                # the token-based scoring above returns 0 because tokens don't overlap.
+                # Boost the score so cross-script candidates with good title matches
+                # can still be discovered (e.g. "sugaru miaki" → "三秋縋").
+                if author_score == 0 and author_hint_norm:
+                    try:
+                        ascii_hint = author_hint_norm.encode("ascii").decode("ascii")
+                        has_non_ascii = any(ord(c) > 127 for c in vol_author)
+                        if ascii_hint and has_non_ascii:
+                            author_score = 1.0
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
                 passed = title_score >= 0.5 and author_score > 0
                 logger.info(
                     f"{log_prefix}{label} candidate title={vol_title!r} author={vol_author!r} "
@@ -826,10 +985,59 @@ class GoodreadsBot:
         if cand:
             return cand
 
-        # Fallback: broader split query when structured search found nothing
+        # Retry the combined fields without a language filter before broadening
+        # to author-only/title-only queries. This preserves both clues while
+        # allowing catalog records stored in their publication language.
         if title_hint and author_hint:
-            fallback_query = f"{title_hint} {author_hint}"
-            fb_items = fetch_items(fallback_query, "fallback", 6)
+            safe_title = title_hint.replace('"', " ").strip()
+            safe_author = author_hint.replace('"', " ").strip()
+            all_language_query = (
+                f'intitle:"{safe_title}" inauthor:"{safe_author}"'
+            )
+            all_language_items = fetch_items(
+                all_language_query, "structured_all_languages", 40,
+                english_only=False,
+            )
+            if all_language_items:
+                cand = matching_candidate(
+                    all_language_items, "structured_all_languages"
+                )
+                if cand:
+                    return cand
+
+            # Google Books occasionally fails to honor fielded title/author
+            # operators for translated editions. Try the same evidence as a
+            # plain combined query; still accept only candidates that pass the
+            # strict title AND author matcher above.
+            combined_query = f'"{safe_title}" "{safe_author}"'
+            combined_items = fetch_items(
+                combined_query, "combined_fallback", 40, english_only=False
+            )
+            if combined_items:
+                cand = matching_candidate(combined_items, "combined_fallback")
+                if cand:
+                    return cand
+
+        # If the strict combined lookup misses, search by author alone first.
+        # Google Books can rank an incomplete title+author query poorly even
+        # when it has the right volume; candidate validation still requires both.
+        if title_hint and author_hint:
+            safe_author = author_hint.replace('"', " ").strip()
+            author_query = f'inauthor:"{safe_author}"'
+            author_items = fetch_items(
+                author_query, "author_fallback", 40, english_only=False
+            )
+            if author_items:
+                cand = matching_candidate(author_items, "author_fallback")
+                if cand:
+                    return cand
+
+            safe_title = title_hint.replace('"', " ").strip()
+            fallback_query = f'intitle:"{safe_title}"'
+            # Search by title across languages as the final discovery fallback.
+            fb_items = fetch_items(
+                fallback_query, "fallback", 40, english_only=False
+            )
             if fb_items:
                 cand = matching_candidate(fb_items, "fallback")
                 if cand:
@@ -1187,7 +1395,11 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             elif cls._same_author_for_dedup(right, author):
                 raw_title = left
 
-        tokens = cls._dedup_tokens(raw_title)
+        # Catalogs alternate between "&" and "and" in otherwise identical
+        # titles (for example, "Angels & Demons" / "Angels and Demons").
+        # Canonicalize the symbol only for work identity; display titles remain
+        # untouched and edition/subtitle text is still retained.
+        tokens = cls._dedup_tokens(raw_title.replace("&", " and "))
         author_tokens = cls._author_tokens(author)
         # Remove "by Author" only when the suffix matches the author field.
         for index, token in enumerate(tokens):
@@ -1221,11 +1433,71 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         except (TypeError, ValueError):
             return 0.0
 
-    def _merge_duplicate_book_data(self, target: dict, other: dict) -> None:
+    @classmethod
+    def _dedup_record_completeness(
+        cls, book: dict, preferred_language: str | None = None
+    ) -> int:
+        """Score a duplicate record for choosing the metadata/cover seed.
+
+        Cover URLs belong to a provider's edition record, so choose a complete
+        record as a unit instead of taking its cover from one duplicate while
+        assembling the displayed metadata from another. Ties intentionally keep
+        the earlier provider result for stable behavior.
+        """
+        score = 0
+        if book.get("cover_url"):
+            score += 4
+        if book.get("cover_source") == "google_books" and book.get("gb_volume_id"):
+            score += 3
+        if cls._isbn_key(book):
+            score += 3
+        if book.get("page_count"):
+            score += 1
+        if book.get("published_date"):
+            score += 1
+        if book.get("info_link"):
+            score += 1
+        description = str(book.get("description") or "").strip()
+        if description:
+            score += 1
+            if len(description) >= 120:
+                score += 1
+        language = str(book.get("language") or "").casefold()
+        preferred_prefix = (preferred_language or "").casefold()
+        if preferred_prefix and language.startswith(preferred_prefix):
+            score += 20
+        return score
+
+    def _merge_duplicate_book_data(
+        self, target: dict, other: dict, preferred_language: str | None = None
+    ) -> None:
         """Merge duplicates while preferring the more informative record."""
+        target_language = str(target.get("language") or "").casefold()
+        other_language = str(other.get("language") or "").casefold()
+        preferred_prefix = (preferred_language or "").casefold()
+        prefer_other_edition = bool(
+            preferred_prefix
+            and other_language.startswith(preferred_prefix)
+            and not target_language.startswith(preferred_prefix)
+        )
+        target_is_preferred_edition = bool(
+            preferred_prefix and target_language.startswith(preferred_prefix)
+        )
+        if prefer_other_edition:
+            # Keep metadata from the preferred-language edition together, so
+            # translated descriptions don't replace an English edition's data.
+            for key in (
+                "title", "description", "isbn", "page_count", "published_date",
+                "categories", "language", "info_link", "gb_volume_id", "source",
+                "cover_url", "cover_source",
+            ):
+                if self._is_useful_dedup_value(other.get(key)):
+                    target[key] = other[key]
+
         target_title = target.get("title", "") or ""
         other_title = other.get("title", "") or ""
-        if len(self._dedup_tokens(other_title)) < len(self._dedup_tokens(target_title)):
+        if (not prefer_other_edition
+                and len(self._dedup_tokens(other_title)) < len(self._dedup_tokens(target_title))):
             target["title"] = other_title
         target_author = target.get("author", "") or ""
         other_author = other.get("author", "") or ""
@@ -1243,7 +1515,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             current = target.get(key)
             if not self._is_useful_dedup_value(current) and self._is_useful_dedup_value(value):
                 target[key] = value
-            elif key == "description" and value and current:
+            elif (key == "description" and value and current
+                  and not (target_is_preferred_edition
+                           and not other_language.startswith(preferred_prefix))):
                 if len(str(value)) > len(str(current)):
                     target[key] = value
             elif key == "categories" and value:
@@ -1266,8 +1540,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     if other.get(key) is not None:
                         target[key] = other[key]
 
-    def _deduplicate_search_results(self, books: list[dict],
-                                     query: str) -> list[dict]:
+    def _deduplicate_search_results(
+        self, books: list[dict], query: str,
+        preferred_language: str | None = None,
+    ) -> list[dict]:
         """Merge duplicate work records using ISBN, normalized title and author evidence.
 
         Edition/subtitle text is retained in the title key. Unknown-author records
@@ -1276,6 +1552,8 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         """
         records = [dict(book) for book in (books or [])]
         count = len(records)
+        logger.info("DEBUG DEDUP in=%d", count)
+        logger.info("DEBUG DEDUP in=%d", count)
         parents = list(range(count))
 
         def find(index: int) -> int:
@@ -1330,13 +1608,28 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 for unknown_root in unknown_roots:
                     union(known_root, unknown_root)
 
-        clusters: dict[int, dict] = {}
+        record_clusters: dict[int, list[tuple[int, dict]]] = {}
         for index, book in enumerate(records):
             root = find(index)
-            if root not in clusters:
-                clusters[root] = dict(book)
-            else:
-                self._merge_duplicate_book_data(clusters[root], book)
+            record_clusters.setdefault(root, []).append((index, book))
+
+        clusters: dict[int, dict] = {}
+        for root, entries in record_clusters.items():
+            # Keep cover and edition metadata together. If equally complete,
+            # max() keeps the first record because entries preserve provider order.
+            seed_index, seed_book = max(
+                entries,
+                key=lambda entry: self._dedup_record_completeness(
+                    entry[1], preferred_language=preferred_language
+                ),
+            )
+            clusters[root] = dict(seed_book)
+            for index, book in entries:
+                if index == seed_index:
+                    continue
+                self._merge_duplicate_book_data(
+                    clusters[root], book, preferred_language=preferred_language
+                )
 
         merged = list(clusters.values())
         removed = count - len(merged)
@@ -1344,10 +1637,14 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             logger.info("Removed %s duplicate title/author results for query=%r", removed, query)
         return merged
 
-    def _rank_search_results(self, books: list[dict], query: str) -> list[dict]:
+    def _rank_search_results(
+        self, books: list[dict], query: str,
+        preferred_language: str | None = None,
+    ) -> list[dict]:
         """Stable relevance ordering using query token coverage in title and author."""
         query_tokens = [token for token in self._dedup_tokens(query)
                         if token not in self._STOPWORDS]
+        logger.info("DEBUG INSIDE RANK query_tokens=%s books_in=%d", query_tokens, len(books or []))
         if not query_tokens or len(books or []) < 2:
             return list(books or [])
 
@@ -1369,6 +1666,16 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 + (0.5 if exact_title else 0.0)
             )
 
+        if preferred_language:
+            language_prefix = preferred_language.casefold()
+            return sorted(
+                books,
+                key=lambda book: (
+                    str(book.get("language") or "").casefold().startswith(language_prefix),
+                    score(book),
+                ),
+                reverse=True,
+            )
         return sorted(books, key=score, reverse=True)
 
     async def inline_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1674,8 +1981,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
         return "\n".join(parts)
 
     def _build_inline_photo_keyboard(self, callback_key: str) -> InlineKeyboardMarkup:
-        """Build inline keyboard for photo results with hourglass button."""
-        keyboard = [[InlineKeyboardButton("⏳", callback_data=f"hourglass_{callback_key}")]]
+        """Build the compact inline-result keyboard."""
+        keyboard = [[InlineKeyboardButton(
+            "View More", callback_data=f"inline_more_{callback_key}"
+        )]]
         return InlineKeyboardMarkup(keyboard)
 
     def _build_expanded_inline_caption(self, book: dict) -> str:
@@ -2132,8 +2441,12 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             )])
         else:
             actions.append([InlineKeyboardButton(
+                "🔙 Back to Results", callback_data=f"back_{user_id}"
+            )])
+            actions.append([InlineKeyboardButton(
                 "✖️ Close", callback_data=f"close_{user_id}"
             )])
+            return InlineKeyboardMarkup(actions)
         actions.append([InlineKeyboardButton(
             "🔙 Back to Results", callback_data=f"back_{user_id}"
         )])
@@ -2415,10 +2728,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     self.cleanup_temp_file(temp_file)
                 return
 
-            # ── Hourglass button (inline details expansion) ───────────────────
-            if callback_data.startswith("hourglass_"):
-                # Extract callback key from hourglass_<callback_key>
-                callback_key = callback_data[10:]  # Remove "hourglass_" prefix
+            # ── Inline result View More action (one-time expansion) ──────────
+            if callback_data.startswith(("inline_more_", "hourglass_")):
+                prefix = "hourglass_" if callback_data.startswith("hourglass_") else "inline_more_"
+                callback_key = callback_data[len(prefix):]
 
                 # Get book data from callback cache
                 book_data = self._get_inline_callback_data(callback_key)
@@ -2499,8 +2812,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 # Build expanded caption
                 expanded_caption = self._build_expanded_inline_caption(book_data)
 
-                # Build Goodreads keyboard
-                gr_keyboard = self._build_goodreads_keyboard(book_data)
+                # Preserve the original one-time expansion behavior: after
+                # opening details, leave only the Goodreads link available.
+                expanded_keyboard = self._build_goodreads_keyboard(book_data)
 
                 # Restore cover image: the inline Article produces a text-only
                 # message, so convert it into a photo message carrying the cover
@@ -2515,11 +2829,12 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                         )
                         await query.edit_message_media(
                             media=media,
-                            reply_markup=gr_keyboard,
+                            reply_markup=expanded_keyboard,
                         )
                         logger.info(
                             f"Inline details expanded (photo) for: {book_data.get('title', 'Unknown')}"
                         )
+                        await query.answer()
                         return
                     except Exception as media_error:
                         logger.warning(
@@ -2532,7 +2847,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     await query.edit_message_caption(
                         caption=expanded_caption,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=gr_keyboard
+                        reply_markup=expanded_keyboard
                     )
                     logger.info(f"Inline details expanded for: {book_data.get('title', 'Unknown')}")
                 except Exception as e:
@@ -2542,11 +2857,13 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                         await query.edit_message_text(
                             text=expanded_caption,
                             parse_mode=ParseMode.HTML,
-                            reply_markup=gr_keyboard
+                            reply_markup=expanded_keyboard
                         )
                     except Exception as e2:
                         logger.error(f"Failed to edit inline message: {e2}")
                         await query.answer("Failed to update message.", show_alert=True)
+                        return
+                await query.answer()
                 return
 
             # ── Clarification callbacks ──────────────────────────────────────
