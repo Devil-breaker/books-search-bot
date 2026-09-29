@@ -34,44 +34,149 @@ class MultiSourceBookAggregator:
             logger.info(f"🔍 Searching Google Books: {query}")
             url = "https://www.googleapis.com/books/v1/volumes"
 
+            # For an explicit "title by author" query, search the fields
+            # separately. The plain query makes Google Books treat every word
+            # as a full-text term, so a partial author name can bury the title.
+            by_match = re.split(r"\s+by\s+", query, maxsplit=1, flags=re.IGNORECASE)
+            title_author = (by_match[0].strip(), by_match[1].strip()) if len(by_match) == 2 else None
+            primary_query = query
+            if title_author and all(title_author):
+                safe_title = title_author[0].replace('"', " ").strip()
+                primary_query = f'intitle:"{safe_title}" inauthor:{title_author[1]}'
+
+            def pair_matches(item):
+                """Require evidence for both sides before accepting a fallback hit."""
+                if not title_author:
+                    return True
+                info = item.get("volumeInfo") or {}
+                title_text = info.get("title", "")
+                authors = info.get("authors", [])
+                author_text = " ".join(authors) if authors else ""
+                # Use \w+ to match word characters across all scripts (Unicode-aware).
+                # This correctly handles CJK, Cyrillic, Arabic, etc. in titles and author names.
+                title_words = set(re.findall(r"\w+", title_author[0].casefold()))
+                author_words = set(re.findall(r"\w+", title_author[1].casefold()))
+                result_title = set(re.findall(r"\w+", title_text.casefold()))
+                result_author = set(re.findall(r"\w+", author_text.casefold()))
+                title_coverage = len(title_words & result_title) / max(1, len(title_words))
+                if title_coverage >= 0.5 and bool(author_words & result_author):
+                    return True
+                # Cross-script author matching: when the query author is ASCII/Latin but the
+                # result author contains non-ASCII characters (CJK, Cyrillic, Arabic, etc.),
+                # the token-based check above can't connect Romanized names to native script.
+                # Trust the title match — Google Books' own transliteration handled the author.
+                if title_coverage >= 0.5 and author_words and not (author_words & result_author):
+                    try:
+                        ascii_author = title_author[1].encode("ascii").decode("ascii")
+                        has_non_ascii = any(ord(c) > 127 for c in author_text)
+                        if ascii_author and has_non_ascii:
+                            return True
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
+                return False
+
             params = {
-                "q": query,
+                "q": primary_query,
                 "maxResults": min(limit, 8),
                 "printType": "books",
                 "orderBy": "relevance",
-                "langRestrict": "en",
             }
 
             if GOOGLE_BOOKS_API_KEY:
                 params["key"] = GOOGLE_BOOKS_API_KEY
 
-            response = get_http_session().get(url, params=params, timeout=8)
-            if response.status_code != 200:
-                logger.warning(f"Google Books API error: {response.status_code}")
-                return []
+            def fetch_items(request_params, label):
+                try:
+                    response = get_http_session().get(
+                        url, params=request_params, timeout=8
+                    )
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Google Books %s API error: %s",
+                            label, response.status_code,
+                        )
+                        return None
+                    return response.json().get("items", []) or []
+                except Exception as exc:
+                    logger.warning(
+                        "Google Books %s request failed: %s: %s",
+                        label, type(exc).__name__, exc,
+                    )
+                    return None
 
-            data = response.json()
-            items = data.get("items", [])
+            items = fetch_items(params, "primary")
+            if items is None:
+                # Existing ordinary searches keep the prior fail-open behavior.
+                # Explicit title/author searches may still recover through the
+                # validated language-neutral fallbacks below.
+                if not title_author:
+                    return []
+                items = []
 
-            # ── PART 1/2 diagnostic + language filter ─────────────────────────────
-            # langRestrict=en in the API params should filter by language metadata,
-            # but Koyeb Frankfurt IPs still return German results in practice.
-            # Belt-and-suspenders: apply an application-side filter as a safety net.
+            if title_author:
+                items = [item for item in items if pair_matches(item)]
+                explicit_pair_fallback = False
+                if not items:
+                    # Retry both fields without a language restriction first,
+                    # then query author-only and exact title. Every fallback
+                    # candidate must still match both sides.
+                    fallback_queries = [
+                        (
+                            f'intitle:"{title_author[0].replace(chr(34), " ").strip()}" '
+                            f'inauthor:"{title_author[1].replace(chr(34), " ").strip()}"',
+                            "all-languages",
+                        ),
+                        (
+                            f'"{title_author[0].replace(chr(34), " ").strip()}" '
+                            f'"{title_author[1].replace(chr(34), " ").strip()}"',
+                            "combined",
+                        ),
+                        (f'inauthor:"{title_author[1].replace(chr(34), " ").strip()}"', "author"),
+                        (f'intitle:"{title_author[0].replace(chr(34), " ").strip()}"', "title"),
+                    ]
+                    for fallback_query, fallback_label in fallback_queries:
+                        fallback_params = {
+                            "q": fallback_query,
+                            "maxResults": 40,
+                            "printType": "books",
+                            "orderBy": "relevance",
+                        }
+                        if GOOGLE_BOOKS_API_KEY:
+                            fallback_params["key"] = GOOGLE_BOOKS_API_KEY
+                        fallback_items = fetch_items(
+                            fallback_params, f"{fallback_label} fallback"
+                        )
+                        if fallback_items is None:
+                            continue
+                        matched_items = [
+                            item for item in fallback_items if pair_matches(item)
+                        ]
+                        logger.info(
+                            "GB explicit-pair %s fallback: raw=%d matched=%d query=%r",
+                            fallback_label, len(fallback_items), len(matched_items),
+                            fallback_query,
+                        )
+                        if matched_items:
+                            items = matched_items
+                            explicit_pair_fallback = any(
+                                (item.get("volumeInfo") or {}).get("language") != "en"
+                                for item in matched_items
+                            )
+                            break
+                # The pair matcher already verifies relevance. Preserve matching
+                # non-English editions returned by the language-neutral fallback.
+            else:
+                explicit_pair_fallback = False
+
+            # Preserve results in every catalog language. Language is metadata,
+            # not a relevance gate; translated editions may have English titles.
             raw_count = len(items)
-            items = [
-                item
-                for item in items
-                if (item.get("volumeInfo") or {}).get("language") == "en"
-            ]
-            filtered_count = raw_count - len(items)
             # Also reject items with blank/missing titles as a basic validity check.
             items = [item for item in items if (item.get("volumeInfo") or {}).get("title", "").strip()]
-            invalid_count = raw_count - filtered_count - len(items)
+            invalid_count = raw_count - len(items)
             logger.info(
-                f"GB: raw={raw_count} lang_filtered={filtered_count} "
-                f"invalid_title_filtered={invalid_count} final={len(items)}"
+                f"GB: raw={raw_count} invalid_title_filtered={invalid_count} final={len(items)}"
             )
-            # ── end filter ─────────────────────────────────────────────────
             for idx, item in enumerate(items[:8]):
                 vol = item.get("volumeInfo", {})
                 title = vol.get("title", "")
@@ -162,6 +267,7 @@ class MultiSourceBookAggregator:
                 "page_count": vol.get("pageCount", 0),
                 "published_date": vol.get("publishedDate", ""),
                 "categories": vol.get("categories", []),
+                "language": vol.get("language", ""),
                 "info_link": vol.get("infoLink", ""),
                 "gb_volume_id": volume_id,
                 "source": "google_books",
