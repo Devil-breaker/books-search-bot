@@ -1,6 +1,7 @@
 """Shared utilities — logging, escaping, cover-image validation, constants."""
 
 import logging
+import os
 import hashlib
 import struct
 import threading
@@ -98,74 +99,78 @@ def is_unreliable_gb_cover(volume_id: str) -> bool:
 
 
 # ── Auto-translation ──────────────────────────────────────────────────────────
-# Translates non-English text to English using Google Translate's free API.
-# Uses the same requests library already imported — no extra dependencies.
-# Handles 429 rate limits with a single retry after a short delay.
+# Translate non-English descriptions using Azure Translator's REST API.
+# Uses the existing requests dependency; no translation package is required.
 
 def translate_to_english(text: str) -> str:
     """Translate *text* to English. Returns original on failure."""
     if not text or not text.strip():
         return text
-    # Chunk long text to avoid URL length limits and API truncation.
-    # ~500 chars is a safe chunk size; Google Translate returns incomplete
-    # translations for very long strings.
-    CHUNK_SIZE = 480
-    if len(text) > CHUNK_SIZE:
-        chunks = [text[i : i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-        translated_chunks = []
-        for chunk in chunks:
-            result = _translate_chunk(chunk)
-            translated_chunks.append(result)
-            if result != chunk:
-                pass  # translated OK
-        return "".join(translated_chunks)
+    # Azure Translator v3 accepts up to 5,000 characters per request. Keep some
+    # headroom and send typical book descriptions in a single request.
+    chunk_size = 4500
+    if len(text) > chunk_size:
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        return "".join(_translate_chunk(chunk) for chunk in chunks)
     return _translate_chunk(text)
 
 
 def _translate_chunk(text: str) -> str:
-    """Translate a single short chunk. Internal — always called by the public fn."""
-    for attempt in range(2):
-        try:
-            resp = get_http_session().get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
-            )
-            if resp.status_code == 429:
-                if attempt == 0:
-                    import time
+    """Translate a single short chunk; return it unchanged if Azure is unavailable."""
+    api_key = os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
+    if not api_key:
+        logger.warning("Translation skipped: AZURE_TRANSLATOR_KEY is not configured")
+        return text
 
-                    time.sleep(1.5)
-                    continue
-                logger.warning("Translation failed: status=429 (rate-limited)")
-                return text
-            if resp.status_code != 200:
-                logger.warning(f"Translation failed: status={resp.status_code}")
-                return text
-            # Parse: [[["translated","original",...], ...], lang, ...]
-            try:
-                data = resp.json()
-            except ValueError:
-                logger.warning("Translation failed: non-JSON response")
-                return text
-            if not isinstance(data, list) or not data:
-                logger.warning("Translation failed: unexpected response structure")
-                return text
-            sentences = data[0]
-            if not isinstance(sentences, list):
-                logger.warning("Translation failed: unexpected response structure [sentences]")
-                return text
-            parts = []
-            for part in sentences:
-                if isinstance(part, list) and len(part) > 0 and part[0]:
-                    parts.append(part[0])
-            translated = "".join(parts)
-            return translated if translated else text
-        except Exception as e:
-            logger.warning(f"Translation failed: {e}")
+    headers = {
+        "Ocp-Apim-Subscription-Key": api_key,
+        "Content-Type": "application/json",
+    }
+    # Global single-service resources may not need a region header; regional and
+    # multi-service resources require the region shown in the Azure portal.
+    region = os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
+    if region:
+        # Accept Azure portal display names such as "West US" as well as `westus`.
+        region = region.casefold().replace(" ", "").replace("-", "")
+        headers["Ocp-Apim-Subscription-Region"] = region
+
+    try:
+        response = get_http_session().post(
+            "https://api.cognitive.microsofttranslator.com/translate",
+            params={"api-version": "3.0", "to": "en"},
+            headers=headers,
+            json=[{"Text": text}],
+            timeout=8,
+        )
+        if response.status_code != 200:
+            logger.warning("Azure Translator failed: status=%s", response.status_code)
             return text
-    return text
+        try:
+            data = response.json()
+        except ValueError:
+            logger.warning("Azure Translator failed: non-JSON response")
+            return text
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            logger.warning("Azure Translator failed: unexpected response structure")
+            return text
+        translations = data[0].get("translations", [])
+        if not isinstance(translations, list) or not translations or not isinstance(translations[0], dict):
+            logger.warning("Azure Translator failed: translation missing from response")
+            return text
+        translated = translations[0].get("text", "")
+        if isinstance(translated, str) and translated:
+            detected = data[0].get("detectedLanguage", {})
+            source_language = detected.get("language", "auto") if isinstance(detected, dict) else "auto"
+            logger.info(
+                "Translation succeeded: provider=azure source=%s characters=%d",
+                source_language,
+                len(text),
+            )
+            return translated
+        return text
+    except Exception as exc:
+        logger.warning("Azure Translator request failed: %s", exc)
+        return text
 
 
 # ── Language detection ───────────────────────────────────────────────────────────

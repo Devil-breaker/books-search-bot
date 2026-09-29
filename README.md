@@ -69,6 +69,8 @@ Edit `.env` and add your credentials:
 TELEGRAM_BOT_TOKEN=123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 GOOGLE_BOOKS_API_KEY=your_google_books_api_key_here
 HARDCOVER_API_KEY=your_hardcover_api_key_here
+AZURE_TRANSLATOR_KEY=your_azure_translator_key_here
+AZURE_TRANSLATOR_REGION=your_azure_translator_region_here
 ```
 
 **Run:**
@@ -115,6 +117,8 @@ py -3.12 setup_webhook.py
    - `TELEGRAM_BOT_TOKEN` — your Telegram bot token
    - `GOOGLE_BOOKS_API_KEY` — *(optional)*
    - `HARDCOVER_API_KEY` — *(optional)*
+   - `AZURE_TRANSLATOR_KEY` — *(optional; only used for non-English descriptions)*
+   - `AZURE_TRANSLATOR_REGION` — *(set when required by your Azure resource)*
    - `WEBHOOK_SECRET` — *(optional, but recommended)* a random secret string to verify incoming webhook requests
 7. Click **Deploy**
 

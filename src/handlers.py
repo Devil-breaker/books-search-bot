@@ -2809,6 +2809,17 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                                 book_data["rating_formatted"] = best.get("rating_formatted", f"{best['rating']:.2f}")
                                 book_data["rating_source"] = best.get("rating_source", "hardcover")
 
+                # Keep inline search fast: translate only the one description
+                # the user explicitly opens with View More, never the result set.
+                description = book_data.get("description", "")
+                if description and not is_english_description(description):
+                    translated_description = await asyncio.to_thread(
+                        translate_to_english, description
+                    )
+                    if translated_description != description:
+                        book_data["description"] = translated_description
+                        self._set_inline_callback_data(callback_key, book_data)
+
                 # Build expanded caption
                 expanded_caption = self._build_expanded_inline_caption(book_data)
 
