@@ -66,6 +66,23 @@ class MiniAppTrendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fantasy_result["books"][0]["title"], "Fantasy Book 0")
         self.assertEqual(sci_fi_result["books"][0]["title"], "Sci-Fi Book 0")
 
+    async def test_trending_shelf_starts_with_rolling_hardcover_results(self):
+        current = [book(f"Recent Fantasy {i}", "Fantasy") for i in range(12)]
+
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover_trending",
+            return_value=current,
+        ) as trending, patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover",
+        ) as fallback:
+            result = await self.service.trending("Fantasy")
+
+        trending.assert_called_once_with(100, "month")
+        fallback.assert_not_called()
+        self.assertEqual([item["title"] for item in result["books"]], [
+            f"Recent Fantasy {i}" for i in range(12)
+        ])
+
     async def test_genre_filter_rejects_unrelated_categories(self):
         books = [
             book("Actual Sci-Fi", "Science Fiction"),
@@ -76,6 +93,19 @@ class MiniAppTrendingTests(unittest.IsolatedAsyncioTestCase):
         filtered = self.service._filter_trending_books(books, "Sci-Fi")
 
         self.assertEqual([item["title"] for item in filtered], ["Actual Sci-Fi"])
+
+    def test_related_books_can_fill_a_ten_book_shelf(self):
+        books = [
+            book("Selected Book", "Fantasy", author="Selected Author"),
+            *[
+                book(f"Fantasy Pick {index}", "Fantasy", author=f"Author {index}")
+                for index in range(12)
+            ],
+        ]
+
+        result = self.service._related_books(books, books[0], 0)
+
+        self.assertEqual(len(result), 10)
 
 
 class MiniAppRecommendationDetailTests(unittest.IsolatedAsyncioTestCase):

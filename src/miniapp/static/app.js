@@ -71,6 +71,8 @@
   window.setTimeout(dismissLaunchWelcome, 7000);
 
   const THEME_STORAGE_KEY = "annie-search-theme";
+  const HOME_SHELF_SIZE = 10;
+  const HOME_TRENDING_CACHE_MS = 60 * 60 * 1000;
   const THEME_COLORS = { purple: "#130e1b", light: "#eeeeef", amoled: "#000000" };
 
   function applyTheme(theme, { persist = true } = {}) {
@@ -390,24 +392,28 @@
     elements.moreTrendingBooks.replaceChildren();
     elements.moreSection.hidden = true;
     const cached = state.featuredCache[genre];
-    if (cached) {
+    const cacheIsFresh = cached && Date.now() - cached.loadedAt < HOME_TRENDING_CACHE_MS;
+    if (cached && !cacheIsFresh) {
+      delete state.featuredCache[genre];
+    }
+    if (cacheIsFresh) {
       state.featuredBooks = cached.books;
       state.featuredQuery = cached.query;
-      cached.books.slice(0, 5).forEach((book, index) => {
+      cached.books.slice(0, HOME_SHELF_SIZE).forEach((book, index) => {
         elements.trendingBooks.append(renderBookCard(book, index, {
           query: cached.query,
           page: 1,
           collection: "featured",
         }));
       });
-      cached.books.slice(5).forEach((book, index) => {
-        elements.moreTrendingBooks.append(renderBookCard(book, index + 5, {
+      cached.books.slice(HOME_SHELF_SIZE).forEach((book, index) => {
+        elements.moreTrendingBooks.append(renderBookCard(book, index + HOME_SHELF_SIZE, {
           query: cached.query,
           page: 2,
           collection: "more",
         }));
       });
-      elements.moreSection.hidden = cached.books.length <= 5;
+      elements.moreSection.hidden = cached.books.length <= HOME_SHELF_SIZE;
       setDiscoverMessage(cached.books.length ? "" : "No picks found for this genre yet.");
       refreshDesktopScrollControls(elements.trendingBooks);
       return;
@@ -427,23 +433,27 @@
         setDiscoverMessage("No picks found for this genre yet.");
         return;
       }
-      state.featuredCache[genre] = { query: state.featuredQuery, books: state.featuredBooks };
+      state.featuredCache[genre] = {
+        query: state.featuredQuery,
+        books: state.featuredBooks,
+        loadedAt: Date.now(),
+      };
       setDiscoverMessage("");
-      state.featuredBooks.slice(0, 5).forEach((book, index) => {
+      state.featuredBooks.slice(0, HOME_SHELF_SIZE).forEach((book, index) => {
         elements.trendingBooks.append(renderBookCard(book, index, {
           query: state.featuredQuery,
           page: 1,
           collection: "featured",
         }));
       });
-      state.featuredBooks.slice(5).forEach((book, index) => {
-        elements.moreTrendingBooks.append(renderBookCard(book, index + 5, {
+      state.featuredBooks.slice(HOME_SHELF_SIZE).forEach((book, index) => {
+        elements.moreTrendingBooks.append(renderBookCard(book, index + HOME_SHELF_SIZE, {
           query: state.featuredQuery,
           page: 2,
           collection: "more",
         }));
       });
-      elements.moreSection.hidden = state.featuredBooks.length <= 5;
+      elements.moreSection.hidden = state.featuredBooks.length <= HOME_SHELF_SIZE;
       refreshDesktopScrollControls(elements.trendingBooks);
     } catch (error) {
       if (requestId !== state.featuredRequestId || error.name === "AbortError") return;
@@ -659,15 +669,6 @@
       if (translationStatus) descriptionSection.append(translationStatus);
       elements.detail.append(descriptionSection);
     }
-    const infoUrl = safeHttpUrl(book.info_link);
-    if (infoUrl) {
-      const link = node("a", "more-link", "View book source ↗");
-      link.href = infoUrl;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      elements.detail.append(link);
-    }
-
     const relatedBooks = state.activeDetailContext === context && state.activeRelatedBooks.length
       ? state.activeRelatedBooks
       : (Array.isArray(book.related_books) ? book.related_books : []);
@@ -680,11 +681,14 @@
           if (!relatedBook) continue;
           const relatedCard = node("button", "related-card");
           relatedCard.type = "button";
-          relatedCard.setAttribute("aria-label", `Search for ${relatedBook.title || "book"}`);
+          relatedCard.setAttribute("aria-label", `View details for ${relatedBook.title || "book"}`);
           appendCover(relatedCard, relatedBook.cover_url, relatedBook.title || "book", "related-cover");
           relatedCard.append(node("span", "related-title", relatedBook.title || "Untitled"));
           relatedCard.append(node("span", "related-author", relatedBook.author || "Unknown author"));
-          relatedCard.addEventListener("click", () => searchRelatedBook(relatedBook));
+          relatedCard.addEventListener("click", () => openDetails(relatedBook, {
+            collection: "related",
+            book: { ...relatedBook },
+          }));
           shelf.append(relatedCard);
         }
         relatedSection.append(addDesktopScrollControls(shelf, "More Like This"));
@@ -695,17 +699,6 @@
       }
       elements.detail.append(relatedSection);
     }
-  }
-
-  function searchRelatedBook(book) {
-    const title = String(book.title || "").trim();
-    const author = String(book.author || "").trim();
-    if (!title) return;
-    const query = `${title}${author && !/^unknown(?: author)?$/i.test(author) ? ` by ${author}` : ""}`;
-    elements.dialog.close();
-    elements.input.value = query;
-    void search(query, 1);
-    window.scrollTo({ top: 0, behavior: "auto" });
   }
 
   async function toggleDescriptionTranslation(book, context, button, status) {
@@ -731,7 +724,7 @@
     try {
       const response = await api("translate", {
         method: "POST",
-        body: JSON.stringify(context.collection === "recommendations"
+        body: JSON.stringify(["recommendations", "related"].includes(context.collection)
           ? { book: { title: book.title, author: book.author, description: book.description } }
           : { query: context.query, page: context.page, index: context.index }),
         signal: controller.signal,
@@ -765,7 +758,8 @@
     state.activeRelatedBooks = [];
     state.relatedLoading = Boolean(context);
     state.relatedMessage = "";
-    state.detailLoadingMessage = context?.collection === "recommendations" ? "Loading complete book details…" : "";
+    state.detailLoadingMessage = ["recommendations", "related"].includes(context?.collection)
+      ? "Loading complete book details…" : "";
     state.translationRequestId += 1;
     state.translationController?.abort();
     state.translationController = null;
@@ -780,7 +774,7 @@
     else elements.dialog.setAttribute("open", "");
     elements.quickNav.hidden = true;
     webApp?.HapticFeedback?.impactOccurred("light");
-    if (context?.collection === "recommendations") {
+    if (["recommendations", "related"].includes(context?.collection)) {
       void fetchRecommendationBookDetails(context);
     } else if (context) {
       void fetchGoogleBookDetails(context);

@@ -452,6 +452,144 @@ class MultiSourceBookAggregator:
             return []
 
     @staticmethod
+    def search_hardcover_trending(limit: int = 100, duration: str = "month") -> list[dict]:
+        """Fetch Hardcover's activity-ranked feed for a rolling time window."""
+        api_key = os.getenv("HARDCOVER_API_KEY", "").strip()
+        if not api_key or duration not in {"week", "month", "three_month", "one_year", "all"}:
+            return []
+        limit = max(1, min(int(limit), 200))
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        session = get_http_session()
+        try:
+            trending_response = session.post(
+                "https://api.hardcover.app/v1/graphql",
+                headers=headers,
+                json={
+                    "query": """
+                    query TrendingBooks($duration: TrendingDuration!, $limit: Int!) {
+                        books_trending(duration: $duration, limit: $limit, offset: 0) {
+                            error
+                            ids
+                        }
+                    }
+                    """,
+                    "variables": {"duration": duration, "limit": limit},
+                },
+                timeout=10,
+            )
+            if trending_response.status_code != 200:
+                logger.debug("Hardcover trending request failed: %s", trending_response.status_code)
+                return []
+            trending_payload = trending_response.json()
+            if trending_payload.get("errors"):
+                logger.debug("Hardcover trending GraphQL error: %s", trending_payload["errors"])
+                return []
+            trending_data = (trending_payload.get("data") or {}).get("books_trending") or {}
+            if trending_data.get("error"):
+                logger.debug("Hardcover trending returned error: %s", trending_data["error"])
+                return []
+            ids = [
+                book_id for book_id in (trending_data.get("ids") or [])
+                if isinstance(book_id, int) and not isinstance(book_id, bool)
+            ]
+            if not ids:
+                return []
+
+            books_response = session.post(
+                "https://api.hardcover.app/v1/graphql",
+                headers=headers,
+                json={
+                    "query": """
+                    query TrendingBookDetails($ids: [Int!]) {
+                        books(where: {id: {_in: $ids}}) {
+                            id title description rating ratings_count users_read_count
+                            release_date release_year cached_tags image { url }
+                            contributions(limit: 3) { author { name } }
+                            default_cover_edition {
+                                pages isbn_10 isbn_13 cached_tags
+                                release_date language { name }
+                                image { url }
+                            }
+                        }
+                    }
+                    """,
+                    "variables": {"ids": ids},
+                },
+                timeout=10,
+            )
+            if books_response.status_code != 200:
+                logger.debug("Hardcover trending hydration failed: %s", books_response.status_code)
+                return []
+            books_payload = books_response.json()
+            if books_payload.get("errors"):
+                logger.debug("Hardcover trending hydration GraphQL error: %s", books_payload["errors"])
+                return []
+            rows = (books_payload.get("data") or {}).get("books") or []
+            by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
+
+            def genres_from(*values):
+                genres = []
+                for raw in values:
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except ValueError:
+                            continue
+                    if isinstance(raw, dict):
+                        raw = raw.get("tags", raw.get("Genre", raw.get("genres", [])))
+                        if isinstance(raw, dict):
+                            raw = raw.get("Genre", raw.get("genre", []))
+                    if not isinstance(raw, list):
+                        continue
+                    for tag in raw:
+                        if isinstance(tag, dict):
+                            category = str(tag.get("category") or "").casefold()
+                            if category and category != "genre":
+                                continue
+                            tag = tag.get("tag") or tag.get("name") or ""
+                        if isinstance(tag, str) and tag.strip() and tag.strip() not in genres:
+                            genres.append(tag.strip())
+                return genres
+
+            books = []
+            for book_id in ids:
+                row = by_id.get(book_id)
+                if not row or not str(row.get("title") or "").strip():
+                    continue
+                edition = row.get("default_cover_edition") or {}
+                contributions = row.get("contributions") or []
+                authors = [
+                    item["author"]["name"] for item in contributions
+                    if isinstance(item, dict) and isinstance(item.get("author"), dict)
+                    and item["author"].get("name")
+                ]
+                image = edition.get("image") or row.get("image") or {}
+                categories = genres_from(row.get("cached_tags"), edition.get("cached_tags"))
+                rating = float(row.get("rating") or 0)
+                published = edition.get("release_date") or row.get("release_date") or row.get("release_year") or ""
+                books.append({
+                    "title": str(row.get("title") or "").strip(),
+                    "author": ", ".join(authors) or "Unknown Author",
+                    "rating": rating,
+                    "rating_count": int(row.get("ratings_count") or 0),
+                    "users_read_count": int(row.get("users_read_count") or 0),
+                    "rating_formatted": f"{rating:.2f}" if rating > 0 else "N/A",
+                    "description": str(row.get("description") or ""),
+                    "page_count": int(edition.get("pages") or 0),
+                    "published_date": str(published),
+                    "language": (edition.get("language") or {}).get("name", ""),
+                    "categories": categories,
+                    "genres": categories,
+                    "cover_url": str(image.get("url") or ""),
+                    "isbn": str(edition.get("isbn_13") or edition.get("isbn_10") or ""),
+                    "source": "hardcover",
+                })
+            return books
+        except Exception as e:
+            logger.debug("Hardcover trending lookup failed: %s", e)
+            return []
+
+    @staticmethod
     def _parse_itunes_book(result):
         """Parse iTunes result"""
         try:

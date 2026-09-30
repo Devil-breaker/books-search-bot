@@ -65,6 +65,43 @@ class TestAggregatorSearchRatingFields(unittest.TestCase):
 class TestAggregatorNetworkPaths(unittest.TestCase):
     """Network-return paths that don't require live API calls."""
 
+    @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-token"})
+    @patch("src.aggregator.get_http_session")
+    def test_hardcover_trending_uses_rolling_window_and_preserves_rank(self, mock_session):
+        trending = MagicMock(status_code=200)
+        trending.json.return_value = {"data": {"books_trending": {"ids": [2, 1]}}}
+        details = MagicMock(status_code=200)
+        details.json.return_value = {"data": {"books": [
+            {
+                "id": 1, "title": "Second", "rating": 4.1, "ratings_count": 12,
+                "cached_tags": {"tags": [{"category": "Genre", "tag": "Fantasy"}]},
+                "contributions": [{"author": {"name": "Author One"}}],
+            },
+            {
+                "id": 2, "title": "First", "rating": 4.5, "ratings_count": 20,
+                "cached_tags": {"tags": [{"category": "Genre", "tag": "Fantasy"}]},
+                "contributions": [{"author": {"name": "Author Two"}}],
+            },
+        ]}}
+        mock_session.return_value.post.side_effect = [trending, details]
+
+        books = MultiSourceBookAggregator.search_hardcover_trending(100, "month")
+
+        self.assertEqual([book["title"] for book in books], ["First", "Second"])
+        self.assertEqual(books[0]["categories"], ["Fantasy"])
+        request_payload = mock_session.return_value.post.call_args_list[0].kwargs["json"]
+        self.assertEqual(request_payload["variables"], {"duration": "month", "limit": 100})
+
+    @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-token"})
+    @patch("src.aggregator.get_http_session")
+    def test_hardcover_trending_returns_empty_on_api_error(self, mock_session):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"errors": [{"message": "unavailable"}]}
+        mock_session.return_value.post.return_value = response
+
+        self.assertEqual(MultiSourceBookAggregator.search_hardcover_trending(), [])
+        mock_session.return_value.post.assert_called_once()
+
     @patch("requests.get")
     def test_search_google_books_returns_empty_on_api_error(self, mock_get):
         mock_get.return_value.status_code = 500

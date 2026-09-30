@@ -21,6 +21,7 @@ class MiniAppSearchService:
     TRENDING_CACHE_TTL_SECONDS = 3600
     TRENDING_LIMIT = 20
     TRENDING_TARGET_SIZE = 10
+    RELATED_LIMIT = 10
     TRENDING_GENRES = ("All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics")
     TRENDING_SEARCH_TERMS = {
         "All": ("*",),
@@ -70,39 +71,45 @@ class MiniAppSearchService:
             from src.aggregator import MultiSourceBookAggregator
 
             started = time.perf_counter()
+            recent_cache_key = "activity:month"
             with self._cache_lock:
-                source_cache = self._trending_source_cache.get(genre)
-                if source_cache and now - source_cache[0] < self.TRENDING_CACHE_TTL_SECONDS:
-                    candidates = copy.deepcopy(source_cache[1])
-                else:
-                    candidates = None
-            if candidates is None:
-                # Searching one global wildcard result set and filtering it
-                # locally starves smaller genres (especially Sci-Fi). Search
-                # Hardcover by the selected genre first, then try a small set
-                # of equivalent catalogue terms only if the first query is
-                # sparse. Keep this discovery-only so normal /search is intact.
-                candidates = []
-                books = []
+                recent_cache = self._trending_source_cache.get(recent_cache_key)
+                recent_candidates = (
+                    copy.deepcopy(recent_cache[1])
+                    if recent_cache and now - recent_cache[0] < self.TRENDING_CACHE_TTL_SECONDS
+                    else None
+                )
+            if recent_candidates is None:
+                recent_candidates = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover_trending,
+                    100,
+                    "month",
+                )
+                if not isinstance(recent_candidates, list):
+                    recent_candidates = []
+                with self._cache_lock:
+                    self._trending_source_cache[recent_cache_key] = (
+                        time.time(), copy.deepcopy(recent_candidates)
+                    )
+
+            # Start with Hardcover's rolling one-month activity ranking. If a
+            # genre has too few recent hits, broaden it with genre-filtered
+            # catalog search, sorting that fallback by current activity.
+            candidates = list(recent_candidates)
+            books = self._filter_trending_books(candidates, genre)
+            if len(books) < self.TRENDING_TARGET_SIZE:
                 for term in self.TRENDING_SEARCH_TERMS[genre]:
                     batch = await asyncio.to_thread(
                         MultiSourceBookAggregator.search_hardcover,
                         term,
                         100,
-                        sort="users_read_count:desc",
+                        sort="activities_count:desc",
                     )
                     if isinstance(batch, list):
                         candidates.extend(batch)
                     books = self._filter_trending_books(candidates, genre)
                     if len(books) >= self.TRENDING_TARGET_SIZE:
                         break
-                if candidates:
-                    with self._cache_lock:
-                        self._trending_source_cache[genre] = (
-                            time.time(), copy.deepcopy(candidates)
-                        )
-            else:
-                books = self._filter_trending_books(candidates, genre)
             if books:
                 with self._cache_lock:
                     self._trending_cache[genre] = (time.time(), copy.deepcopy(books))
@@ -378,7 +385,7 @@ class MiniAppSearchService:
         selected = books[book_index]
         related = [item["book"] for item in self._related_books(books, selected, book_index)]
         provider_books = await self.related_books_for_book(selected)
-        return self._merge_related_books(related, provider_books)[:5]
+        return self._merge_related_books(related, provider_books)[: self.RELATED_LIMIT]
 
     async def related_books_for_book(self, selected: dict) -> list[dict]:
         """Fetch related books from selected-book metadata, independent of search cache."""
@@ -495,7 +502,7 @@ class MiniAppSearchService:
                             )
                             if match and match.get("cover_url"):
                                 candidate["cover_url"] = match["cover_url"]
-                provider_books = self._merge_related_books(*provider_groups)[:5]
+                provider_books = self._merge_related_books(*provider_groups)[: self.RELATED_LIMIT]
                 with self._cache_lock:
                     if len(self._related_cache) >= 128:
                         oldest = min(self._related_cache, key=lambda item: self._related_cache[item][0])
@@ -507,7 +514,7 @@ class MiniAppSearchService:
                 logger.exception("[miniapp] related-book fallback failed")
                 provider_books = []
 
-        return self._merge_related_books([], provider_books or [])[:5]
+        return self._merge_related_books([], provider_books or [])[: self.RELATED_LIMIT]
 
     @staticmethod
     def _merge_related_books(*groups: list[dict]) -> list[dict]:
@@ -599,7 +606,7 @@ class MiniAppSearchService:
 
         scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
         related = []
-        for _score, _rating_count, candidate_index, candidate in scored[:5]:
+        for _score, _rating_count, candidate_index, candidate in scored[: self.RELATED_LIMIT]:
             related.append({
                 "book": self._public_book(candidate),
                 "page": candidate_index // self.PAGE_SIZE + 1,
