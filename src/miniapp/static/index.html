@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en" data-theme="purple">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#130e1b">
+  <title>Book Discovery</title>
+  <link rel="preload" as="image" href="/miniapp/assets/images/welcome.jpg?v=20260930-app-assets-v1" fetchpriority="high">
+  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20260930-performance-review-v1">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="/miniapp/assets/recommendations.js?v=20260930-performance-review-v1" defer></script>
+  <script src="/miniapp/assets/app.js?v=20260930-performance-review-v1" defer></script>
+</head>
+<body>
+  <section id="launch-welcome" class="launch-welcome" role="status" aria-live="polite" aria-label="Welcome to Annie Search">
+    <div class="launch-welcome-content">
+      <div class="launch-welcome-mark" aria-hidden="true">A</div>
+      <p class="launch-welcome-kicker">YOUR NEXT STORY STARTS HERE</p>
+      <h1>Welcome to<br>Annie Search</h1>
+      <span class="launch-welcome-loader" aria-hidden="true"></span>
+    </div>
+  </section>
+  <main class="app-shell">
+    <div id="home-sticky" class="home-sticky">
+      <header class="topbar">
+        <div class="topbar-meta">
+          <p id="greeting" class="hello">Hi</p>
+          <div class="theme-switch" role="group" aria-label="Color theme">
+            <button class="theme-option" type="button" data-theme-choice="purple" aria-label="Purple theme" title="Purple theme" aria-pressed="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></svg>
+            </button>
+            <button class="theme-option" type="button" data-theme-choice="light" aria-label="Light theme" title="Light theme" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+            </button>
+            <button class="theme-option" type="button" data-theme-choice="amoled" aria-label="AMOLED dark theme" title="AMOLED dark theme" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.2A8.7 8.7 0 0 1 8.8 3.8 8.8 8.8 0 1 0 20.2 15.2Z"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">
+            <svg class="brand-symbol" viewBox="0 0 48 48" focusable="false">
+              <defs>
+                <linearGradient id="annie-mark-stroke" x1="12" y1="10" x2="37" y2="40" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#fffaff" />
+                  <stop offset="1" stop-color="#ead5ff" />
+                </linearGradient>
+              </defs>
+              <path d="M13.5 35.5c4.5-6.4 8.2-16.3 10.4-22.2.7-1.8 2-1.7 2.5.2 1.7 7.4 4.3 15.4 8.5 22" fill="none" stroke="url(#annie-mark-stroke)" stroke-width="3.7" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M18.5 27.7c3.6-1.4 7.6-1.8 11.6-1" fill="none" stroke="url(#annie-mark-stroke)" stroke-width="3" stroke-linecap="round" />
+              <path d="M10.5 38c5.2-2 9.5-1.4 13.5 1.2 4-2.6 8.8-3.2 13.5-1.2" fill="none" stroke="#f6eaff" stroke-opacity=".86" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </div>
+          <div class="brand-copy">
+            <p class="eyebrow">WELCOME TO ANNIE SEARCH</p>
+            <h1>Discover New Books</h1>
+          </div>
+        </div>
+      </header>
+
+      <section class="search-panel" aria-label="Book search">
+        <form id="search-form" autocomplete="off">
+          <label class="sr-only" for="query">Book title or author</label>
+          <div class="search-row">
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input id="query" name="query" type="search" maxlength="160"
+                   placeholder="Title, author, or both" required>
+            <button id="search-button" class="search-button" type="submit">Search</button>
+          </div>
+        </form>
+        <p id="typing-indicator" class="typing-indicator" role="status" aria-live="polite" hidden>
+          Finding books <span class="animated-dots" aria-hidden="true">...</span>
+        </p>
+        <div id="startup-message" class="message" role="status" aria-live="polite" hidden></div>
+      </section>
+    </div>
+
+    <section class="discover-section" id="discover-section" aria-label="Discover books">
+      <div class="genre-tabs-wrap">
+        <div id="genre-tabs" class="genre-tabs" role="tablist" aria-label="Book genres"></div>
+      </div>
+      <div class="discover-heading">
+        <div>
+          <p class="eyebrow">DISCOVER SOMETHING GOOD</p>
+          <h2 id="discover-title">Top books</h2>
+        </div>
+        <span class="discover-note">Swipe to explore</span>
+      </div>
+      <div id="discover-message" class="message" role="status" aria-live="polite" hidden></div>
+      <div id="trending-books" class="trending-books" aria-label="Trending books"></div>
+      <div id="more-section" class="more-section" hidden>
+        <div class="discover-heading more-heading">
+          <div>
+            <p class="eyebrow">MORE TO EXPLORE</p>
+          </div>
+        </div>
+        <div id="more-trending-books" class="more-book-list"></div>
+      </div>
+    </section>
+
+    <section class="welcome" id="welcome" hidden>
+      <div class="welcome-icon" aria-hidden="true">▤</div>
+      <h2>A good book is waiting</h2>
+      <p>Search across book catalogs and open a result to see its details.</p>
+    </section>
+
+    <section class="results-section" id="results-section" hidden>
+      <div class="results-heading">
+        <div>
+          <p class="eyebrow">SEARCH RESULTS</p>
+          <h2 id="results-title"></h2>
+        </div>
+        <span id="result-count" class="result-count"></span>
+      </div>
+      <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+      <div id="results" class="book-list"></div>
+      <nav id="pagination" class="pagination" aria-label="Search result pages" hidden>
+        <button id="previous-page" class="page-button" type="button">← Previous</button>
+        <span id="page-label" class="page-label"></span>
+        <button id="next-page" class="page-button" type="button">Next →</button>
+      </nav>
+    </section>
+
+    <section id="recommendations-view" class="recommendations-view" aria-labelledby="recommendations-title" hidden></section>
+
+    <footer class="footer">
+      <span>Powered by Annie search</span>
+      <span class="made-with">Made with ❤️</span>
+    </footer>
+
+    <button id="quick-menu-backdrop" class="quick-menu-backdrop" type="button" aria-label="Close navigation menu" hidden></button>
+    <nav id="quick-nav" class="quick-nav" aria-label="Quick navigation">
+      <div id="quick-menu-items" class="quick-menu-items" hidden>
+        <button class="quick-menu-item" type="button" data-page="recommendations">
+          <span class="quick-menu-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 6.2c-2.2-1.8-5-2.2-8.2-1.2v13c3.1-1 6-.6 8.2 1.2m0-13c2.2-1.8 5-2.2 8.2-1.2v13c-3.1-1-6-.6-8.2 1.2m0-13v13"/></svg>
+          </span>
+          <span class="quick-menu-copy"><strong>Recommendations</strong><small>For You</small></span>
+        </button>
+        <button class="quick-menu-item coming-soon" type="button" disabled aria-label="Search History, coming soon">
+          <span class="quick-menu-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M3.5 11a8.5 8.5 0 1 1 2.6 6.1M3.5 5.5V11h5.5M12 7v5l3.3 2"/></svg>
+          </span>
+          <span class="quick-menu-copy"><strong>Search History</strong><small>Coming later</small></span>
+        </button>
+        <button class="quick-menu-item coming-soon" type="button" disabled aria-label="My Bookshelf, coming soon">
+          <span class="quick-menu-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 5.5h4v13H4zM10 4h4v14.5h-4zM16 6h4v12.5h-4zM3 20.5h18"/></svg>
+          </span>
+          <span class="quick-menu-copy"><strong>My Bookshelf</strong><small>Saved books · coming later</small></span>
+        </button>
+      </div>
+      <button id="quick-nav-toggle" class="quick-nav-toggle" type="button" aria-expanded="false" aria-controls="quick-menu-items" aria-label="Open quick navigation">
+        <svg class="quick-nav-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>
+        <svg class="quick-nav-home" viewBox="0 0 24 24" aria-hidden="true"><path d="m3.5 10 8.5-7 8.5 7v10.5a1 1 0 0 1-1 1h-5.2v-7h-4.6v7H4.5a1 1 0 0 1-1-1V10Z"/></svg>
+      </button>
+    </nav>
+  </main>
+
+  <dialog id="book-dialog" class="book-dialog" aria-labelledby="detail-title">
+    <nav class="detail-navigation" aria-label="Book details navigation">
+      <button id="home-button" class="home-button" type="button" aria-label="Back to home">
+        <svg class="home-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="m3.5 10 8.5-7 8.5 7v10.5a1 1 0 0 1-1 1h-5.2v-7h-4.6v7H4.5a1 1 0 0 1-1-1V10Z" />
+        </svg>
+      </button>
+      <form id="detail-search-form" class="detail-search-form" role="search" autocomplete="off">
+        <label class="sr-only" for="detail-query">Search books</label>
+        <span class="detail-search-icon" aria-hidden="true">⌕</span>
+        <input id="detail-query" name="query" type="search" maxlength="160" placeholder="Search books…" required>
+        <button type="submit" aria-label="Search books">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 5 5"/></svg>
+        </button>
+      </form>
+      <button id="close-dialog" class="close-dialog" type="button" aria-label="Close details">×</button>
+    </nav>
+    <div id="book-detail" class="book-detail"></div>
+  </dialog>
+</body>
+</html>

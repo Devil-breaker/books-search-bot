@@ -311,7 +311,14 @@ class MultiSourceBookAggregator:
             return []
 
     @staticmethod
-    def search_hardcover(query: str, limit: int = 10) -> list[dict]:
+    def search_hardcover(
+        query: str,
+        limit: int = 10,
+        *,
+        sort: str = "",
+        fields: str = "",
+        weights: str = "",
+    ) -> list[dict]:
         """Search Hardcover.app for books, return list of dicts with metadata.
 
         Returns up to `limit` books with: title, author, rating, rating_count,
@@ -329,14 +336,26 @@ class MultiSourceBookAggregator:
 
             search_query = query.strip()
 
-            query_string = """
-            query SearchBooks($q: String!, $limit: Int) {
-                search(query: $q, query_type: "Book", per_page: $limit) {
-                    results
-                }
-            }
-            """
+            search_arguments = [
+                "query: $q",
+                'query_type: "Book"',
+                "per_page: $limit",
+            ]
+            variable_definitions = ["$q: String!", "$limit: Int"]
             variables = {"q": search_query, "limit": limit}
+            for name, value in (("sort", sort), ("fields", fields), ("weights", weights)):
+                if value:
+                    search_arguments.append(f"{name}: ${name}")
+                    variable_definitions.append(f"${name}: String")
+                    variables[name] = value
+
+            query_string = f"""
+            query SearchBooks({", ".join(variable_definitions)}) {{
+                search({", ".join(search_arguments)}) {{
+                    results
+                }}
+            }}
+            """
             resp = get_http_session().post(
                 "https://api.hardcover.app/v1/graphql",
                 headers={
@@ -411,6 +430,7 @@ class MultiSourceBookAggregator:
                     "author": author,
                     "rating": rating,
                     "rating_count": rating_count,
+                    "users_read_count": int(doc.get("users_read_count") or 0),
                     "rating_formatted": f"{rating:.2f}" if rating > 0 else "N/A",
                     "description": description,
                     "page_count": page_count,

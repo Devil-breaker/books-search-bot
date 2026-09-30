@@ -45,12 +45,17 @@ from src.handlers import GoodreadsBot  # noqa: E402, F401
 # cron) hit it every ~20 min to keep the instance awake.
 
 PORT = int(os.getenv("PORT", "8080"))
+_MINIAPP_RUNTIME = {}
 
 
 def _run_webserver():
     from flask import Flask, Response
+    from src.miniapp import create_miniapp_blueprint
 
     app = Flask(__name__)
+    app.register_blueprint(
+        create_miniapp_blueprint(_MINIAPP_RUNTIME), url_prefix="/miniapp"
+    )
 
     @app.route("/ping")
     def ping():
@@ -80,7 +85,7 @@ def _start_webserver():
             time.sleep(0.2)
 
 
-_start_webserver()
-
 bot = GoodreadsBot(TELEGRAM_BOT_TOKEN)
+_MINIAPP_RUNTIME["bot"] = bot
+_start_webserver()
 bot.run()

@@ -12,10 +12,11 @@ import requests
 import unicodedata
 from io import BytesIO
 from PIL import Image
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from telegram import (
     Update,
+    WebAppInfo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -1096,6 +1097,8 @@ class GoodreadsBot:
         """Register all command and callback handlers."""
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("annie_app", self.annie_app_command))
+        self.app.add_handler(CommandHandler("annie_recommend", self.annie_recommend_command))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("ping", self.ping_command))
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
@@ -1152,8 +1155,71 @@ class GoodreadsBot:
 
     # ── Commands ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _mini_app_url(page: str = "") -> str | None:
+        """Return the configured public Mini App URL, optionally targeting a page."""
+        configured = os.getenv("ANNIE_APP_URL", "").strip()
+        if not configured:
+            return None
+        try:
+            parsed = urlsplit(configured)
+        except ValueError:
+            return None
+        if parsed.scheme != "https" or not parsed.netloc:
+            return None
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if page:
+            query["page"] = page
+        else:
+            query.pop("page", None)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), parsed.fragment))
+
+    def _mini_app_markup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: str = "") -> InlineKeyboardMarkup | None:
+        url = self._mini_app_url(page)
+        if not url:
+            return None
+        if update.effective_chat and update.effective_chat.type == "private":
+            button = InlineKeyboardButton("Open Annie Search", web_app=WebAppInfo(url=url))
+        else:
+            username = (context.bot.username or "").lstrip("@")
+            if not username:
+                return None
+            start_parameter = "annie_recommend" if page == "recommendations" else "annie_app"
+            button = InlineKeyboardButton(
+                "Open Annie Search in private chat",
+                url=f"https://t.me/{username}?start={start_parameter}",
+            )
+        return InlineKeyboardMarkup([[button]])
+
+    async def _send_mini_app(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: str = "") -> None:
+        markup = self._mini_app_markup(update, context, page)
+        if markup is None:
+            await update.effective_message.reply_text(
+                "Annie Search isn’t connected yet. Set ANNIE_APP_URL to the public HTTPS address of the Mini App."
+            )
+            return
+        prompt = "Open Annie Search to explore books."
+        if page == "recommendations":
+            prompt = "Open Annie’s recommendation studio and tell her what you like."
+        await update.effective_message.reply_text(prompt, reply_markup=markup)
+
+    async def annie_app_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Open the Annie Search Mini App from a regular bot chat."""
+        await self._send_mini_app(update, context)
+
+    async def annie_recommend_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Open the recommendations screen directly inside the Mini App."""
+        await self._send_mini_app(update, context, "recommendations")
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message on /start."""
+        start_parameter = context.args[0] if context.args else ""
+        page = "recommendations" if start_parameter == "annie_recommend" else ""
+        launch_markup = self._mini_app_markup(update, context, page)
+        launch_hint = (
+            "Open the Mini App below to browse visually."
+            if launch_markup else "Use /annie_app after the public Mini App URL is configured."
+        )
         await update.message.reply_text( f"""
 🤖 <b>Multi-Source Book Bot</b>
 
@@ -1162,6 +1228,8 @@ covers, and descriptions.
 
 <b>How to use:</b>
 • <code>/search &lt;book_title&gt;</code> - Search for books
+• <code>/annie_app</code> - Open the Annie Search Mini App
+• <code>/annie_recommend</code> - Open recommendations directly
 • <code>@{context.bot.username} &lt;book_name&gt;</code> - Inline search from any chat
 
 <b>Example:</b>
@@ -1174,9 +1242,10 @@ covers, and descriptions.
 💠 Hardcover.app - Community ratings
 📖 StoryGraph - Social reading ratings
 
-Use /help for more information.
+Use /help for more information. {launch_hint}
             """ .strip(),
             parse_mode=ParseMode.HTML,
+            reply_markup=launch_markup,
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1188,6 +1257,8 @@ Use /help for more information.
 <code>/start</code> - Show welcome message
 <code>/help</code> - Show this help message
 <code>/search &lt;query&gt;</code> - Search for books
+<code>/annie_app</code> - Open the Annie Search Mini App
+<code>/annie_recommend</code> - Open the recommendations screen directly
 <code>/ping</code> - Check if the bot is running
 
 <b>Features:</b>
@@ -1198,6 +1269,7 @@ Use /help for more information.
 ✓ Community ratings from Hardcover.app
 ✓ Social ratings from StoryGraph
 ✓ Download covers as image files
+✓ Browse trending books and personalized recommendations in the Annie Search Mini App
 
 <b>Inline Search:</b>
 Use the bot from any Telegram chat by typing:

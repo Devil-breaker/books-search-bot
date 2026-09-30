@@ -27,6 +27,8 @@ src/
 |---|---|
 | `/start` | Show welcome message |
 | `/help` | Show help and usage guide |
+| `/annie_app` | Open the Annie Search Mini App |
+| `/annie_recommend` | Open the recommendations screen directly |
 | `/search <query>` | Search for books by title, author, or ISBN |
 
 ## 🔍 Features
@@ -71,7 +73,18 @@ GOOGLE_BOOKS_API_KEY=your_google_books_api_key_here
 HARDCOVER_API_KEY=your_hardcover_api_key_here
 AZURE_TRANSLATOR_KEY=your_azure_translator_key_here
 AZURE_TRANSLATOR_REGION=your_azure_translator_region_here
+ANNIE_APP_URL=https://your-koyeb-domain.example/miniapp/
 ```
+
+`ANNIE_APP_URL` must be the public HTTPS URL for the Mini App. Set it to your
+Koyeb service domain followed by `/miniapp/` (for example,
+`https://<your-service>.koyeb.app/miniapp/`). The launch commands are available
+in private chats; from groups, they direct users to open the bot privately.
+`/annie_recommend` opens the recommendations screen directly.
+
+Mini App artwork is kept in `src/miniapp/static/images/` and served from
+`/miniapp/assets/images/`. Keep image files in that folder instead of the
+project root so the source assets stay together with the Mini App.
 
 **Run:**
 

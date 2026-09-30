@@ -86,13 +86,60 @@ class TestGroupResultOwnership(unittest.IsolatedAsyncioTestCase):
         keyboard = GoodreadsBot._build_detail_keyboard(42, 3, "supergroup")
         labels = [button.text for row in keyboard.inline_keyboard for button in row]
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-        self.assertEqual(labels, ["✖️ Close", "🔙 Back to Results"])
-        self.assertEqual(callbacks, ["close_42", "back_42"])
+        self.assertEqual(labels, ["🔙 Back to Results", "✖️ Close"])
+        self.assertEqual(callbacks, ["back_42", "close_42"])
 
     def test_private_detail_keyboard_keeps_cover_download(self):
         keyboard = GoodreadsBot._build_detail_keyboard(42, 3, "private")
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         self.assertEqual(callbacks, ["download_42_3", "back_42"])
+
+
+class TestInlineResultExpansion(unittest.IsolatedAsyncioTestCase):
+    async def test_view_more_expands_inline_result_once(self):
+        bot = _make_bot()
+        bot._INLINE_CALLBACK_CACHE_TTL = 1800
+        callback_key = "inline_42_bk_example"
+        book = {
+            "title": "Example Book",
+            "author": "Example Author",
+            "isbn": "9780000000000",
+            "page_count": 200,
+            "published_date": "2024",
+            "description": "A description for the example book.",
+            "source": "google_books",
+            "cover_url": "https://example.com/cover.jpg",
+        }
+        bot._inline_callback_cache[callback_key] = (book, time.time())
+
+        expand = _callback_update(42, f"inline_more_{callback_key}")
+        expand.callback_query.edit_message_media = AsyncMock()
+        expand.callback_query.answer = AsyncMock()
+        with patch.object(
+            MultiSourceBookAggregator,
+            "_ensure_ratings",
+            return_value=(book, (0, 0, [], "")),
+        ):
+            with patch.object(
+                MultiSourceBookAggregator, "_ensure_cover", return_value=book
+            ):
+                await bot.button_callback(expand, MagicMock())
+
+        expand.callback_query.edit_message_media.assert_awaited_once()
+        expanded_markup = expand.callback_query.edit_message_media.await_args.kwargs["reply_markup"]
+        expanded_labels = [
+            button.text for row in expanded_markup.inline_keyboard for button in row
+        ]
+        self.assertEqual(expanded_labels, ["📚 Open Goodreads 🔗"])
+        expand.callback_query.answer.assert_awaited_once()
+
+    def test_inline_keyboard_uses_view_more_text(self):
+        compact = _make_bot()._build_inline_photo_keyboard("inline_42_book")
+        compact_buttons = [
+            button for row in compact.inline_keyboard for button in row
+        ]
+        self.assertEqual([button.text for button in compact_buttons], ["View More"])
+        self.assertTrue(compact_buttons[0].callback_data.startswith("inline_more_"))
 
 
 class TestStartupUpdateHandling(unittest.IsolatedAsyncioTestCase):
@@ -380,6 +427,75 @@ class TestCoverFallback(unittest.TestCase):
 
 
 class TestResultDeduplication(unittest.TestCase):
+    def test_duplicate_uses_complete_google_volume_as_cover_metadata_seed(self):
+        bot = _make_bot()
+        books = [
+            {
+                **make_book(
+                    title="Angels & Demons",
+                    author="Dan Brown",
+                    isbn="",
+                    cover_url="https://example.com/less-complete-cover.jpg",
+                ),
+                "cover_source": "google_books",
+                "gb_volume_id": "sparse-volume",
+            },
+            {
+                **make_book(
+                    title="Angels and Demons",
+                    author="Dan Brown",
+                    isbn="9780385504201",
+                    description="A complete description for this catalog volume.",
+                    cover_url="https://example.com/complete-cover.jpg",
+                ),
+                "cover_source": "google_books",
+                "gb_volume_id": "complete-volume",
+                "page_count": 736,
+                "published_date": "2000",
+                "language": "en",
+                "info_link": "https://books.google.com/books?id=complete-volume",
+            },
+        ]
+
+        result = bot._deduplicate_search_results(books, "Angels & Demons")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["cover_url"], "https://example.com/complete-cover.jpg")
+        self.assertEqual(result[0]["gb_volume_id"], "complete-volume")
+        self.assertEqual(result[0]["isbn"], "9780385504201")
+
+    def test_ampersand_and_and_title_variants_merge_metadata(self):
+        bot = _make_bot()
+        books = [
+            make_book(
+                title="Angels & Demons",
+                author="Dan Brown",
+                isbn="9780385504201",
+                description="Short description.",
+                cover_url="",
+                search_rating=0,
+                search_rating_count=0,
+            ),
+            make_book(
+                title="Angels and Demons",
+                author="Dan Brown",
+                isbn="9780385504225",
+                description="The complete description from the better catalog record.",
+                cover_url="https://example.com/angels-cover.jpg",
+                search_rating=3.66,
+                search_rating_count=3133,
+                search_rating_formatted="3.66",
+            ),
+        ]
+
+        result = bot._deduplicate_search_results(books, "Origin Dan Brown")
+
+        self.assertEqual(len(result), 1)
+        self.assertIn(result[0]["title"], {"Angels & Demons", "Angels and Demons"})
+        self.assertIn("complete description", result[0]["description"])
+        self.assertEqual(result[0]["cover_url"], "https://example.com/angels-cover.jpg")
+        self.assertEqual(result[0]["search_rating_count"], 3133)
+
     def test_ranking_prefers_full_title_and_author_match(self):
         bot = _make_bot()
         books = [
@@ -402,6 +518,39 @@ class TestResultDeduplication(unittest.TestCase):
         result = bot._rank_search_results(books, "Crime and Punishment")
 
         self.assertEqual(result[0]["title"], "Crime and Punishment")
+
+    def test_clarified_latin_query_ranks_english_ahead_of_non_english(self):
+        bot = _make_bot()
+        books = [
+            {**make_book(title="Wolfgang Pampel liest Dan Brown, Origin", author="Dan Brown"),
+             "language": "de"},
+            {**make_book(title="Origin", author="Dan Brown"), "language": "en"},
+            {**make_book(title="Angels & Demons", author="Dan Brown"), "language": "en"},
+        ]
+
+        result = bot._rank_search_results(
+            books, "Origin Dan Brown", preferred_language="en"
+        )
+
+        self.assertEqual([book["language"] for book in result[:2]], ["en", "en"])
+
+    def test_duplicate_work_prefers_english_edition_metadata_when_requested(self):
+        bot = _make_bot()
+        books = [
+            {**make_book(title="Origin", author="Dan Brown", isbn="id"),
+             "language": "id", "description": "Deskripsi Bahasa Indonesia"},
+            {**make_book(title="Origin", author="Dan Brown", isbn="en"),
+             "language": "en", "description": "English description"},
+        ]
+
+        result = bot._deduplicate_search_results(
+            books, "Origin Dan Brown", preferred_language="en"
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["language"], "en")
+        self.assertEqual(result[0]["description"], "English description")
+        self.assertEqual(result[0]["isbn"], "en")
 
     def test_single_character_transliteration_variant_merges_with_matching_initials(self):
         bot = _make_bot()

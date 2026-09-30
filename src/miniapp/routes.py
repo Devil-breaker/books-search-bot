@@ -1,0 +1,331 @@
+"""HTTP endpoints for the Telegram Mini App backend."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+import time
+from collections import defaultdict, deque
+
+from flask import Blueprint, current_app, jsonify, request, send_from_directory
+
+from .auth import InitDataError, validate_init_data
+from .service import MiniAppSearchService
+
+
+INIT_DATA_HEADER = "X-Telegram-Init-Data"
+_RATE_LIMIT_WINDOW_SECONDS = 60
+_RATE_LIMIT_MAX_REQUESTS = 12
+
+
+def create_miniapp_blueprint(runtime: dict) -> Blueprint:
+    """Build an isolated Blueprint; ``runtime`` is populated by Koyeb startup."""
+    blueprint = Blueprint("miniapp_api", __name__)
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    rate_lock = threading.Lock()
+    request_times: dict[tuple[int, str], deque[float]] = defaultdict(deque)
+
+    def authenticate():
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        try:
+            return validate_init_data(
+                request.headers.get(INIT_DATA_HEADER, ""), token
+            ), None
+        except InitDataError:
+            return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
+
+    def within_rate_limit(user_id: int, action: str) -> bool:
+        now = time.monotonic()
+        with rate_lock:
+            bucket = (user_id, action)
+            requests_for_user = request_times[bucket]
+            while requests_for_user and now - requests_for_user[0] >= _RATE_LIMIT_WINDOW_SECONDS:
+                requests_for_user.popleft()
+            action_limit = 4 if action == "recommendations" else _RATE_LIMIT_MAX_REQUESTS
+            if len(requests_for_user) >= action_limit:
+                return False
+            requests_for_user.append(now)
+            if len(request_times) > 2000:
+                for old_user, old_times in list(request_times.items()):
+                    if not old_times or now - old_times[-1] >= _RATE_LIMIT_WINDOW_SECONDS:
+                        request_times.pop(old_user, None)
+            return True
+
+    def get_service():
+        service = runtime.get("miniapp_search_service")
+        bot = runtime.get("bot")
+        if service is None and bot is not None:
+            service = MiniAppSearchService(bot.aggregator, bot)
+            runtime["miniapp_search_service"] = service
+        return service
+
+    @blueprint.get("/")
+    def index():
+        """Serve the standalone Mini App interface from the same origin as its API."""
+        response = send_from_directory(static_dir, "index.html")
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
+
+    @blueprint.get("/assets/<path:filename>")
+    def assets(filename):
+        # The HTML is always revalidated, while static files are versioned in
+        # their URLs. Cache them briefly so Mini App relaunches reuse images,
+        # styles, and scripts instead of downloading them again.
+        return send_from_directory(static_dir, filename, max_age=86400)
+
+    @blueprint.get("/api/session")
+    def session():
+        user, error = authenticate()
+        if error:
+            return error
+        return jsonify({"success": True, "user": {
+            "first_name": user["first_name"],
+            "language_code": user["language_code"],
+        }})
+
+    @blueprint.post("/api/search")
+    def search():
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "search"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        query = payload.get("query")
+        page = payload.get("page", 1)
+        if not isinstance(query, str) or not 2 <= len(query.strip()) <= 160:
+            return jsonify({"success": False, "error": "invalid_query"}), 400
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 20:
+            return jsonify({"success": False, "error": "invalid_page"}), 400
+
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.search(query.strip(), page))
+        except Exception:
+            current_app.logger.exception("Mini App search failed")
+            return jsonify({"success": False, "error": "search_failed"}), 502
+        return jsonify({"success": True, "data": result})
+
+    @blueprint.post("/api/trending")
+    def trending():
+        """Return cached, provider-ranked top books for the home discovery view."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "trending"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        genre = payload.get("genre")
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.trending(genre))
+        except ValueError:
+            return jsonify({"success": False, "error": "invalid_genre"}), 400
+        except Exception:
+            current_app.logger.exception("Mini App top books lookup failed")
+            return jsonify({"success": False, "error": "trending_failed"}), 502
+        return jsonify({"success": True, "data": result})
+
+    @blueprint.post("/api/details")
+    def details():
+        """Fetch richer Google Books metadata only for a selected result."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "details"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        query = payload.get("query")
+        page = payload.get("page", 1)
+        index = payload.get("index")
+        if not isinstance(query, str) or not 2 <= len(query.strip()) <= 160:
+            return jsonify({"success": False, "error": "invalid_query"}), 400
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 20:
+            return jsonify({"success": False, "error": "invalid_page"}), 400
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 5:
+            return jsonify({"success": False, "error": "invalid_selection"}), 400
+
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.book_details(query.strip(), page, index))
+        except Exception:
+            current_app.logger.exception("Mini App book details lookup failed")
+            return jsonify({"success": False, "error": "details_failed"}), 502
+        if result is None:
+            return jsonify({"success": False, "error": "search_expired"}), 404
+        return jsonify({"success": True, "data": result})
+
+    @blueprint.post("/api/recommendation-details")
+    def recommendation_details():
+        """Enrich a recommendation selected from the independent recommendations module."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "details"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        raw_book = payload.get("book") if isinstance(payload, dict) else None
+        if not isinstance(raw_book, dict):
+            return jsonify({"success": False, "error": "invalid_book"}), 400
+        title = raw_book.get("title")
+        author = raw_book.get("author", "")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 250:
+            return jsonify({"success": False, "error": "invalid_book"}), 400
+        if not isinstance(author, str) or len(author) > 250:
+            raw_book["author"] = ""
+
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.recommendation_book_details(raw_book))
+        except Exception:
+            current_app.logger.exception("Mini App recommendation detail lookup failed")
+            return jsonify({"success": False, "error": "details_failed"}), 502
+        return jsonify({"success": True, "data": result})
+
+    @blueprint.post("/api/translate")
+    def translate():
+        """Translate a selected description only after an explicit user request."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "translate"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        if isinstance(payload.get("book"), dict):
+            raw_book = payload["book"]
+            title = raw_book.get("title")
+            description = raw_book.get("description", "")
+            if not isinstance(title, str) or not title.strip() or len(title) > 250:
+                return jsonify({"success": False, "error": "invalid_book"}), 400
+            if not isinstance(description, str) or len(description) > 20000:
+                return jsonify({"success": False, "error": "invalid_book"}), 400
+            service = get_service()
+            if service is None:
+                return jsonify({"success": False, "error": "service_unavailable"}), 503
+            try:
+                result = asyncio.run(service.translate_recommendation_description(raw_book))
+            except Exception:
+                current_app.logger.exception("Mini App recommendation description translation failed")
+                return jsonify({"success": False, "error": "translation_failed"}), 502
+            return jsonify({"success": True, "data": result})
+        query = payload.get("query")
+        page = payload.get("page", 1)
+        index = payload.get("index")
+        if not isinstance(query, str) or not 2 <= len(query.strip()) <= 160:
+            return jsonify({"success": False, "error": "invalid_query"}), 400
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 20:
+            return jsonify({"success": False, "error": "invalid_page"}), 400
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 5:
+            return jsonify({"success": False, "error": "invalid_selection"}), 400
+
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.translate_description(query.strip(), page, index))
+        except Exception:
+            current_app.logger.exception("Mini App description translation failed")
+            return jsonify({"success": False, "error": "translation_failed"}), 502
+        if result is None:
+            return jsonify({"success": False, "error": "search_expired"}), 404
+        return jsonify({"success": True, "data": result})
+
+    @blueprint.post("/api/related")
+    def related():
+        """Load book-specific suggestions after the main detail view is visible."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "related"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        raw_book = payload.get("book")
+        if not isinstance(raw_book, dict):
+            return jsonify({"success": False, "error": "invalid_book"}), 400
+        title = raw_book.get("title")
+        author = raw_book.get("author", "")
+        categories = raw_book.get("categories", [])
+        isbn = raw_book.get("isbn", "")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 250:
+            return jsonify({"success": False, "error": "invalid_book"}), 400
+        if not isinstance(author, str) or len(author) > 250:
+            author = ""
+        if isinstance(categories, str):
+            categories = [categories]
+        if not isinstance(categories, list):
+            categories = []
+        cleaned_categories = []
+        for item in categories:
+            if isinstance(item, dict):
+                item = item.get("name") or item.get("title") or ""
+            if isinstance(item, str) and item.strip():
+                cleaned_categories.append(item.strip()[:120])
+            if len(cleaned_categories) >= 10:
+                break
+        categories = cleaned_categories
+        if not isinstance(isbn, str):
+            isbn = ""
+        selected = {"title": title.strip(), "author": author.strip(), "categories": categories, "isbn": isbn[:30]}
+
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.related_books_for_book(selected))
+        except Exception:
+            current_app.logger.exception("Mini App related-book lookup failed")
+            return jsonify({"success": False, "error": "related_failed"}), 502
+        return jsonify({"success": True, "data": {"books": result}})
+
+    @blueprint.post("/api/recommendations")
+    def recommendations():
+        """Build a personalized shelf from the Mini App preference form."""
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "recommendations"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        service = get_service()
+        if service is None:
+            return jsonify({"success": False, "error": "service_unavailable"}), 503
+        try:
+            result = asyncio.run(service.recommend_books(payload))
+        except ValueError as exc:
+            code = str(exc) or "invalid_preferences"
+            status = 400
+            return jsonify({"success": False, "error": code}), status
+        except Exception:
+            current_app.logger.exception("Mini App recommendations failed")
+            return jsonify({"success": False, "error": "recommendations_failed"}), 502
+        return jsonify({"success": True, "data": result})
+
+    return blueprint
