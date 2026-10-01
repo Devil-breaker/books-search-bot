@@ -181,6 +181,20 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parse_qs(parsed.query)["page"], ["recommendations"])
         self.assertTrue(parse_qs(parsed.query)["inline_ticket"][0])
 
+    async def test_partial_launch_shortcut_does_not_search_for_books(self):
+        bot = object.__new__(GoodreadsBot)
+        bot._active_clarification_restriction = MagicMock(return_value=None)
+        update = MagicMock()
+        update.inline_query.query = ".port"
+        update.inline_query.from_user.id = 123
+        update.inline_query.answer = AsyncMock()
+
+        await bot.inline_search(update, MagicMock())
+
+        update.inline_query.answer.assert_awaited_once_with(
+            [], cache_time=0, is_personal=True
+        )
+
     def test_inline_launch_ticket_is_one_use_and_creates_user_session(self):
         bot = object.__new__(GoodreadsBot)
         bot._inline_app_auth_lock = threading.Lock()

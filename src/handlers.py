@@ -2161,7 +2161,17 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
             ".portal": ("", "📚 Open Annie Search Portal"),
             ".recom": ("recommendations", "✨ Open Annie Recommendations"),
         }
-        launch = launch_pages.get(query.casefold())
+        normalized_inline_query = query.casefold()
+        launch = launch_pages.get(normalized_inline_query)
+        if normalized_inline_query and not launch and any(
+            shortcut.startswith(normalized_inline_query)
+            for shortcut in launch_pages
+        ):
+            # Telegram sends every partial query as the user types. Don't run
+            # book searches for `.por`, `.re`, etc. while a launch shortcut is
+            # still being entered.
+            await update.inline_query.answer([], cache_time=0, is_personal=True)
+            return
         if launch:
             page, label = launch
             url = self._mini_app_url(page)
