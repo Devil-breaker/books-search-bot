@@ -17,6 +17,9 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from telegram import (
     Update,
     WebAppInfo,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -53,6 +56,7 @@ class GoodreadsBot:
             .pool_timeout(30.0)
             .get_updates_connect_timeout(30.0)
             .get_updates_read_timeout(40.0)
+            .post_init(self._configure_telegram_commands)
             .build()
         )
         # search_cache: {user_id: (books_list, timestamp)}
@@ -1273,12 +1277,41 @@ class GoodreadsBot:
         """Register all command and callback handlers."""
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
-        self.app.add_handler(CommandHandler("annie_app", self.annie_app_command))
-        self.app.add_handler(CommandHandler("annie_recommend", self.annie_recommend_command))
+        self.app.add_handler(CommandHandler(["portal", "annie_app"], self.annie_app_command))
+        self.app.add_handler(CommandHandler(
+            ["recom", "annie_recommend", "annie_recommendation"],
+            self.annie_recommend_command,
+        ))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("ping", self.ping_command))
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(InlineQueryHandler(self.inline_search))
+
+    async def _configure_telegram_commands(self, application: Application | None = None):
+        """Publish command suggestions through Telegram so BotFather setup is unnecessary."""
+        bot = (application or self.app).bot
+        commands = [
+            BotCommand("start", "Welcome to Annie Search"),
+            BotCommand("help", "How to use Annie"),
+            BotCommand("portal", "Open Annie Search Portal"),
+            BotCommand("recom", "Open Annie Recommendations"),
+            BotCommand("search", "Search books by title or author"),
+            BotCommand("ping", "Check bot status and uptime"),
+        ]
+        scopes = (
+            None,
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+        )
+        for scope in scopes:
+            try:
+                if scope is None:
+                    await bot.set_my_commands(commands)
+                else:
+                    await bot.set_my_commands(commands, scope=scope)
+            except Exception as exc:
+                # Command menu setup is helpful but should never prevent startup.
+                logger.warning("Could not publish Telegram command menu: %s", type(exc).__name__)
 
     def process_update(self, raw_update: dict) -> bool:
         """Process a single update dict received from Telegram webhook.
@@ -1363,10 +1396,10 @@ class GoodreadsBot:
             username = (context.bot.username or "").lstrip("@")
             if not username:
                 return None
-            start_parameter = "annie_recommend" if page == "recommendations" else "annie_app"
+            start_parameter = "recom" if page == "recommendations" else "portal"
             button = InlineKeyboardButton(
-                f"{label} · open in private chat",
-                url=f"https://t.me/{username}?start={start_parameter}",
+                label,
+                url=f"https://t.me/{username}?startapp={start_parameter}",
             )
         return InlineKeyboardMarkup([[button]])
 
@@ -1428,8 +1461,8 @@ Open the portal to search books, explore trending and genre shelves, and browse 
 Add at least one book or author you’ve read or liked, choose genres, or pick moods. Annie will use those clues to suggest books.
 
 <b>Commands</b>
-<code>/annie_app</code> · Open the portal
-<code>/annie_recommend</code> · Open recommendations
+<code>/portal</code> · Open the portal
+<code>/recom</code> · Open recommendations
 <code>/help</code> · Show this guide
 <code>/ping</code> · Check bot status"""
 
@@ -1475,8 +1508,12 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send the concise welcome and action menu on /start."""
         start_parameter = context.args[0] if context.args else ""
-        if start_parameter in {"annie_app", "annie_recommend"}:
-            page = "recommendations" if start_parameter == "annie_recommend" else ""
+        if start_parameter in {
+            "portal", "recom", "annie_app", "annie_recommend", "annie_recommendation"
+        }:
+            page = "recommendations" if start_parameter in {
+                "recom", "annie_recommend", "annie_recommendation"
+            } else ""
             await self._send_mini_app(update, context, page)
             return
         await update.message.reply_text(
@@ -3880,4 +3917,5 @@ def get_bot() -> GoodreadsBot:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         loop.run_until_complete(_bot_instance.app.initialize())
+        loop.run_until_complete(_bot_instance._configure_telegram_commands())
     return _bot_instance

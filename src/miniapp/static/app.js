@@ -1045,7 +1045,12 @@
         : "Hi there";
       setBusy(false);
       renderGenreTabs();
-      if (new URLSearchParams(window.location.search).get("page") === "recommendations") {
+      const startParam = webApp?.initDataUnsafe?.start_param
+        || new URLSearchParams(window.location.search).get("tgWebAppStartParam")
+        || "";
+      const recommendationLaunch = ["recom", "annie_recommend", "annie_recommendation"]
+        .includes(startParam);
+      if (recommendationLaunch || new URLSearchParams(window.location.search).get("page") === "recommendations") {
         showRecommendationsPage();
         dismissLaunchWelcome();
         return;

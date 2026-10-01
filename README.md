@@ -61,18 +61,18 @@ Results and metadata vary by catalog. Some titles may have more complete details
 | `/start` | Welcome message and Mini App launch button |
 | `/help` | Commands and usage tips |
 | `/search <query>` | Search by title, author, or ISBN |
-| `/annie_app` | Open Annie Search Mini App |
-| `/annie_recommend` | Open the recommendations screen directly |
+| `/portal` | Open Annie Search Mini App |
+| `/recom` | Open the recommendations screen directly |
 | `/ping` | Check whether the bot is responding |
 
-To show commands in Telegram’s command menu, configure them with `/setcommands` in [@BotFather](https://t.me/BotFather). Enable Inline Mode in BotFather to use inline search. Enter command names without `/`, for example:
+The bot publishes these commands to Telegram on startup, so no `/setcommands` setup is needed. You can still override the command menu in [@BotFather](https://t.me/BotFather). Enable Inline Mode in BotFather to use inline search. The published commands are:
 
 ```text
 start - Show welcome message
 help - Show help and usage guide
 search - Search for books
-annie_app - Open the Annie Search Mini App
-annie_recommend - Open recommendations directly
+portal - Open the Annie Search Mini App
+recom - Open recommendations directly
 ping - Check whether the bot is responding
 ```
 
@@ -127,7 +127,7 @@ The repository’s Dockerfile runs the polling bot and Mini App web server toget
 2. Add the environment variables listed below in the service settings.
 3. Expose the service’s HTTP port as `8080`, or use the same port configured in `PORT`.
 4. Set `ANNIE_APP_URL` to the public HTTPS address ending in `/miniapp/`, such as `https://<your-service>.koyeb.app/miniapp/`.
-5. Deploy the service, then use `/annie_app` in Telegram.
+5. Deploy the service, then use `/portal` in Telegram.
 
 Koyeb terminates HTTPS at its edge; the Flask server listens for plain HTTP on `0.0.0.0:$PORT` inside the container.
 

@@ -76,7 +76,7 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         bot._send_mini_app = AsyncMock()
         update = MagicMock()
         context = MagicMock()
-        context.args = ["annie_recommend"]
+        context.args = ["recom"]
 
         await bot.start(update, context)
 
@@ -101,7 +101,7 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Mini App URL:</b> Configured", text)
 
     @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
-    def test_group_chat_links_to_private_bot_start(self):
+    def test_group_chat_opens_main_mini_app_in_current_chat(self):
         update = MagicMock()
         update.effective_chat.type = "group"
         context = MagicMock()
@@ -110,8 +110,23 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         markup = GoodreadsBot._mini_app_markup(object.__new__(GoodreadsBot), update, context, "recommendations")
         button = markup.inline_keyboard[0][0]
 
-        self.assertEqual(button.url, "https://t.me/annie_search_bot?start=annie_recommend")
+        self.assertEqual(button.url, "https://t.me/annie_search_bot?startapp=recom")
         self.assertIsNone(button.web_app)
+
+    def test_command_menu_is_registered_for_private_and_group_chats(self):
+        bot = object.__new__(GoodreadsBot)
+        bot.app = MagicMock()
+        bot.app.bot.set_my_commands = AsyncMock()
+
+        import asyncio
+        asyncio.run(bot._configure_telegram_commands())
+
+        self.assertEqual(bot.app.bot.set_my_commands.await_count, 3)
+        commands = bot.app.bot.set_my_commands.await_args_list[0].args[0]
+        command_names = [command.command for command in commands]
+        self.assertIn("portal", command_names)
+        self.assertIn("recom", command_names)
+        self.assertNotIn("annie_app", command_names)
 
 
 if __name__ == "__main__":
