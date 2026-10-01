@@ -128,7 +128,7 @@
     return selected;
   }
 
-  function mount(container, requestApi, onBookSelect, createLoader) {
+  function mount(container, requestApi, onBookSelect) {
     if (!container || container.dataset.mounted === "true") return;
     container.dataset.mounted = "true";
 
@@ -201,12 +201,8 @@
       if (!currentPreferences || !shownBooks.length || typeof requestApi !== "function") return;
       const requestPreferences = currentPreferences;
       loadMore.disabled = true;
-      const loadMoreLabel = "Load more recommendations";
-      loadMore.textContent = "Loading…";
-      resultMessage.replaceChildren();
-      resultMessage.append(typeof createLoader === "function"
-        ? createLoader("Annie is looking for more books…", "recommendation-more-loader")
-        : element("span", "recommendation-loading-copy", "Annie is looking for more books…"));
+      loadMore.textContent = "Finding fresh matches…";
+      resultMessage.textContent = "Annie is looking for more books that haven’t appeared yet.";
       try {
         const response = await requestApi("recommendations", {
           method: "POST",
@@ -243,7 +239,7 @@
           : "Annie couldn’t load more picks right now. Please try again.";
       } finally {
         loadMore.disabled = false;
-        loadMore.textContent = loadMoreLabel;
+        loadMore.textContent = "Load more recommendations";
       }
     });
 
@@ -305,22 +301,10 @@
       quickStartActions.append(action);
     });
     quickStart.append(quickStartActions);
-    const submitLoader = typeof createLoader === "function"
-      ? createLoader("Annie is paging through stories for you…", "recommendation-submit-loader")
-      : element("div", "recommendation-loading recommendation-submit-loader");
-    submitLoader.hidden = true;
-    submitLoader.setAttribute("role", "status");
-    submitLoader.setAttribute("aria-live", "polite");
-    if (typeof createLoader !== "function") {
-      const loadingBooks = element("span", "recommendation-loading-books");
-      loadingBooks.setAttribute("aria-hidden", "true");
-      for (let index = 0; index < 4; index += 1) loadingBooks.append(element("span", "recommendation-loading-book"));
-      submitLoader.append(loadingBooks, element("span", "recommendation-loading-copy", "Annie is paging through stories for you…"));
-    }
     const submitStatus = element("p", "recommendation-submit-status");
     submitStatus.setAttribute("role", "status");
     submitStatus.setAttribute("aria-live", "polite");
-    container.append(submit, submitLoader, submitStatus, quickStart, results);
+    container.append(submit, submitStatus, quickStart, results);
 
     submit.addEventListener("click", async () => {
         const preferences = {
@@ -340,12 +324,11 @@
 
       submit.disabled = true;
       submit.textContent = "Finding thoughtful matches…";
-      submitLoader.hidden = false;
-      submitStatus.textContent = "";
-      results.hidden = true;
-      currentPreferences = preferences;
-      renderGuideClues(preferences);
-      try {
+        submitStatus.textContent = "Annie is looking beyond the bestsellers for books that fit you.";
+        results.hidden = true;
+        currentPreferences = preferences;
+        renderGuideClues(preferences);
+        try {
         const response = await requestApi("recommendations", {
           method: "POST",
           body: JSON.stringify(preferences),
@@ -372,7 +355,6 @@
             ? "Add a book or author, choose a genre, or pick a mood to begin."
             : "Recommendations couldn’t be loaded right now. Please try again.";
       } finally {
-        submitLoader.hidden = true;
         submit.disabled = false;
         submit.textContent = "Find my next reads";
       }

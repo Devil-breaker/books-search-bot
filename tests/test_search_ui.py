@@ -6,9 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import unittest
 from datetime import datetime, timezone
-from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
-from PIL import Image
 
 # Patch env before importing handlers
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "TEST_TOKEN")
@@ -395,9 +393,7 @@ class TestCoverFallback(unittest.TestCase):
         primary.raise_for_status.return_value = None
 
         fallback = MagicMock()
-        image_bytes = BytesIO()
-        Image.new("RGB", (12, 18), color=(80, 40, 120)).save(image_bytes, format="JPEG")
-        fallback.content = image_bytes.getvalue()
+        fallback.content = b"valid-hardcover-cover-bytes"
         fallback.status_code = 200
         fallback.headers = {"Content-Type": "image/jpeg"}
         fallback.url = "https://assets.hardcover.app/cover.jpg"
@@ -424,116 +420,13 @@ class TestCoverFallback(unittest.TestCase):
         try:
             self.assertIsNotNone(temp_path)
             with open(temp_path, "rb") as cover_file:
-                with Image.open(cover_file) as saved_cover:
-                    self.assertEqual(saved_cover.format, "JPEG")
-                    self.assertEqual(saved_cover.size, (12, 18))
-            self.assertEqual(session.get.call_count, 2)
-        finally:
-            bot.cleanup_temp_file(temp_path)
-
-    def test_placeholder_retries_itunes_and_returns_normalized_photo(self):
-        bot = _make_bot()
-        placeholder = MagicMock()
-        placeholder.content = b"google-placeholder"
-        placeholder.status_code = 200
-        placeholder.headers = {"Content-Type": "image/png"}
-        placeholder.url = "https://books.google.com/placeholder"
-        placeholder.raise_for_status.return_value = None
-
-        image_bytes = BytesIO()
-        Image.new("RGB", (14, 20), color=(30, 90, 140)).save(image_bytes, format="PNG")
-        recovered = MagicMock()
-        recovered.content = image_bytes.getvalue()
-        recovered.status_code = 200
-        recovered.headers = {"Content-Type": "image/png"}
-        recovered.url = "https://itunes.example/cover.png"
-        recovered.raise_for_status.return_value = None
-
-        session = MagicMock()
-        session.get.side_effect = [placeholder, recovered]
-        book = {
-            "title": "Harry Potter and the Prisoner of Azkaban: MinaLima Edition",
-            "author": "J. K. Rowling",
-            "isbn": "1526666324",
-            "cover_source": "google_books",
-        }
-        itunes_match = {"cover_url": "https://itunes.example/cover.png"}
-
-        with (
-            patch("src.handlers.get_http_session", return_value=session),
-            patch("src.handlers.is_placeholder_image", side_effect=[True, False]),
-            patch.object(MultiSourceBookAggregator, "search_itunes", return_value=[itunes_match]),
-            patch.object(MultiSourceBookAggregator, "_find_matching_book_strict", return_value=itunes_match),
-            patch.object(MultiSourceBookAggregator, "_get_hardcover_cached", return_value=(0, 0, [], "")),
-            patch.object(MultiSourceBookAggregator, "_get_openlibrary_cover", return_value=""),
-        ):
-            temp_path = bot.download_and_save_image("https://books.google.com/placeholder", book)
-
-        try:
-            self.assertIsNotNone(temp_path)
-            with open(temp_path, "rb") as cover_file, Image.open(cover_file) as saved_cover:
-                self.assertEqual(saved_cover.format, "JPEG")
-                self.assertEqual(saved_cover.size, (14, 20))
-            self.assertEqual(book["cover_url"], itunes_match["cover_url"])
-            self.assertEqual(book["cover_source"], "itunes")
+                self.assertEqual(cover_file.read(), fallback.content)
             self.assertEqual(session.get.call_count, 2)
         finally:
             bot.cleanup_temp_file(temp_path)
 
 
 class TestResultDeduplication(unittest.TestCase):
-    def test_inline_merges_repeated_provider_results_and_keeps_fallback_cover(self):
-        bot = _make_bot()
-        hardcover = [
-            make_book(
-                title="The Metamorphosis", author="Franz Kafka", isbn="hc-1",
-                cover_url="", source="hardcover", categories=["Fiction"],
-            ),
-            make_book(
-                title="Metamorphosis", author="Franz Kafka", isbn="hc-2",
-                cover_url="", source="hardcover", categories=["Classics"],
-            ),
-        ]
-        itunes = [
-            make_book(
-                title="Metamorphosis", author="Franz Kafka", isbn="it-1",
-                cover_url="https://example.com/itunes-cover.jpg", source="itunes",
-                categories=["Literature"],
-            ),
-            make_book(
-                title="The Metamorphosis", author="Franz Kafka", isbn="it-2",
-                cover_url="https://example.com/duplicate-cover.jpg", source="itunes",
-            ),
-        ]
-
-        result = bot._merge_inline_search_results(hardcover, itunes, "Metamorphosis")
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["cover_url"], "https://example.com/itunes-cover.jpg")
-        self.assertEqual(
-            set(result[0]["categories"]), {"Fiction", "Classics", "Literature"}
-        )
-
-    def test_inline_keeps_article_title_variants_when_authors_differ(self):
-        bot = _make_bot()
-        hardcover = [
-            make_book(
-                title="The Metamorphosis", author="Author One", isbn="hc-one",
-                source="hardcover",
-            ),
-        ]
-        itunes = [
-            make_book(
-                title="Metamorphosis", author="Author Two", isbn="it-two",
-                source="itunes",
-            ),
-        ]
-
-        result = bot._merge_inline_search_results(hardcover, itunes, "Metamorphosis")
-
-        self.assertEqual(len(result), 2)
-        self.assertEqual({book["author"] for book in result}, {"Author One", "Author Two"})
-
     def test_duplicate_uses_complete_google_volume_as_cover_metadata_seed(self):
         bot = _make_bot()
         books = [

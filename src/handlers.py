@@ -1174,107 +1174,22 @@ class GoodreadsBot:
             query.pop("page", None)
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), parsed.fragment))
 
-    def _mini_app_markup(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-        page: str = "", label: str = "Annie Search Portal",
-    ) -> InlineKeyboardMarkup | None:
+    def _mini_app_markup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: str = "") -> InlineKeyboardMarkup | None:
         url = self._mini_app_url(page)
         if not url:
             return None
         if update.effective_chat and update.effective_chat.type == "private":
-            button = InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
+            button = InlineKeyboardButton("Open Annie Search", web_app=WebAppInfo(url=url))
         else:
             username = (context.bot.username or "").lstrip("@")
             if not username:
                 return None
             start_parameter = "annie_recommend" if page == "recommendations" else "annie_app"
             button = InlineKeyboardButton(
-                f"{label} · open in private chat",
+                "Open Annie Search in private chat",
                 url=f"https://t.me/{username}?start={start_parameter}",
             )
         return InlineKeyboardMarkup([[button]])
-
-    def _start_keyboard(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> InlineKeyboardMarkup:
-        """Build the compact welcome menu, retaining a fallback if unconfigured."""
-        portal = self._mini_app_markup(update, context, label="📚 Annie Search Portal")
-        recommendations = self._mini_app_markup(
-            update, context, "recommendations", "✨ Annie Recommendations"
-        )
-        portal_button = (
-            portal.inline_keyboard[0][0] if portal else
-            InlineKeyboardButton("📚 Annie Search Portal", callback_data="start_portal")
-        )
-        recommendations_button = (
-            recommendations.inline_keyboard[0][0] if recommendations else
-            InlineKeyboardButton(
-                "✨ Annie Recommendations", callback_data="start_recommendations"
-            )
-        )
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("❔ Help", callback_data="start_help"),
-             InlineKeyboardButton("✦ Features List", callback_data="start_features")],
-            [portal_button],
-            [recommendations_button],
-        ])
-
-    @staticmethod
-    def _start_text() -> str:
-        return (
-            "<b>Welcome to Annie Search</b> ✨\n"
-            "Find your next read with quick book search, thoughtful details, "
-            "and personalized recommendations.\n"
-            "Search by title or author, or let Annie find a story for your mood."
-        )
-
-    @staticmethod
-    def _back_to_start_markup() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[
-            InlineKeyboardButton("← Back to start", callback_data="start_back")
-        ]])
-
-    @staticmethod
-    def _help_text() -> str:
-        return """<b>✦ Using Annie</b>
-
-<b>Search in a chat</b>
-Send <code>/search title or author</code> to search for a book.
-Tap a result to open its details. Use the buttons to browse results or download a cover.
-
-<b>Search inline</b>
-Type <code>@AnnieBooks_bot title or author</code> in any chat, then choose a result to share.
-
-<b>Annie Search Portal</b>
-Open the portal to search books, explore trending and genre shelves, and browse similar titles with <i>More Like This</i>.
-
-<b>Annie Recommendations</b>
-Add at least one book or author you’ve read or liked, choose genres, or pick moods. Annie will use those clues to suggest books.
-
-<b>Commands</b>
-<code>/annie_app</code> · Open the portal
-<code>/annie_recommend</code> · Open recommendations
-<code>/help</code> · Show this guide
-<code>/ping</code> · Check bot status"""
-
-    @staticmethod
-    def _features_text() -> str:
-        return """<b>✦ What Annie can do</b>
-
-📖 <b>Find books</b>
-Search by title or author in a chat or inline.
-
-🪄 <b>Explore details</b>
-See available covers, descriptions, genres, publication information, and ratings.
-
-🖼 <b>Keep a cover</b>
-Download a book cover from its details.
-
-🧭 <b>Discover in the portal</b>
-Browse trending picks, genre shelves, search, and <i>More Like This</i>.
-
-✨ <b>Find your next read</b>
-Get recommendations from books you’ve read or liked, genres, and moods."""
 
     async def _send_mini_app(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: str = "") -> None:
         markup = self._mini_app_markup(update, context, page)
@@ -1297,49 +1212,82 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         await self._send_mini_app(update, context, "recommendations")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send the concise welcome and action menu on /start."""
+        """Send welcome message on /start."""
         start_parameter = context.args[0] if context.args else ""
-        if start_parameter in {"annie_app", "annie_recommend"}:
-            page = "recommendations" if start_parameter == "annie_recommend" else ""
-            await self._send_mini_app(update, context, page)
-            return
-        await update.message.reply_text(
-            self._start_text(),
+        page = "recommendations" if start_parameter == "annie_recommend" else ""
+        launch_markup = self._mini_app_markup(update, context, page)
+        launch_hint = (
+            "Open the Mini App below to browse visually."
+            if launch_markup else "Use /annie_app after the public Mini App URL is configured."
+        )
+        await update.message.reply_text( f"""
+🤖 <b>Multi-Source Book Bot</b>
+
+Welcome! I search across multiple sources to find the best book information,
+covers, and descriptions.
+
+<b>How to use:</b>
+• <code>/search &lt;book_title&gt;</code> - Search for books
+• <code>/annie_app</code> - Open the Annie Search Mini App
+• <code>/annie_recommend</code> - Open recommendations directly
+• <code>@{context.bot.username} &lt;book_name&gt;</code> - Inline search from any chat
+
+<b>Example:</b>
+<code>/search Harry Potter and the Prisoner of Azkaban</code>
+<code>@{context.bot.username} Harry Potter</code>
+
+<b>Data Sources:</b>
+📚 Google Books - Descriptions & metadata
+🍎 iTunes - High-resolution covers
+💠 Hardcover.app - Community ratings
+📖 StoryGraph - Social reading ratings
+
+Use /help for more information. {launch_hint}
+            """ .strip(),
             parse_mode=ParseMode.HTML,
-            reply_markup=self._start_keyboard(update, context),
+            reply_markup=launch_markup,
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help text on /help."""
-        await update.message.reply_text(
-            self._help_text(),
+        await update.message.reply_text( f"""
+<b>📚 Multi-Source Book Bot Help</b>
+
+<b>Commands:</b>
+<code>/start</code> - Show welcome message
+<code>/help</code> - Show this help message
+<code>/search &lt;query&gt;</code> - Search for books
+<code>/annie_app</code> - Open the Annie Search Mini App
+<code>/annie_recommend</code> - Open the recommendations screen directly
+<code>/ping</code> - Check if the bot is running
+
+<b>Features:</b>
+✓ Searches multiple sources simultaneously
+✓ Combines best data from each source
+✓ High-resolution covers from iTunes
+✓ Descriptions from Google Books
+✓ Community ratings from Hardcover.app
+✓ Social ratings from StoryGraph
+✓ Download covers as image files
+✓ Browse trending books and personalized recommendations in the Annie Search Mini App
+
+<b>Inline Search:</b>
+Use the bot from any Telegram chat by typing:
+<code>@{context.bot.username} &lt;book_name&gt;</code>
+
+Example: <code>@{context.bot.username} Harry Potter</code>
+
+<b>Tips:</b>
+• Use full book titles for best results
+• Include author name for better matching
+• Try different keywords if no results
+            """ .strip(),
             parse_mode=ParseMode.HTML,
-            reply_markup=self._back_to_start_markup(),
         )
 
     async def ping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Report process uptime and basic configured runtime status."""
-        uptime_seconds = max(0, int(time.time() - getattr(self, "_started_at", time.time())))
-        days, remainder = divmod(uptime_seconds, 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        uptime_parts = []
-        if days:
-            uptime_parts.append(f"{days}d")
-        if hours or days:
-            uptime_parts.append(f"{hours}h")
-        if minutes or hours or days:
-            uptime_parts.append(f"{minutes}m")
-        uptime_parts.append(f"{seconds}s")
-        mode = "Webhook" if getattr(self, "webhook_mode", False) else "Polling"
-        mini_app = "Configured" if self._mini_app_url() else "Not configured"
-        await update.message.reply_text(
-            "<b>✅ Annie is online</b>\n\n"
-            f"⏱ <b>Uptime:</b> {' '.join(uptime_parts)}\n"
-            f"🔌 <b>Connection:</b> {mode}\n"
-            f"📱 <b>Mini App URL:</b> {mini_app}",
-            parse_mode=ParseMode.HTML,
-        )
+        """Reply with bot status on /ping."""
+        await update.message.reply_text("✅ Bot is running and polling Telegram!")
 
     # ── Inline search ───────────────────────────────────────────────────────────
 
@@ -1540,11 +1488,6 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         # edition labels remain part of the title key.
         if len(tokens) >= 3 and tokens[-2:] == ["novel", "by"]:
             tokens = tokens[:-2]
-        # Some catalogs include a leading English article while others omit it
-        # (e.g. "The Metamorphosis" vs "Metamorphosis"). Treat that as the same
-        # work for deduplication without rewriting the displayed title.
-        if len(tokens) > 1 and tokens[0] in {"a", "an", "the"}:
-            tokens = tokens[1:]
         return " ".join(tokens)
 
     @staticmethod
@@ -1766,16 +1709,6 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
             logger.info("Removed %s duplicate title/author results for query=%r", removed, query)
         return merged
 
-    def _merge_inline_search_results(
-        self, hardcover_books: list[dict], itunes_books: list[dict], query: str
-    ) -> list[dict]:
-        """Merge inline providers and collapse duplicate works across both lists."""
-        # Hardcover first gives its records precedence when the deduplicator has
-        # equally complete candidates; iTunes can still fill missing metadata.
-        return self._deduplicate_search_results(
-            [*(hardcover_books or []), *(itunes_books or [])], query,
-        )
-
     def _rank_search_results(
         self, books: list[dict], query: str,
         preferred_language: str | None = None,
@@ -1935,8 +1868,32 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
             f"(Hardcover={len(hc_books)}, iTunes={len(it_books)})"
         )
 
-        # ── Phase 2: Merge and deduplicate within/across providers ────────────────
-        final = self._merge_inline_search_results(hc_books, it_books, query)[:20]
+        # ── Phase 2: Merge — Hardcover primary, iTunes cover supplementation ──────
+        merged: list[dict] = []
+        matched_it_indices: set[int] = set()
+
+        for hc in hc_books:
+            book = hc.copy()
+            for it_idx, it in enumerate(it_books):
+                if it_idx in matched_it_indices:
+                    continue
+                if self._inline_title_author_match(
+                    hc.get("title", ""), hc.get("author", ""),
+                    it.get("title", ""), it.get("author", ""),
+                ):
+                    # Prefer iTunes cover when Hardcover lacks one
+                    if it.get("cover_url") and not book.get("cover_url"):
+                        book["cover_url"] = it["cover_url"]
+                    matched_it_indices.add(it_idx)
+                    break
+            merged.append(book)
+
+        # Unmatched iTunes-only results
+        for it_idx, it in enumerate(it_books):
+            if it_idx not in matched_it_indices:
+                merged.append(it.copy())
+
+        final = merged[:20]
 
         elapsed = time.monotonic() - t_start
         logger.info(f"⏱️ Inline total: {elapsed:.1f}s → {len(final)} results")
@@ -2255,120 +2212,85 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def download_and_save_image(self, cover_url: str, book: dict = None):
-        """Download, validate, and normalize a cover to JPEG for Telegram.
+        """Download cover image and save to a temp file. Returns path or None.
 
-        Some catalog URLs fail only for individual editions or return formats
-        Telegram cannot send as photos. Retry other available catalogs after a
-        failed/placeholder image, and always upload a decoded JPEG.
+        Args:
+            cover_url: URL to download.
+            book: Book dict (optional). Used for cover fallback and diagnostics.
+                  When the primary cover is a placeholder, retries with the
+                  Hardcover cover from book["_hardcover_match"]["cover_url"] if available.
         """
-        book = book or {}
-        title = book.get("title", "")
-        primary_source = book.get("cover_source", book.get("source", "unknown"))
-        candidates: list[tuple[str, str]] = []
+        cover_source = (book or {}).get("cover_source", "unknown")
 
-        def add_candidate(url: str | None, source: str) -> None:
-            if url and url.startswith(("https://", "http://")) and all(url != old for old, _ in candidates):
-                candidates.append((url, source))
+        def _log_cover_diagnostic(source, url, status, ctype, clen, final_url, width, height):
+            """Log diagnostic info for a cover download (PART 4)."""
+            domain = urlsplit(url).netloc
+            final_domain = urlsplit(final_url).netloc if final_url != url else domain
+            logger.info(
+                f"Cover diag: source={source} url={url[:70]} "
+                f"status={status} type={ctype} len={clen} "
+                f"domain={final_domain} dims={width}x{height}"
+            )
 
-        add_candidate(cover_url, primary_source)
-        hc_match = book.get("_hardcover_match") or {}
-        add_candidate(hc_match.get("cover_url"), "hardcover")
+        def _download_one(url: str, source: str = cover_source):
+            """Attempt one cover download. Returns (bytes, status, ctype, clen, final_url, width, height)."""
+            response = get_http_session().get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+            response.raise_for_status()
+            final_url = response.url
+            ctype = response.headers.get("Content-Type", "")
+            clen = len(response.content)
+            width = height = None
+            try:
+                img = Image.open(BytesIO(response.content))
+                width, height = img.size
+            except Exception:
+                pass
+            _log_cover_diagnostic(source, url, response.status_code, ctype, clen, final_url, width, height)
+            return response.content, response.status_code, ctype, clen, final_url, width, height
 
-        initial_candidate_count = len(candidates)
+        try:
+            title = (book or {}).get("title", "")
+            result_source = cover_source
+            logger.info(f"📥 Downloading cover: {cover_url[:60]}... source={cover_source} title={title}")
+            content, status, ctype, clen, final_url, width, height = _download_one(cover_url)
 
-        def try_candidates(candidate_list: list[tuple[str, str]]) -> str | None:
-            for candidate_url, source in candidate_list:
-                try:
-                    logger.info("📥 Downloading cover: %s... source=%s title=%s", candidate_url[:60], source, title)
-                    response = get_http_session().get(
-                        candidate_url, headers=HEADERS, timeout=15, allow_redirects=True
-                    )
-                    response.raise_for_status()
-                    content = response.content
-                    if not content or is_placeholder_image(content):
-                        logger.warning("Cover is empty or placeholder: source=%s title=%s", source, title)
-                        continue
+            if is_placeholder_image(content):
+                logger.warning(f"⚠️ Cover placeholder detected: source={cover_source} title={title}")
+                # ── PART 6 fallback: try Hardcover cover if available ─────────
+                if book and cover_source == "google_books":
+                    hc_cover = book.get("_hardcover_match", {}).get("cover_url")
+                    if hc_cover:
+                        logger.info(f"Cover fallback: source=hardcover title={title}")
+                        try:
+                            content, status, ctype, clen, final_url, width, height = (
+                                _download_one(hc_cover, source="hardcover")
+                            )
+                            if is_placeholder_image(content):
+                                logger.warning(
+                                    f"⚠️ Fallback cover also placeholder; skipping. title={title}"
+                                )
+                                return None
+                            logger.info(f"✅ Cover fallback OK: source=hardcover title={title} bytes={clen}")
+                            # Fall through — content now holds the valid fallback bytes.
+                            result_source = "hardcover"
+                        except Exception as e:
+                            logger.warning(f"Fallback cover download failed: {e} title={title}")
+                            return None
+                    else:
+                        logger.info(f"No Hardcover cover available for fallback. title={title}")
+                        return None
+                else:
+                    return None
 
-                    with Image.open(BytesIO(content)) as image:
-                        image.load()
-                        width, height = image.size
-                        # Telegram expects a supported photo format. Converting
-                        # WebP/AVIF/PNG responses avoids format-specific sendPhoto failures.
-                        normalized = image.convert("RGB")
-                        output = BytesIO()
-                        normalized.save(output, format="JPEG", quality=92, optimize=True)
-                        jpeg_content = output.getvalue()
-
-                    logger.info(
-                        "Cover validated: source=%s status=%s type=%s bytes=%s dims=%sx%s",
-                        source,
-                        response.status_code,
-                        response.headers.get("Content-Type", ""),
-                        len(content),
-                        width,
-                        height,
-                    )
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                    temp_file.write(jpeg_content)
-                    temp_file.close()
-                    if candidate_url != cover_url:
-                        book["cover_url"] = candidate_url
-                        book["cover_source"] = source
-                    logger.info("✅ Downloaded and normalized cover: source=%s title=%s", source, title)
-                    return temp_file.name
-                except Exception as exc:
-                    logger.warning("Cover candidate failed: source=%s title=%s error=%s", source, title, exc)
+            # ── Write temp file (reached by both primary and fallback paths) ──────
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            temp_file.write(content)
+            temp_file.close()
+            logger.info(f"✅ Downloaded: source={result_source} title={title} bytes={clen}")
+            return temp_file.name
+        except Exception as e:
+            logger.error(f"Error downloading image: {e}")
             return None
-
-        # Try the supplied URL and any already-cached Hardcover image first.
-        temp_path = try_candidates(candidates)
-        if temp_path:
-            return temp_path
-
-        # Only make extra provider lookups when those images were absent,
-        # inaccessible, invalid, or placeholders.
-        fallback_index = len(candidates)
-        if primary_source != "itunes":
-            try:
-                itunes_results = MultiSourceBookAggregator.search_itunes(
-                    f"{title} {book.get('author', '')}".strip()
-                )
-                itunes_match = MultiSourceBookAggregator._find_matching_book_strict(
-                    title, book.get("author", ""), itunes_results
-                )
-                if itunes_match:
-                    add_candidate(itunes_match.get("cover_url"), "itunes")
-            except Exception as exc:
-                logger.debug("iTunes cover recovery lookup failed for %s: %s", title, exc)
-
-        temp_path = try_candidates(candidates[fallback_index:])
-        if temp_path:
-            return temp_path
-
-        if not hc_match.get("cover_url"):
-            fallback_index = len(candidates)
-            try:
-                hc_cover = MultiSourceBookAggregator._get_hardcover_cached(
-                    book.get("isbn", ""), title, book.get("author", "")
-                )[3]
-                add_candidate(hc_cover, "hardcover")
-            except Exception as exc:
-                logger.debug("Hardcover cover recovery lookup failed for %s: %s", title, exc)
-
-            temp_path = try_candidates(candidates[fallback_index:])
-            if temp_path:
-                return temp_path
-
-        fallback_index = len(candidates)
-        isbn_cover = MultiSourceBookAggregator._get_openlibrary_cover(book.get("isbn", ""))
-        add_candidate(isbn_cover, "open_library")
-
-        temp_path = try_candidates(candidates[fallback_index:])
-        if temp_path:
-            return temp_path
-
-        logger.warning("No usable cover found across providers for: %s", title)
-        return None
 
     def cleanup_temp_file(self, file_path: str):
         """Delete a temporary file, silently ignoring errors."""
@@ -2740,40 +2662,6 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         try:
             query = update.callback_query
             callback_data = query.data
-
-            # Welcome-menu actions are shared by /start and Mini App fallbacks.
-            if callback_data == "start_back":
-                await query.answer()
-                await query.edit_message_text(
-                    self._start_text(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._start_keyboard(update, context),
-                )
-                return
-            if callback_data == "start_help":
-                await query.answer()
-                await query.message.reply_text(
-                    self._help_text(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._back_to_start_markup(),
-                )
-                return
-            if callback_data == "start_features":
-                await query.answer()
-                await query.message.reply_text(
-                    self._features_text(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._back_to_start_markup(),
-                )
-                return
-            if callback_data == "start_portal":
-                await query.answer()
-                await self._send_mini_app(update, context)
-                return
-            if callback_data == "start_recommendations":
-                await query.answer()
-                await self._send_mini_app(update, context, "recommendations")
-                return
 
             # All normal search-result controls carry the original requester's
             # ID. Reject another group member before any cache/state is touched.
@@ -3204,54 +3092,6 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
 
             if cover_url:
                 temp_file = await asyncio.to_thread(self.download_and_save_image, cover_url, book)
-
-            # Some edition records (for example illustrated/anniversary editions)
-            # have only a catalog placeholder even though another exact-work
-            # result in this same search has a usable cover. Use that cover only
-            # when provider-specific recovery above found nothing.
-            if not temp_file:
-                def _base_work_title(value: str) -> str:
-                    value = re.sub(
-                        r"\s*[:(]\s*(?:the\s+)?(?:minalima|illustrated|special|deluxe|collector(?:'s)?|anniversary|paperback|hardcover|ebook|e-book|edition)\b.*$",
-                        "",
-                        value or "",
-                        flags=re.IGNORECASE,
-                    )
-                    return re.sub(r"[^a-z0-9]+", "", value.lower())
-
-                current_author = re.sub(r"[^a-z0-9]+", "", (book.get("author") or "").lower())
-                current_work = _base_work_title(book.get("title", ""))
-                for sibling in books:
-                    if sibling is book or not sibling.get("cover_url"):
-                        continue
-                    sibling_author = re.sub(
-                        r"[^a-z0-9]+", "", (sibling.get("author") or "").lower()
-                    )
-                    if (
-                        current_work
-                        and current_work == _base_work_title(sibling.get("title", ""))
-                        and current_author
-                        and current_author == sibling_author
-                    ):
-                        sibling_source = dict(book)
-                        sibling_source["cover_url"] = sibling["cover_url"]
-                        sibling_source["cover_source"] = sibling.get(
-                            "cover_source", sibling.get("source", "catalog edition")
-                        )
-                        temp_file = await asyncio.to_thread(
-                            self.download_and_save_image,
-                            sibling["cover_url"],
-                            sibling_source,
-                        )
-                        if temp_file:
-                            book["cover_url"] = sibling["cover_url"]
-                            book["cover_source"] = sibling_source["cover_source"]
-                            logger.info(
-                                "Using sibling-edition cover for %s from %s",
-                                book.get("title", "Unknown"),
-                                sibling.get("title", "Unknown"),
-                            )
-                            break
 
             if temp_file:
                 # ── TEMP FILE DIAGNOSTICS ──
