@@ -26,7 +26,7 @@ from telegram import (
 )
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from src.utils import (
     logger, HEADERS, get_http_session, html_escape, is_placeholder_image,
@@ -62,6 +62,11 @@ class GoodreadsBot:
         # Per-user current page and query text for normal search pagination
         self._search_page_cache: dict[int, int] = {}  # user_id -> page number
         self._search_query_cache: dict[int, str] = {}  # user_id -> query text
+        # Immutable-per-search result snapshots, addressed by the Telegram
+        # message that owns each set of numbered buttons.
+        self._result_message_cache: dict[tuple[int, int], dict] = {}
+        self._RESULT_MESSAGE_CACHE_TTL: int = 60 * 60
+        self._RESULT_MESSAGE_CACHE_MAX: int = 1000
         self._SEARCH_CACHE_MAX: int = 1000      # max users tracked
         self.aggregator = MultiSourceBookAggregator()
         self.webhook_mode = webhook_mode
@@ -117,7 +122,10 @@ class GoodreadsBot:
     _GROUP_SEARCH_COOLDOWN_SECONDS = 3
     _GROUP_SEARCH_NOTICE_INTERVAL_SECONDS = 15
     _CLARIFICATION_DISCOVERY_CACHE_TTL_SECONDS = 5 * 60
-    _CLARIFICATION_DISCOVERY_MISS_TTL_SECONDS = 60
+    # Negative discoveries can be caused by transient upstream failures or
+    # Google Books ranking; retry fairly soon instead of suppressing another
+    # clarification attempt for a full minute.
+    _CLARIFICATION_DISCOVERY_MISS_TTL_SECONDS = 10
     _CLARIFICATION_DISCOVERY_CACHE_MAX = 256
 
     _STOPWORDS: set = {
@@ -446,6 +454,44 @@ class GoodreadsBot:
             return matched / len(hint_tokens)
         return 0.0
 
+    def _candidate_from_search_books(
+        self, books: list[dict], query: str,
+        title_hint: str, author_hint: str,
+    ) -> dict | None:
+        """Verify a title/author split against already-fetched catalog records."""
+        title_norm = self._normalize_for_matching(title_hint)
+        author_norm = self._normalize_for_matching(author_hint)
+        author_tokens = [
+            token for token in re.findall(r"\w+", author_norm)
+            if token not in self._STOPWORDS and len(token) >= 2
+        ]
+        for book in books or []:
+            title = str(book.get("title") or "")
+            author = str(book.get("author") or "")
+            normalized_title = self._normalize_for_matching(title)
+            normalized_author = self._normalize_for_matching(author)
+            title_score = self._score_title_hint(title_norm, normalized_title)
+            candidate_title_tokens = set(re.findall(r"\w+", normalized_title))
+            author_is_independent = (
+                " by " in query.lower()
+                or not author_tokens
+                or any(token not in candidate_title_tokens for token in author_tokens)
+            )
+            author_score = (
+                self._score_author_hint(author_norm, normalized_author)
+                if author_is_independent else 0.0
+            )
+            if author_score == 0 and author_norm:
+                try:
+                    ascii_hint = author_norm.encode("ascii").decode("ascii")
+                    if ascii_hint and any(ord(char) > 127 for char in author):
+                        author_score = 1.0
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+            if title_score >= 0.5 and author_score > 0:
+                return {"title": title, "author": author, "source": book.get("source", "")}
+        return None
+
     def _discover_candidate(
         self, query: str, title_hint: str | None, author_hint: str | None
     ) -> dict | None:
@@ -500,7 +546,7 @@ class GoodreadsBot:
         return None
 
     async def _try_clarification(
-        self, update: Update, query: str
+        self, update: Update, query: str, candidate: dict | None = None,
     ) -> bool:
         # Return True if caller should stop (clarification shown or rate-limited).
         user_id = update.effective_user.id
@@ -527,14 +573,15 @@ class GoodreadsBot:
         if not needs:
             return False  # Not a clarification query
 
-        discovery_started = time.perf_counter()
-        candidate = await self._discover_candidate_cached(query, title_hint, author_hint)
-        logger.info(
-            "[perf] clarification_discovery elapsed_ms=%d matched=%s query=%r",
-            round((time.perf_counter() - discovery_started) * 1000),
-            candidate is not None,
-            query,
-        )
+        if candidate is None:
+            discovery_started = time.perf_counter()
+            candidate = await self._discover_candidate_cached(query, title_hint, author_hint)
+            logger.info(
+                "[perf] clarification_discovery elapsed_ms=%d matched=%s query=%r",
+                round((time.perf_counter() - discovery_started) * 1000),
+                candidate is not None,
+                query,
+            )
         if candidate is None:
             return False  # No strong match
 
@@ -654,7 +701,7 @@ class GoodreadsBot:
         )
         bot = self.app.bot
 
-        async def send_result(text: str, reply_markup=None) -> None:
+        async def send_result(text: str, reply_markup=None):
             kwargs = {
                 "chat_id": chat_id,
                 "text": text,
@@ -664,13 +711,13 @@ class GoodreadsBot:
             if reply_to_id:
                 kwargs["reply_to_message_id"] = reply_to_id
             try:
-                await bot.send_message(**kwargs)
+                return await bot.send_message(**kwargs)
             except Exception:
                 # A group may have deleted the source message while the search ran.
                 if "reply_to_message_id" not in kwargs:
                     raise
                 kwargs.pop("reply_to_message_id", None)
-                await bot.send_message(**kwargs)
+                return await bot.send_message(**kwargs)
 
         try:
             # Run primary (title+author) and supplementary (author-only) searches
@@ -678,11 +725,42 @@ class GoodreadsBot:
             # author; deduplication keeps only distinct works.
             if original_query is None and title_hint and author_hint:
                 safe_author = author_hint.replace('"', " ").strip()
-                author_query = f'inauthor:"{safe_author}"'
+                # Keep the plain author string for alternate/mock aggregators;
+                # the production author bibliography is queried from Hardcover.
+                author_query = safe_author
                 logger.info("🔍 Clarification supplementary author search: %s", author_query)
+                original_author_hint = str((entry or {}).get("author_hint") or "").strip()
+                cross_script_author_hint = (
+                    original_author_hint
+                    if any(ord(char) > 127 for char in safe_author)
+                    and any(char.isascii() and char.isalpha() for char in original_author_hint)
+                    else ""
+                )
+
+                async def search_hardcover_author() -> list[dict]:
+                    # Keep the author bibliography on Hardcover, whose search
+                    # index is book/author metadata oriented. Google remains the
+                    # source for the exact confirmed title and its editions.
+                    if not isinstance(self.aggregator, MultiSourceBookAggregator):
+                        return await self.aggregator.aggregate_book_data(
+                            author_query, limit=10
+                        )
+                    author_queries = [safe_author]
+                    if cross_script_author_hint and cross_script_author_hint.casefold() != safe_author.casefold():
+                        author_queries.append(cross_script_author_hint)
+                    search_sets = await asyncio.gather(*(
+                        asyncio.to_thread(
+                            MultiSourceBookAggregator.search_hardcover,
+                            author_search_query,
+                            40,
+                        )
+                        for author_search_query in author_queries
+                    ))
+                    return [book for result_set in search_sets for book in (result_set or [])]
+
                 primary_books, extra_books = await asyncio.gather(
                     self._aggregate_search_results(provider_query, limit=10),
-                    self.aggregator.aggregate_book_data(author_query, limit=10),
+                    search_hardcover_author(),
                 )
                 # Normalise empty results to empty list.
                 primary_books = primary_books or []
@@ -714,9 +792,25 @@ class GoodreadsBot:
                 # must not hide Chinese/Japanese or unknown-language editions.
                 extra_filtered = [
                     b for b in extra_books
-                    if self._author_matches_canonical(b.get("author", ""), author_hint)
+                    if (
+                        self._author_matches_canonical(b.get("author", ""), author_hint)
+                        or (cross_script_author_hint and self._author_matches_canonical(
+                            b.get("author", ""), cross_script_author_hint
+                        ))
+                    )
                     and not self._is_free_sample(b.get("title", ""))
                 ]
+                standalone_books = [
+                    book for book in extra_filtered
+                    if not self._is_compilation_or_bundle(book.get("title", ""))
+                ]
+                bundle_books = [
+                    book for book in extra_filtered
+                    if self._is_compilation_or_bundle(book.get("title", ""))
+                ]
+                # Keep the provider's order within each group, but show
+                # individual works before boxed collections and omnibus sets.
+                extra_filtered = standalone_books + bundle_books
                 # ── Merge: confirmed primary matches first, then supplementary. ────
                 confirmed = [b for b in primary_clean if is_confirmed_primary(b)]
                 other_primary = [b for b in primary_clean if not is_confirmed_primary(b)]
@@ -735,6 +829,9 @@ class GoodreadsBot:
                 books = self._rank_search_results(
                     deduped, search_q, preferred_language=preferred_language
                 )
+                books.sort(key=lambda book: self._is_compilation_or_bundle(
+                    book.get("title", "")
+                ))
                 logger.info("DEBUG RANK books=%d titles=%s", len(books),
                             [(b.get("title","")[:15], b.get("author","")[:10]) for b in books[:8]])
                 logger.info("DEBUG post-rank books=%d titles=%s", len(books),
@@ -744,6 +841,12 @@ class GoodreadsBot:
                 books = self._rank_search_results(
                     self._deduplicate_search_results(books, search_q), search_q
                 )
+                if original_query is not None:
+                    needs_pair_check, title_hint, author_hint = self._is_clarification_query(search_q)
+                    if needs_pair_check:
+                        books = self._filter_clarification_like_results(
+                            books, search_q, title_hint or "", author_hint or ""
+                        )
             self._set_cached_books(user_id, books)
             self._search_page_cache[user_id] = 1
             self._search_query_cache[user_id] = search_q
@@ -756,7 +859,17 @@ class GoodreadsBot:
             await self._preload_hardcover_ratings_for_page(books, 1, 5)
             results_text, keyboard = self._build_search_results_message(
                 books, search_q, user_id, 1, 5)
-            await send_result(results_text, reply_markup=keyboard)
+            result_message = await send_result(results_text, reply_markup=keyboard)
+            if result_message:
+                result_message_id = result_message.message_id
+                self._cache_result_message(
+                    chat_id, result_message_id, user_id, books, search_q, 1
+                )
+                self._active_result_messages[(chat_id, user_id)] = {
+                    "message_id": result_message_id,
+                    "query": search_q,
+                    "page": 1,
+                }
         except Exception as e:
             logger.error(f"Error in _run_clarified_search: {e}", exc_info=True)
 
@@ -852,6 +965,15 @@ class GoodreadsBot:
         """
         t = title.casefold()
         return "read a free sample" in t or "free sample" in t or t.startswith("sample -")
+
+    @staticmethod
+    def _is_compilation_or_bundle(title: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").casefold()).strip()
+        return bool(re.search(
+            r"\b(?:\d+\s*book\s+(?:set|box|collection)|(?:box|boxed)\s*set|"
+            r"boxset|omnibus|collection\s+\d+\s+books?)\b",
+            normalized,
+        ))
 
     @staticmethod
     def _author_hint_is_complete(author_hint: str | None, candidate_author: str | None) -> bool:
@@ -1019,6 +1141,19 @@ class GoodreadsBot:
                 if cand:
                     return cand
 
+            # The quoted/title-author searches can miss common short author
+            # names (for example, `Origin Dan`) even though Google's ordinary
+            # combined search returns the exact book. Keep the same strict
+            # title-and-author validation so broad-query noise cannot trigger
+            # a false clarification.
+            plain_items = fetch_items(
+                query, "plain_combined_fallback", 40, english_only=False
+            )
+            if plain_items:
+                cand = matching_candidate(plain_items, "plain_combined_fallback")
+                if cand:
+                    return cand
+
         # If the strict combined lookup misses, search by author alone first.
         # Google Books can rank an incomplete title+author query poorly even
         # when it has the right volume; candidate validation still requires both.
@@ -1055,6 +1190,47 @@ class GoodreadsBot:
             self.search_cache.pop(user_id, None)
             return None
         return entry[0]
+
+    def _cache_result_message(
+        self, chat_id: int, message_id: int, user_id: int,
+        books: list, query_text: str, page_num: int = 1,
+    ) -> None:
+        """Bind a result message's buttons to that search's own result list."""
+        cache = getattr(self, "_result_message_cache", None)
+        if cache is None:
+            cache = self._result_message_cache = {}
+        now = time.time()
+        ttl = getattr(self, "_RESULT_MESSAGE_CACHE_TTL", 60 * 60)
+        for key, state in list(cache.items()):
+            if now - state.get("timestamp", 0) > ttl:
+                cache.pop(key, None)
+        max_entries = getattr(self, "_RESULT_MESSAGE_CACHE_MAX", 1000)
+        if len(cache) >= max_entries:
+            oldest = min(cache, key=lambda key: cache[key].get("timestamp", 0))
+            cache.pop(oldest, None)
+        cache[(chat_id, message_id)] = {
+            "user_id": user_id,
+            "books": books,
+            "query": query_text,
+            "page": page_num,
+            "timestamp": now,
+        }
+
+    def _get_result_message_state(
+        self, chat_id: int, message_id: int, user_id: int,
+    ) -> dict | None:
+        cache = getattr(self, "_result_message_cache", {})
+        key = (chat_id, message_id)
+        state = cache.get(key)
+        if state is None:
+            return None
+        ttl = getattr(self, "_RESULT_MESSAGE_CACHE_TTL", 60 * 60)
+        if time.time() - state.get("timestamp", 0) > ttl:
+            cache.pop(key, None)
+            return None
+        if state.get("user_id") != user_id:
+            return None
+        return state
 
     def _set_cached_books(self, user_id: int, books: list) -> None:
         """Store search results for *user_id* with a timestamp."""
@@ -1750,6 +1926,42 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             )
         return sorted(books, key=score, reverse=True)
 
+    def _filter_clarification_like_results(
+        self, books: list[dict], query: str,
+        title_hint: str, author_hint: str,
+    ) -> list[dict]:
+        """Keep query-relevant records if discovery could not verify a pair."""
+        query_tokens = [
+            token for token in self._dedup_tokens(query)
+            if token not in self._STOPWORDS
+        ]
+        title_tokens = [
+            token for token in self._dedup_tokens(title_hint)
+            if token not in self._STOPWORDS
+        ]
+        relevant = []
+        for book in books:
+            record_tokens = set(self._dedup_tokens(
+                f"{book.get('title') or ''} {book.get('author') or ''}"
+            ))
+            if query_tokens and all(token in record_tokens for token in query_tokens):
+                relevant.append(book)
+                continue
+            # Romanized author queries can match an edition whose author is
+            # stored in another script; retain it when the title clue matches.
+            author = str(book.get("author") or "")
+            try:
+                romanized_hint = author_hint.encode("ascii").decode("ascii")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                romanized_hint = ""
+            if (romanized_hint and any(ord(char) > 127 for char in author)
+                    and title_tokens and all(
+                        token in set(self._dedup_tokens(book.get("title") or ""))
+                        for token in title_tokens
+                    )):
+                relevant.append(book)
+        return relevant
+
     async def inline_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline queries with debounce.
 
@@ -1893,7 +2105,16 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             if it_idx not in matched_it_indices:
                 merged.append(it.copy())
 
-        final = merged[:20]
+        # Keep inline results consistent with /search and the Mini App. The
+        # Hardcover and iTunes catalogs often repeat an exact work under
+        # different edition IDs; merge those records before Telegram renders
+        # duplicate cards. This uses ISBN/title/author evidence, never cover art.
+        has_latin_query = any(ch.isascii() and ch.isalpha() for ch in query)
+        has_non_latin_query = any(ch.isalpha() and not ch.isascii() for ch in query)
+        preferred_language = "en" if has_latin_query and not has_non_latin_query else None
+        final = self._deduplicate_search_results(
+            merged, query, preferred_language=preferred_language
+        )[:20]
 
         elapsed = time.monotonic() - t_start
         logger.info(f"⏱️ Inline total: {elapsed:.1f}s → {len(final)} results")
@@ -2303,6 +2524,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
     def format_book_message(self, book: dict) -> str:
         """Format book info for display using Telegram HTML."""
         title = html_escape(book.get("title", "Unknown"))
+        translated_title = str(book.get("translated_title") or "").strip()
         author = html_escape(book.get("author", "Unknown"))
         rating = html_escape(str(book.get("rating_formatted", book.get("rating", "N/A"))))
         rating_cnt = book.get("rating_count", 0)
@@ -2340,6 +2562,8 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
         # Header
         parts.append(f"<b>{title}</b>")
+        if translated_title and translated_title.casefold() != str(book.get("title") or "").strip().casefold():
+            parts.append(f"🌐 <i>English title: {html_escape(translated_title)}</i>")
         parts.append(f"<i>{author}</i>")
 
         # Rating line with stars
@@ -2386,6 +2610,32 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             parts.append(f'<a href="{html_escape(book["goodreads_url"])}">Goodreads Page</a>')
 
         return "\n".join(parts)
+
+    @staticmethod
+    async def _translate_book_text_fields(book: dict) -> dict:
+        """Translate a selected book's title and description without blocking the bot loop."""
+        title = str(book.get("title") or "").strip()
+        description = str(book.get("description") or "").strip()
+        tasks = []
+        fields = []
+        if title and not is_english_description(title):
+            fields.append("title")
+            tasks.append(asyncio.to_thread(translate_to_english, title))
+        if description and not is_english_description(description):
+            fields.append("description")
+            tasks.append(asyncio.to_thread(translate_to_english, description))
+        if tasks:
+            translated_values = await asyncio.gather(*tasks, return_exceptions=True)
+            for field, translated in zip(fields, translated_values):
+                if isinstance(translated, Exception) or not translated:
+                    continue
+                original = title if field == "title" else description
+                if str(translated).strip() != original:
+                    if field == "title":
+                        book["translated_title"] = str(translated).strip()
+                    else:
+                        book["description"] = str(translated).strip()
+        return book
 
     # ── Search helpers ─────────────────────────────────────────────────────────
     async def _preload_hardcover_ratings_for_page(
@@ -2602,6 +2852,24 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             books = self._rank_search_results(
                 self._deduplicate_search_results(books, query_text), query_text
             )
+            needs_pair_check, title_hint, author_hint = self._is_clarification_query(query_text)
+            if needs_pair_check:
+                candidate = self._candidate_from_search_books(
+                    books, query_text, title_hint or "", author_hint or ""
+                )
+                if candidate:
+                    stop = await self._try_clarification(update, query_text, candidate)
+                    if stop:
+                        self._clear_active_result_message(session_key, status_message.message_id)
+                        try:
+                            await status_message.delete()
+                        except Exception:
+                            pass
+                        return
+                else:
+                    books = self._filter_clarification_like_results(
+                        books, query_text, title_hint or "", author_hint or ""
+                    )
 
             if not books:
                 logger.warning(f"No books found for: {query_text}")
@@ -2624,6 +2892,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 text=results_text,
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
+            )
+            self._cache_result_message(
+                chat_id, status_message.message_id, user_id, books, query_text, 1
             )
             self._schedule_result_rating_refresh(
                 books, query_text, user_id, 1, chat_id,
@@ -2692,15 +2963,29 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 user_id = int(parts[1])
                 page_num = int(parts[2])
 
-                books = self._get_cached_books(user_id)
+                chat_id = query.message.chat_id
+                message_id = query.message.message_id
+                result_state = self._get_result_message_state(
+                    chat_id, message_id, user_id
+                )
+                books = (
+                    result_state.get("books") if result_state
+                    else self._get_cached_books(user_id)
+                )
                 if books is None:
                     await query.answer("Search results expired.", show_alert=True)
                     return
 
                 self._search_page_cache[user_id] = page_num
-                query_text = self._search_query_cache.get(user_id, "")
-                chat_id = query.message.chat_id
-                message_id = query.message.message_id
+                query_text = (
+                    result_state.get("query", "") if result_state
+                    else self._search_query_cache.get(user_id, "")
+                )
+                self._search_query_cache[user_id] = query_text
+                self._set_cached_books(user_id, books)
+                self._cache_result_message(
+                    chat_id, message_id, user_id, books, query_text, page_num
+                )
                 self._active_result_messages[(chat_id, user_id)] = {
                     "message_id": message_id,
                     "query": query_text,
@@ -2709,9 +2994,17 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 results_text, keyboard = self._build_search_results_message(
                     books, query_text, user_id, page_num, 5
                 )
-                await query.edit_message_text(
-                    text=results_text, reply_markup=keyboard, parse_mode=ParseMode.HTML
-                )
+                try:
+                    await query.edit_message_text(
+                        text=results_text, reply_markup=keyboard, parse_mode=ParseMode.HTML
+                    )
+                except BadRequest as exc:
+                    # Telegram raises when a user taps the already-selected
+                    # page button. Treat it as a harmless no-op so pagination
+                    # remains responsive and the callback spinner clears.
+                    if "message is not modified" not in str(exc).casefold():
+                        raise
+                await query.answer()
                 self._schedule_result_rating_refresh(
                     books, query_text, user_id, page_num, chat_id,
                     message_id, context.bot,
@@ -2723,13 +3016,25 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 parts = callback_data.split("_")
                 user_id = int(parts[1])
 
-                books = self._get_cached_books(user_id)
+                current_state = self._get_result_message_state(
+                    query.message.chat_id, query.message.message_id, user_id
+                )
+                books = (
+                    current_state.get("books") if current_state
+                    else self._get_cached_books(user_id)
+                )
                 if books is None:
                     await query.answer("Search results expired.", show_alert=True)
                     return
 
-                page_num = self._search_page_cache.get(user_id, 1)
-                query_text = self._search_query_cache.get(user_id, "")
+                page_num = (
+                    current_state.get("page", 1) if current_state
+                    else self._search_page_cache.get(user_id, 1)
+                )
+                query_text = (
+                    current_state.get("query", "") if current_state
+                    else self._search_query_cache.get(user_id, "")
+                )
                 results_text, keyboard = self._build_search_results_message(
                     books, query_text, user_id, page_num=page_num, page_size=5
                 )
@@ -2745,6 +3050,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     text=results_text,
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML,
+                )
+                self._cache_result_message(
+                    query.message.chat_id, result_message.message_id,
+                    user_id, books, query_text, page_num,
                 )
                 self._active_result_messages[(query.message.chat_id, user_id)] = {
                     "message_id": result_message.message_id,
@@ -2766,7 +3075,13 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 user_id = int(parts[1])
                 book_idx = int(parts[2])
 
-                books = self._get_cached_books(user_id)
+                result_state = self._get_result_message_state(
+                    query.message.chat_id, query.message.message_id, user_id
+                )
+                books = (
+                    result_state.get("books") if result_state
+                    else self._get_cached_books(user_id)
+                )
                 if books is None:
                     await query.answer("Search results expired.", show_alert=True)
                     return
@@ -2881,16 +3196,10 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                                 book_data["rating_formatted"] = best.get("rating_formatted", f"{best['rating']:.2f}")
                                 book_data["rating_source"] = best.get("rating_source", "hardcover")
 
-                # Keep inline search fast: translate only the one description
-                # the user explicitly opens with View More, never the result set.
-                description = book_data.get("description", "")
-                if description and not is_english_description(description):
-                    translated_description = await asyncio.to_thread(
-                        translate_to_english, description
-                    )
-                    if translated_description != description:
-                        book_data["description"] = translated_description
-                        self._set_inline_callback_data(callback_key, book_data)
+                # Keep inline search fast: translate only the selected book's
+                # title/description when the user opens View More.
+                await self._translate_book_text_fields(book_data)
+                self._set_inline_callback_data(callback_key, book_data)
 
                 # Build expanded caption
                 expanded_caption = self._build_expanded_inline_caption(book_data)
@@ -3025,11 +3334,21 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             # page_num is encoded in callback as 4th part (for Back to Results restoration)
             page_num = int(parts[3]) if len(parts) > 3 else 1
             self._search_page_cache[user_id] = page_num
-            self._active_result_messages.pop(
-                (query.message.chat_id, user_id), None
+            result_state = self._get_result_message_state(
+                query.message.chat_id, query.message.message_id, user_id
+            )
+            if result_state:
+                page_num = result_state.get("page", page_num)
+                self._search_page_cache[user_id] = page_num
+                self._search_query_cache[user_id] = result_state.get("query", "")
+            self._clear_active_result_message(
+                (query.message.chat_id, user_id), query.message.message_id
             )
 
-            books = self._get_cached_books(user_id)
+            books = (
+                result_state.get("books") if result_state
+                else self._get_cached_books(user_id)
+            )
             if books is None:
                 await query.edit_message_text("❌ Search results expired.", parse_mode=ParseMode.HTML)
                 return
@@ -3050,12 +3369,8 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             # Pass hc_data to avoid re-fetching from Hardcover.
             book = await asyncio.to_thread(MultiSourceBookAggregator._ensure_cover, book, hc_data=hc_data)
 
-            # Translate description lazily when user selects a book (performance fix).
-            # Skip if description is already English to avoid unnecessary HTTP calls.
-            if book.get("description") and not is_english_description(book["description"]):
-                book["description"] = await asyncio.to_thread(
-                    translate_to_english, book["description"]
-                )
+            # Translate non-English text only after the user selects a book.
+            await self._translate_book_text_fields(book)
 
             text_info = self.format_book_message(book)
 
@@ -3088,6 +3403,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             await query.delete_message()
 
             temp_file = None
+            detail_message = None
             cover_url = book.get("cover_url")
 
             if cover_url:
@@ -3135,7 +3451,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
 
                     logger.info(f"ABOUT TO SEND COVER: path={_fpath} size={_fsize} position={_fpos_after_open}")
                     with open(temp_file, "rb") as f:
-                        await context.bot.send_photo(
+                        detail_message = await context.bot.send_photo(
                             chat_id=query.message.chat_id,
                             photo=f,
                             caption=text_info,
@@ -3149,7 +3465,7 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                     reply_markup = self._build_detail_keyboard(
                         user_id, book_idx, getattr(query.message.chat, "type", "private")
                     )
-                    await context.bot.send_message(
+                    detail_message = await context.bot.send_message(
                         chat_id=query.message.chat_id,
                         text=text_info,
                         parse_mode=ParseMode.HTML,
@@ -3161,11 +3477,17 @@ Example: <code>@{context.bot.username} Harry Potter</code>
                 reply_markup = self._build_detail_keyboard(
                     user_id, book_idx, getattr(query.message.chat, "type", "private")
                 )
-                await context.bot.send_message(
+                detail_message = await context.bot.send_message(
                     chat_id=query.message.chat_id,
                     text=text_info,
                     parse_mode=ParseMode.HTML,
                     reply_markup=reply_markup,
+                )
+
+            if result_state and detail_message:
+                self._cache_result_message(
+                    query.message.chat_id, detail_message.message_id, user_id,
+                    books, result_state.get("query", ""), page_num,
                 )
 
             # ── Hourglass button (inline details expansion) ─────────────────────
@@ -3234,6 +3556,9 @@ Example: <code>@{context.bot.username} Harry Potter</code>
             f"✍️ <b>Author:</b> {author}",
             "",  # blank line
         ]
+        translated_title = str(book.get("translated_title") or "").strip()
+        if translated_title and translated_title.casefold() != str(book.get("title") or "").strip().casefold():
+            parts.insert(1, f"🌐 <i>English title: {html_escape(translated_title)}</i>")
 
         # Genres: limit to 5, remove duplicates
         categories = book.get("categories", [])

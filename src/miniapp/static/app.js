@@ -623,6 +623,10 @@
     shareButton.addEventListener("click", () => shareBook(book));
     titleRow.append(shareButton);
     hero.append(titleRow);
+    if (book.show_translation && book.translated_title
+      && String(book.translated_title).toLocaleLowerCase() !== String(book.title || "").toLocaleLowerCase()) {
+      hero.append(node("p", "detail-translated-title", `English title: ${book.translated_title}`));
+    }
     hero.append(node("p", "detail-author", book.author || "Unknown author"));
     hero.append(makeRatingDisplay(book, "detail-rating"));
     if (loadingMessage) hero.append(node("p", "detail-status", loadingMessage));
@@ -637,18 +641,19 @@
     addMetadata(metadata, "Source", formatMetadataSource(book.metadata_source || book.source));
     if (metadata.childElementCount) elements.detail.append(metadata);
 
+    const needsTranslation = book.description_needs_translation || book.title_needs_translation;
     if (book.description) {
       const descriptionSection = node("section", "description-section");
       const descriptionHeading = node("div", "description-heading");
       descriptionHeading.append(node("h3", "detail-section-title", "Description"));
       const descriptionActions = node("div", "description-actions");
       let translationStatus = null;
-      if (book.description_needs_translation) {
+      if (needsTranslation) {
         const button = node("button", "translate-button", book.show_translation ? "Show original" : "Translate");
         button.type = "button";
         translationStatus = node("span", "translation-status");
         button.addEventListener("click", () => {
-          void toggleDescriptionTranslation(book, context, button, translationStatus);
+          void toggleBookTranslation(book, context, button, translationStatus);
         });
         descriptionActions.append(button);
       }
@@ -668,6 +673,16 @@
       descriptionSection.append(descriptionCopy.status);
       if (translationStatus) descriptionSection.append(translationStatus);
       elements.detail.append(descriptionSection);
+    } else if (needsTranslation) {
+      const translationActions = node("div", "description-actions title-translation-actions");
+      const button = node("button", "translate-button", book.show_translation ? "Show original" : "Translate");
+      const translationStatus = node("span", "translation-status");
+      button.type = "button";
+      button.addEventListener("click", () => {
+        void toggleBookTranslation(book, context, button, translationStatus);
+      });
+      translationActions.append(button, translationStatus);
+      elements.detail.append(translationActions);
     }
     const relatedBooks = state.activeDetailContext === context && state.activeRelatedBooks.length
       ? state.activeRelatedBooks
@@ -701,13 +716,13 @@
     }
   }
 
-  async function toggleDescriptionTranslation(book, context, button, status) {
+  async function toggleBookTranslation(book, context, button, status) {
     if (book.show_translation) {
       book.show_translation = false;
       renderBookDetails(book, "", context);
       return;
     }
-    if (book.translated_description) {
+    if (book.translated_title || book.translated_description) {
       book.show_translation = true;
       renderBookDetails(book, "", context);
       return;
@@ -730,13 +745,14 @@
         signal: controller.signal,
       });
       if (requestId !== state.translationRequestId || state.activeDetailContext !== context || !elements.dialog.open) return;
-      if (!response.data.translated) {
+      if (!response.data.any_translated && !response.data.translated && !response.data.title_translated) {
         status.textContent = "Translation isn’t available right now.";
         button.disabled = false;
         button.textContent = "Translate";
         return;
       }
-      book.translated_description = response.data.translation;
+      book.translated_title = response.data.title_translation || book.title;
+      book.translated_description = response.data.translation || book.description;
       book.show_translation = true;
       renderBookDetails(book, "", context);
     } catch (error) {

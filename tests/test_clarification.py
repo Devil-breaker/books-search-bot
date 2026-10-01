@@ -9,6 +9,7 @@ import unittest
 import time
 import requests
 from unittest.mock import patch, MagicMock, AsyncMock
+from telegram.error import BadRequest
 
 # Patch environment before imports
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "TEST_TOKEN")
@@ -643,6 +644,125 @@ class TestClarificationButtonActions(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("ja", {book["language"] for book in cached_books})
 
+    async def test_author_supplement_uses_hardcover_search(self):
+        bot = make_bot()
+        bot.aggregator = src.handlers.MultiSourceBookAggregator()
+        bot._aggregate_search_results = AsyncMock(return_value=[
+            {"title": "Origin", "author": "Dan Brown", "language": "en"},
+        ])
+        bot._set_cached_books = MagicMock()
+        bot._preload_hardcover_ratings_for_page = AsyncMock()
+        bot._build_search_results_message = MagicMock(return_value=("results", None))
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock()
+        update = make_mock_update("Origin Dan")
+        hardcover_books = [
+            {"title": "Dan Brown 4-Book Boxset", "author": "Dan Brown", "language": "en"},
+            {"title": "Angels & Demons", "author": "Dan Brown", "language": "en"},
+            {"title": "Digital Fortress", "author": "Dan Brown", "language": "en"},
+        ]
+
+        with patch.object(
+            src.handlers.MultiSourceBookAggregator,
+            "search_hardcover",
+            return_value=hardcover_books,
+        ) as search_hardcover:
+            await bot._run_clarified_search(update, "Origin Dan Brown", "Origin", "Dan Brown")
+
+        search_hardcover.assert_called_once_with("Dan Brown", 40)
+        cached_books = bot._set_cached_books.call_args.args[1]
+        self.assertEqual(
+            {book["title"] for book in cached_books},
+            {"Origin", "Angels & Demons", "Digital Fortress", "Dan Brown 4-Book Boxset"},
+        )
+        self.assertEqual(cached_books[-1]["title"], "Dan Brown 4-Book Boxset")
+
+    async def test_romanized_author_hint_recovers_hardcover_author_books(self):
+        bot = make_bot()
+        bot.aggregator = src.handlers.MultiSourceBookAggregator()
+        bot._aggregate_search_results = AsyncMock(return_value=[
+            {"title": "Starting Over 重啟人生", "author": "三秋縋", "language": "zh"},
+        ])
+        bot._set_cached_books = MagicMock()
+        bot._preload_hardcover_ratings_for_page = AsyncMock()
+        bot._build_search_results_message = MagicMock(return_value=("results", None))
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock()
+        update = make_mock_update("Starting Over Sugaru")
+        entry = {"author_hint": "Sugaru"}
+
+        def hardcover_search(author_query, limit):
+            self.assertEqual(limit, 40)
+            if author_query == "Sugaru":
+                return [{"title": "Three Days of Happiness", "author": "Sugaru Miaki"}]
+            return [{"title": "Starting Over", "author": "Sugaru Miaki"}]
+
+        with patch.object(
+            src.handlers.MultiSourceBookAggregator,
+            "search_hardcover",
+            side_effect=hardcover_search,
+        ) as search_hardcover:
+            await bot._run_clarified_search(
+                update, "Starting Over Sugaru", "Starting Over", "三秋縋", entry=entry
+            )
+
+        self.assertEqual(search_hardcover.call_count, 2)
+        cached_titles = {
+            book["title"] for book in bot._set_cached_books.call_args.args[1]
+        }
+        self.assertIn("Three Days of Happiness", cached_titles)
+
+    async def test_old_result_message_selection_uses_its_own_search(self):
+        bot = make_bot()
+        bot._active_result_messages = {(99, 42): {"message_id": 2000, "page": 1}}
+        old_books = [{"title": "Starting Over", "author": "Sugaru Miaki"}]
+        newer_books = [{"title": "Confessions", "author": "Kanae Minato"}]
+        bot._set_cached_books(42, newer_books)
+        bot._cache_result_message(99, 1000, 42, old_books, "Starting Over Sugaru", 1)
+        bot._set_cached_books = MagicMock(wraps=bot._set_cached_books)
+        bot.format_book_message = MagicMock(return_value="Starting Over details")
+        bot.download_and_save_image = MagicMock(return_value=None)
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock(return_value=MagicMock(message_id=3000))
+        update = _make_callback_update(42, "book_42_0_1", chat_id=99, message_id=1000)
+        update.callback_query.message.chat.type = "private"
+        context = MagicMock()
+        context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=3000))
+
+        with patch.object(
+            src.handlers.MultiSourceBookAggregator,
+            "_ensure_ratings",
+            return_value=(old_books[0], None),
+        ), patch.object(
+            src.handlers.MultiSourceBookAggregator,
+            "_ensure_cover",
+            return_value=old_books[0],
+        ):
+            await bot.button_callback(update, context)
+
+        bot.format_book_message.assert_called_once_with(old_books[0])
+        self.assertEqual(bot._active_result_messages[(99, 42)]["message_id"], 2000)
+
+    async def test_repeated_page_edit_is_treated_as_success(self):
+        bot = make_bot()
+        books = [{"title": f"Book {index}", "author": "Author"} for index in range(15)]
+        bot._get_cached_books = MagicMock(return_value=books)
+        bot._search_page_cache = {42: 2}
+        bot._search_query_cache = {42: "Author"}
+        bot._active_result_messages = {}
+        bot._build_search_results_message = MagicMock(return_value=("same page", None))
+        bot._schedule_result_rating_refresh = MagicMock()
+        update = _make_callback_update(42, "page_42_3", chat_id=99, message_id=999)
+        update.callback_query.edit_message_text = AsyncMock(
+            side_effect=BadRequest("Message is not modified")
+        )
+        context = MagicMock()
+
+        await bot.button_callback(update, context)
+
+        update.callback_query.answer.assert_awaited_once()
+        self.assertEqual(bot._search_page_cache[42], 3)
+
     async def test_yes_deletes_and_searches_title_plus_author(self):
         """Yes: deletes prompt, sends result via chat_id from effective_chat."""
         bot = make_bot()
@@ -691,12 +811,12 @@ class TestClarificationButtonActions(unittest.IsolatedAsyncioTestCase):
         update.callback_query.delete_message.assert_awaited_once()
         self.assertNotIn(42, bot._clarification)
         self.assertIn((42, "harry potter rowling"), bot._clarification_rate_limit)
-        # Both primary (title by author) and supplementary (author-only) calls expected.
+        # A primary title search and mock-provider author fallback are made.
         calls = bot.aggregator.aggregate_book_data.call_args_list
-        self.assertEqual(len(calls), 2, f"Expected 2 calls, got {calls}")
+        self.assertEqual(len(calls), 2, f"Expected 2 aggregate calls, got {calls}")
         call_queries = {c[0][0] for c in calls}
         self.assertIn("Harry Potter by J.K. Rowling", call_queries)
-        self.assertIn('inauthor:"J.K. Rowling"', call_queries)
+        self.assertIn("J.K. Rowling", call_queries)
         # Caches must be populated after Yes (merged primary + supplementary, deduped).
         cached_books = bot._set_cached_books.call_args[0][1]
         self.assertTrue(len(cached_books) >= 1)
@@ -1049,6 +1169,23 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
             "Did you mean Starting Over by Sugaru Miaki?",
         )
 
+    async def test_clarification_miss_cache_expires_quickly(self):
+        bot = make_bot()
+        bot._discover_candidate = MagicMock(return_value=None)
+
+        await bot._discover_candidate_cached("Origin Dan", "origin", "dan")
+
+        key = (
+            bot._normalize_for_matching("Origin Dan"),
+            bot._normalize_for_matching("origin"),
+            bot._normalize_for_matching("dan"),
+        )
+        expires_at = bot._clarification_discovery_cache[key][0]
+        self.assertLessEqual(
+            expires_at - time.monotonic(),
+            bot._CLARIFICATION_DISCOVERY_MISS_TTL_SECONDS,
+        )
+
     async def test_harry_potter_rowling_clarification_triggered(self):
         """_try_clarification("Harry Potter Rowling") sends a confirmation prompt.
 
@@ -1248,6 +1385,45 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
 
         bot2.aggregator.aggregate_book_data.assert_not_called()
         self.assertIn(42, bot2._clarification)
+
+
+    async def test_plain_combined_fallback_clarifies_origin_dan(self):
+        """A broad query can find a title/author pair missed by fielded lookups."""
+        bot = make_bot()
+        bot.app = MagicMock()
+        bot.app.bot.send_message = AsyncMock()
+        update = make_mock_update("Origin Dan", user_id=42, chat_id=99)
+
+        def gb_side_effect(_url, **kwargs):
+            query = (kwargs.get("params") or {}).get("q", "")
+            response = MagicMock()
+            response.status_code = 200
+            if query == "Origin Dan":
+                response.json.return_value = {
+                    "items": [{
+                        "id": "origin-dan-brown",
+                        "volumeInfo": {
+                            "title": "Origin",
+                            "authors": ["Dan Brown"],
+                            "language": "en",
+                        },
+                    }],
+                }
+            else:
+                response.json.return_value = {"items": []}
+            return response
+
+        with patch("requests.get", side_effect=gb_side_effect):
+            result = await bot._try_clarification(update, "Origin Dan")
+
+        self.assertTrue(result)
+        self.assertIn(42, bot._clarification)
+        self.assertEqual(
+            bot._clarification[42]["canonical_title"], "Origin"
+        )
+        self.assertEqual(
+            bot._clarification[42]["canonical_author"], "Dan Brown"
+        )
 
 
     async def test_clarification_with_explicit_jk_rowling_author_hint(self):

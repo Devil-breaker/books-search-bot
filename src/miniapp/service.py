@@ -254,6 +254,9 @@ class MiniAppSearchService:
         public_book["description_needs_translation"] = bool(
             description and not is_english_description(description)
         )
+        public_book["title_needs_translation"] = bool(
+            public_book["title"] and not is_english_description(public_book["title"])
+        )
         return {
             "book": public_book,
             "metadata_enriched": enriched,
@@ -327,21 +330,30 @@ class MiniAppSearchService:
         public_book["description_needs_translation"] = bool(
             description and not is_english_description(description)
         )
+        public_book["title_needs_translation"] = bool(
+            public_book["title"] and not is_english_description(public_book["title"])
+        )
         return {"book": public_book, "metadata_enriched": enriched}
 
     async def translate_recommendation_description(self, raw_book: object) -> dict:
-        """Translate a description from a recommendation detail view on demand."""
+        """Translate title and description from a recommendation detail on demand."""
         if not isinstance(raw_book, dict):
             raise ValueError("invalid_book")
+        title = str(raw_book.get("title") or "")[:250]
         description = str(raw_book.get("description") or "")[:20000]
-        if not description:
-            return {"translation": "", "translated": False}
-        if is_english_description(description):
-            return {"translation": description, "translated": False}
-        translated = await asyncio.to_thread(translate_to_english, description)
+        title_translation, description_translation = await self._translate_book_fields(
+            title, description
+        )
+        title_translated = bool(title_translation and title_translation != title)
+        description_translated = bool(
+            description_translation and description_translation != description
+        )
         return {
-            "translation": str(translated or description),
-            "translated": bool(translated and translated != description),
+            "title_translation": title_translation or title,
+            "title_translated": title_translated,
+            "translation": description_translation or description,
+            "translated": description_translated,
+            "any_translated": title_translated or description_translated,
         }
 
     async def translate_description(self, query: str, page: int, index: int) -> dict | None:
@@ -354,23 +366,49 @@ class MiniAppSearchService:
         if not 0 <= index < self.PAGE_SIZE or book_index >= len(books):
             return None
 
-        description = str(books[book_index].get("description") or "")
-        if not description:
-            return {"translation": "", "translated": False}
-        cached_translation = str(books[book_index].get("translated_description") or "")
-        if cached_translation:
-            return {"translation": cached_translation, "translated": True}
-        if is_english_description(description):
-            return {"translation": description, "translated": False}
-
-        translated = await asyncio.to_thread(translate_to_english, description)
-        if translated and translated != description:
-            books[book_index]["translated_description"] = translated
+        book = books[book_index]
+        title = str(book.get("title") or "")[:250]
+        description = str(book.get("description") or "")[:20000]
+        title_translation = str(book.get("translated_title") or "")
+        description_translation = str(book.get("translated_description") or "")
+        if not title_translation or (description and not description_translation):
+            new_title, new_description = await self._translate_book_fields(
+                title if not title_translation else "",
+                description if not description_translation else "",
+            )
+            if new_title and new_title != title:
+                title_translation = new_title
+                book["translated_title"] = new_title
+            if new_description and new_description != description:
+                description_translation = new_description
+                book["translated_description"] = new_description
             self._set_cached(cache_key, books)
         return {
-            "translation": str(translated or description),
-            "translated": bool(translated and translated != description),
+            "title_translation": title_translation or title,
+            "title_translated": bool(title_translation and title_translation != title),
+            "translation": description_translation or description,
+            "translated": bool(description_translation and description_translation != description),
+            "any_translated": bool(
+                (title_translation and title_translation != title)
+                or (description_translation and description_translation != description)
+            ),
         }
+
+    @staticmethod
+    async def _translate_book_fields(title: str, description: str) -> tuple[str, str]:
+        """Translate only non-English fields concurrently, returning each original on failure."""
+        values = {"title": title, "description": description}
+        tasks = {}
+        for field, value in values.items():
+            if value and not is_english_description(value):
+                tasks[field] = asyncio.to_thread(translate_to_english, value)
+        if tasks:
+            names = list(tasks)
+            results = await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
+            for name, result in zip(names, results):
+                if not isinstance(result, Exception) and result:
+                    values[name] = str(result).strip()
+        return values["title"], values["description"]
 
     async def related_books(self, query: str, page: int, index: int) -> list[dict] | None:
         """Find similar books from current results, then cached Hardcover searches."""

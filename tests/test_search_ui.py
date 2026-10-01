@@ -96,6 +96,33 @@ class TestGroupResultOwnership(unittest.IsolatedAsyncioTestCase):
 
 
 class TestInlineResultExpansion(unittest.IsolatedAsyncioTestCase):
+    async def test_inline_search_deduplicates_before_answering_telegram(self):
+        bot = _make_bot()
+        bot._INLINE_CALLBACK_CACHE_TTL = 1800
+        bot._inline_debounce_tasks = {42: asyncio.current_task()}
+        duplicates = [
+            make_book(
+                title="三日間の幸福", author="Sugaru Miaki", isbn="9781111111111",
+                source="hardcover", cover_url="https://example.com/cover-a.jpg",
+            ),
+            make_book(
+                title="三日間の幸福", author="Sugaru Miaki", isbn="9782222222222",
+                source="hardcover", cover_url="https://example.com/cover-b.jpg",
+            ),
+        ]
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ok": True}
+        http = MagicMock()
+        http.post.return_value = response
+
+        with patch.object(MultiSourceBookAggregator, "search_hardcover", return_value=duplicates), \
+             patch.object(MultiSourceBookAggregator, "search_itunes", return_value=[]), \
+             patch("src.handlers.get_http_session", return_value=http):
+            await bot._do_inline_search("三日間の幸福", 42, "query-id")
+
+        payload = http.post.call_args.kwargs["json"]
+        self.assertEqual(len(payload["results"]), 1)
+
     async def test_view_more_expands_inline_result_once(self):
         bot = _make_bot()
         bot._INLINE_CALLBACK_CACHE_TTL = 1800
@@ -508,6 +535,40 @@ class TestResultDeduplication(unittest.TestCase):
 
         self.assertEqual(result[0]["isbn"], "match")
 
+    def test_search_aggregator_results_can_recover_origin_dan_clarification(self):
+        bot = _make_bot()
+        query = "Origin Dan"
+        _, title_hint, author_hint = bot._is_clarification_query(query)
+        candidate = bot._candidate_from_search_books(
+            [
+                make_book(title="Gnuplot", author="Prof. Mohammad Ivan Azis"),
+                make_book(title="Origin", author="Dan Brown"),
+            ],
+            query,
+            title_hint,
+            author_hint,
+        )
+
+        self.assertEqual(candidate["title"], "Origin")
+        self.assertEqual(candidate["author"], "Dan Brown")
+
+    def test_clarification_like_query_filters_unrelated_catalog_results(self):
+        bot = _make_bot()
+        query = "Origin Dan"
+        _, title_hint, author_hint = bot._is_clarification_query(query)
+        results = bot._filter_clarification_like_results(
+            [
+                make_book(title="Origin", author="Dan Brown"),
+                make_book(title="Gnuplot", author="Prof. Mohammad Ivan Azis"),
+                make_book(title="Oxford Dictionary of English", author="Angus Stevenson"),
+            ],
+            query,
+            title_hint,
+            author_hint,
+        )
+
+        self.assertEqual([book["title"] for book in results], ["Origin"])
+
     def test_ranking_prefers_exact_work_title_over_a_longer_containing_title(self):
         bot = _make_bot()
         books = [
@@ -768,6 +829,36 @@ class TestResultDeduplication(unittest.TestCase):
 
 
 # ── Message building ───────────────────────────────────────────────────────────
+
+class TestBookTitleTranslation(unittest.IsolatedAsyncioTestCase):
+    async def test_selected_book_translation_keeps_original_and_adds_english_title(self):
+        bot = _make_bot()
+        book = {"title": "三日間の幸福", "description": "日本語の説明です。"}
+        with patch("src.handlers.is_english_description", return_value=False), patch(
+            "src.handlers.translate_to_english",
+            side_effect=["Three Days of Happiness", "An English description."],
+        ):
+            await bot._translate_book_text_fields(book)
+
+        self.assertEqual(book["title"], "三日間の幸福")
+        self.assertEqual(book["translated_title"], "Three Days of Happiness")
+        self.assertEqual(book["description"], "An English description.")
+
+    def test_normal_and_inline_detail_outputs_include_translated_title(self):
+        bot = _make_bot()
+        book = {
+            "title": "三日間の幸福",
+            "translated_title": "Three Days of Happiness",
+            "author": "Sugaru Miaki",
+            "source": "hardcover",
+        }
+
+        normal_output = bot.format_book_message(book)
+        inline_output = bot._build_expanded_inline_caption(book)
+
+        self.assertIn("English title: Three Days of Happiness", normal_output)
+        self.assertIn("English title: Three Days of Happiness", inline_output)
+
 
 class TestBuildSearchResultsMessage(unittest.TestCase):
     """_build_search_results_message produces the correct text and keyboard."""

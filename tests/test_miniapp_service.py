@@ -1,9 +1,10 @@
 """Focused tests for Mini App discovery shelves."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from src.miniapp.service import MiniAppSearchService
+from src.handlers import GoodreadsBot
 
 
 def book(title, category, author="Test Author", **extra):
@@ -106,6 +107,53 @@ class MiniAppTrendingTests(unittest.IsolatedAsyncioTestCase):
         result = self.service._related_books(books, books[0], 0)
 
         self.assertEqual(len(result), 10)
+
+
+class MiniAppSearchDeduplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_miniapp_search_uses_shared_non_latin_deduplication(self):
+        processor = object.__new__(GoodreadsBot)
+        service = MiniAppSearchService(None, processor)
+        duplicates = [
+            book("三日間の幸福", "Fiction", isbn="9781111111111"),
+            book("三日間の幸福", "Fiction", isbn="9782222222222"),
+        ]
+        service._search_fast_sources = AsyncMock(return_value=(duplicates, []))
+
+        results = await service._get_search_books("三日間の幸福")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "三日間の幸福")
+
+    async def test_search_translation_returns_title_and_description_together(self):
+        service = MiniAppSearchService(None, object.__new__(GoodreadsBot))
+        service._set_cached("translated book", [
+            book("三日間の幸福", "Fiction", description="日本語の説明です。")
+        ])
+        with patch("src.miniapp.service.is_english_description", return_value=False), patch(
+            "src.miniapp.service.translate_to_english",
+            side_effect=["Three Days of Happiness", "An English description."],
+        ):
+            result = await service.translate_description("translated book", 1, 0)
+
+        self.assertEqual(result["title_translation"], "Three Days of Happiness")
+        self.assertTrue(result["title_translated"])
+        self.assertEqual(result["translation"], "An English description.")
+        self.assertTrue(result["translated"])
+
+    async def test_recommendation_translation_returns_title_and_description_together(self):
+        service = MiniAppSearchService(None, None)
+        with patch("src.miniapp.service.is_english_description", return_value=False), patch(
+            "src.miniapp.service.translate_to_english",
+            side_effect=["Three Days of Happiness", "An English description."],
+        ):
+            result = await service.translate_recommendation_description({
+                "title": "三日間の幸福",
+                "description": "日本語の説明です。",
+            })
+
+        self.assertEqual(result["title_translation"], "Three Days of Happiness")
+        self.assertEqual(result["translation"], "An English description.")
+        self.assertTrue(result["any_translated"])
 
 
 class MiniAppRecommendationDetailTests(unittest.IsolatedAsyncioTestCase):
