@@ -1,212 +1,188 @@
-# 📚 Multi-Source Books Search Bot
+# 📚 Annie Search
 
-A Telegram bot that searches for books across multiple sources (Google Books, Hardcover.app, OpenLibrary) and delivers rich results including covers, ratings, descriptions, and metadata — all in your chat.
+### A Telegram book search and discovery bot
 
-## 🏗️ Architecture
+Search for books by title, author, or ISBN, explore personalized recommendations, and open detailed book pages in Annie’s Mini App.
 
-The bot uses a **modular structure** with a single source of truth in `src/handlers.py`. All entry points (polling, Docker, or Vercel webhook) import from the same shared code, so fixes apply everywhere automatically.
+<p align="center">
+  <a href="https://t.me/AnnieBooks_bot"><strong>Open @AnnieBooks_bot</strong></a>
+</p>
 
-```
-src/
-├── handlers.py    # GoodreadsBot class — bot logic, commands, UI (single source of truth)
-├── aggregator.py  # MultiSourceBookAggregator — Google Books, Hardcover, OpenLibrary
-├── search.py      # Search helpers, Goodreads URL builder
-└── utils.py       # Logger, HTTP headers, HTML utilities
-```
+![Annie Search Mini App](Intro.png)
 
-**Two deployment modes:**
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white" alt="Telegram bot">
+  <img src="https://img.shields.io/badge/Mini_App-Telegram-8A63D2" alt="Telegram Mini App">
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+</p>
 
-| Mode | Entry point | How it runs |
-|---|---|---|
-| Polling | `goodreads_bot.py` | Long-polls Telegram via python-telegram-bot |
-| Vercel Webhook | `api/webhook.py` | Vercel receives HTTPS POST from Telegram |
+---
 
-## 🤖 Bot Commands
+## About Annie Search
 
-| Command | Description |
+Annie Search helps readers find books and decide what to read next. Use the bot directly in Telegram or open the Mini App for visual search, current trending shelves, full book details, and recommendations based on books you’ve read or liked, genres, and mood.
+
+## Highlights
+
+- 🔎 Search by book title, author, or ISBN
+- 💬 Search inline from any chat with `@AnnieBooks_bot`
+- 📚 Browse recently trending books and genre shelves
+- ✨ Get recommendations from reading preferences, genres, and moods
+- 📖 Open full book details with covers, ratings, genres, language, ISBN, pages, publication date, and description when available
+- 🌐 Discover books across catalog languages and translate non-English descriptions into English
+- 🪄 Explore a **More Like This** shelf based on genre and book relevance
+- 📤 Share a book in a Telegram chat using inline results
+- 🎨 Choose Purple, Light, or AMOLED Dark appearance in the Mini App
+
+## Book sources
+
+Annie combines data from different catalogs depending on the feature:
+
+| Feature | Sources |
 |---|---|
-| `/start` | Show welcome message |
-| `/help` | Show help and usage guide |
-| `/annie_app` | Open the Annie Search Mini App |
+| Bot search | Google Books and iTunes, with Hardcover ratings and a Goodreads fallback when the main catalogs return no results |
+| Mini App search | Hardcover, with iTunes and Google Books used for search or metadata enrichment |
+| Recommendations | Hardcover and Google Books, with Open Library and optional Big Book API results for additional discovery |
+
+Results and metadata vary by catalog. Some titles may have more complete details or covers than others.
+
+## Language support
+
+- **Project language:** Python 3.12
+- **Book catalogs:** Search can return English and other catalog-language editions.
+- **Mini App interface:** English.
+- **Description translation:** The Mini App detects non-English descriptions locally and offers translation to English. Configure Azure Translator to enable the translation service.
+
+## Telegram commands
+
+| Command | What it does |
+|---|---|
+| `/start` | Welcome message and Mini App launch button |
+| `/help` | Commands and usage tips |
+| `/search <query>` | Search by title, author, or ISBN |
+| `/annie_app` | Open Annie Search Mini App |
 | `/annie_recommend` | Open the recommendations screen directly |
-| `/search <query>` | Search for books by title, author, or ISBN |
+| `/ping` | Check whether the bot is responding |
 
-## 🔍 Features
+To show commands in Telegram’s command menu, configure them with `/setcommands` in [@BotFather](https://t.me/BotFather). Enable Inline Mode in BotFather to use inline search. Enter command names without `/`, for example:
 
-- 🔎 **Multi-source search** – Google Books, Hardcover.app, iTunes & more
-- 📖 **Rich book data** – titles, authors, descriptions, ratings, covers
-- 🖼️ **High-resolution images** – iTunes-quality covers
-- 💬 **Inline search** – use `@BotUsername <book name>` from any chat
-- 📱 **Telegram-native** – works in private chats, groups & channels
+```text
+start - Show welcome message
+help - Show help and usage guide
+search - Search for books
+annie_app - Open the Annie Search Mini App
+annie_recommend - Open recommendations directly
+ping - Check whether the bot is responding
+```
 
-## 💬 Inline Search
+Inline search works in chats that support it:
 
-No commands needed — search from any Telegram chat:
+1. Type `@AnnieBooks_bot Dune` in the message field.
+2. Choose a book result.
+3. Send it to the chat or open its details.
 
-1. Type `@BotUsername <book name>` in any chat's message box
-2. Pick a result from the list
-3. Tap ⏳ on a result to expand full details (ISBN, pages, year, genres & more)
+## Quick start
 
-## 🚀 Deployment
+### Requirements
 
-### Option 1 — Polling (local / VPS / Docker)
+- Python 3.12 or newer
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Optional API keys for enhanced catalog data and translation
 
-**Prerequisites:** Python 3.12+
+### Run locally
 
 ```bash
-# Clone the repository
-git clone https://github.com/Devil-breaker/Multi-source-Books-Search-Bot.git
-cd Multi-source-Books-Search-Bot
+git clone https://github.com/Devil-breaker/books-search-bot.git
+cd books-search-bot
+python -m venv .venv
+```
 
-# Install dependencies
+Activate the environment, then install dependencies and create your settings file:
+
+```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+Copy-Item env.example .env
+
+# macOS / Linux (use these instead of the two commands above)
+# source .venv/bin/activate
+# cp env.example .env
+```
+
+Set `TELEGRAM_BOT_TOKEN` in `.env`, then start the bot:
+
+```bash
 pip install -r requirements.txt
-
-# Create .env file
-cp env.example .env
+python goodreads_bot.py
 ```
 
-Edit `.env` and add your credentials:
+The polling entry point starts both the Telegram bot and the Flask server that serves the Mini App at `/miniapp/`.
 
-```env
-TELEGRAM_BOT_TOKEN=123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-GOOGLE_BOOKS_API_KEY=your_google_books_api_key_here
-HARDCOVER_API_KEY=your_hardcover_api_key_here
-AZURE_TRANSLATOR_KEY=your_azure_translator_key_here
-AZURE_TRANSLATOR_REGION=your_azure_translator_region_here
-ANNIE_APP_URL=https://your-koyeb-domain.example/miniapp/
-```
+## Deploy on Koyeb
 
-`ANNIE_APP_URL` must be the public HTTPS URL for the Mini App. Set it to your
-Koyeb service domain followed by `/miniapp/` (for example,
-`https://<your-service>.koyeb.app/miniapp/`). The launch commands are available
-in private chats; from groups, they direct users to open the bot privately.
-`/annie_recommend` opens the recommendations screen directly.
+The repository’s Dockerfile runs the polling bot and Mini App web server together.
 
-Mini App artwork is kept in `src/miniapp/static/images/` and served from
-`/miniapp/assets/images/`. Keep image files in that folder instead of the
-project root so the source assets stay together with the Mini App.
+1. Create a Koyeb service from this GitHub repository using the **Dockerfile** builder.
+2. Add the environment variables listed below in the service settings.
+3. Expose the service’s HTTP port as `8080`, or use the same port configured in `PORT`.
+4. Set `ANNIE_APP_URL` to the public HTTPS address ending in `/miniapp/`, such as `https://<your-service>.koyeb.app/miniapp/`.
+5. Deploy the service, then use `/annie_app` in Telegram.
 
-**Run:**
+Koyeb terminates HTTPS at its edge; the Flask server listens for plain HTTP on `0.0.0.0:$PORT` inside the container.
 
-```bash
-py -3.12 goodreads_bot.py
-```
+## Configuration
 
-**Run with Docker:**
+Copy `env.example` to `.env` for local use. In production, add values through your hosting provider’s secret or environment-variable settings.
 
-```bash
-docker build -t books-bot .
-docker run --env-file .env books-bot
-```
+| Variable | Required | Purpose |
+|---|---:|---|
+| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot authentication |
+| `ANNIE_APP_URL` | For Mini App | Public HTTPS Mini App URL, ending in `/miniapp/` |
+| `GOOGLE_BOOKS_API_KEY` | No | Higher Google Books API quota |
+| `HARDCOVER_API_KEY` | No | Hardcover catalog search, trending, and community ratings |
+| `AZURE_TRANSLATOR_KEY` | No | Translate non-English descriptions into English |
+| `AZURE_TRANSLATOR_REGION` | Sometimes | Azure Translator region, if required for your resource |
+| `BIGBOOK_API_KEY` | No | Extra recommendation candidates from Big Book API |
+| `BIGBOOK_API_DAILY_BUDGET` | No | Daily request ceiling for Big Book API; defaults to `45` |
+| `OPEN_LIBRARY_CONTACT_EMAIL` | No | Contact information for Open Library requests |
+| `BOT_OWNER_ID` | No | Telegram user ID exempt from cancellation abuse limits |
 
----
+The Mini App can show cached and provider-backed features without every optional key, but missing provider keys can reduce coverage. Keep real credentials out of Git and never put them in the README.
 
-### Option 2 — Vercel Webhook
+## Project structure
 
-The bot runs as a serverless Vercel Python function. Telegram sends updates via HTTPS webhook — no long-running process needed.
-
-#### Before deploying (one-time Telegram setup)
-
-Set your bot's webhook to point at Vercel:
-
-```
-https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-project.vercel.app/api/webhook
-```
-
-Or use the helper script (from the `vercel` branch):
-
-```bash
-py -3.12 setup_webhook.py
-```
-
-#### Deploy via Vercel Dashboard
-
-1. Go to [vercel.com](https://vercel.com) and sign in
-2. Click **Add New → Project**
-3. Import your GitHub repository (`Devil-breaker/Multi-source-Books-Search-Bot`)
-4. In **Framework Preset**, select **Python** (or leave as Other)
-5. Under **Build and Output Settings**, leave both fields at default (no build command needed for Python)
-6. Click **Environment Variables** and add:
-   - `TELEGRAM_BOT_TOKEN` — your Telegram bot token
-   - `GOOGLE_BOOKS_API_KEY` — *(optional)*
-   - `HARDCOVER_API_KEY` — *(optional)*
-   - `AZURE_TRANSLATOR_KEY` — *(optional; only used for non-English descriptions)*
-   - `AZURE_TRANSLATOR_REGION` — *(set when required by your Azure resource)*
-   - `WEBHOOK_SECRET` — *(optional, but recommended)* a random secret string to verify incoming webhook requests
-7. Click **Deploy**
-
-After the first deploy, set your Telegram bot's webhook URL (see "Before deploying" above), substituting `your-project.vercel.app` with your actual Vercel deployment URL.
-
-#### Deploy via Vercel CLI
-
-```bash
-# Install Vercel CLI
-npm install -g vercel
-
-# Login (opens browser)
-vercel login
-
-# Go to the vercel branch (has api/ webhook files)
-git checkout vercel
-
-# Pull the latest remote changes
-git pull origin vercel
-
-# Deploy to preview
-vercel
-
-# Deploy to production
-vercel 
-# On the vercel branch
-git pull origin vercel
-vercel --prod
-```
-
-#### Vercel environment variables (CLI)
-
-```bash
-# Add each variable
-vercel env add TELEGRAM_BOT_TOKEN
-vercel env add GOOGLE_BOOKS_API_KEY
-vercel env add HARDCOVER_API_KEY
-vercel env add WEBHOOK_SECRET    # optional but recommended
-
-# After adding variables, redeploy to apply them
-vercel --prod
-```
-
-#### Cron job (keep-warm heartbeat)
-
-`api/cron.py` runs every 10 minutes (configured in `vercel.json`) to flush the Hardcover API cache and prevent cold starts. The Vercel Cron Job should be automatically enabled from `vercel.json`. If not, add it manually under **Storage → Cron Jobs** in your Vercel dashboard.
-
----
-
-## 📁 Project Structure
-
-```
+```text
 .
-├── goodreads_bot.py           # Polling entry point (imports src/handlers.py)
-├── goodreads_bot_advanced.py  # Legacy all-in-one (kept for reference)
+├── goodreads_bot.py              # Polling entry point and Flask Mini App server
 ├── src/
-│   ├── handlers.py            # GoodreadsBot class — single source of truth
-│   ├── aggregator.py          # MultiSourceBookAggregator
-│   ├── search.py              # Search helpers + Goodreads URL builder
-│   └── utils.py               # Logger, HEADERS, HTML utilities
-├── api/
-│   ├── webhook.py             # Vercel webhook entry point
-│   └── cron.py                # Vercel cron job (keep-warm + cache flush)
-├── vercel.json                # Vercel config (builds, crons, CORS headers)
-├── requirements.txt           # Python dependencies
-├── Dockerfile                 # Docker image (Python 3.12)
-├── env.example                # Environment variable template
-└── .gitignore                 # Git ignore rules (.env, __pycache__, .claude/, etc.)
+│   ├── handlers.py               # Telegram commands, inline search, and callbacks
+│   ├── aggregator.py             # Search and book metadata providers
+│   └── miniapp/
+│       ├── routes.py             # Mini App API routes
+│       ├── service.py            # Search, details, trending, and related books
+│       ├── recommendations.py    # Separate recommendation module
+│       └── static/               # Mini App UI, styles, scripts, and images
+├── api/                          # Optional Telegram webhook entry points
+├── tests/                        # Automated test suite
+├── Intro.png                     # README Mini App preview
+├── Dockerfile
+├── requirements.txt
+└── env.example
 ```
 
-## 🛠️ Dependencies
+## Tests
 
-- [python-telegram-bot](https://python-telegram-bot.org/) v21.1 — Telegram Bot API
-- [requests](https://docs.python-requests.org/) — HTTP client
-- [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — HTML parsing
-- [python-dotenv](https://pypi.org/project/python-dotenv/) — .env support
-- [lxml](https://lxml.de/) — XML/HTML parser
-- [storygraph-api](https://pypi.org/project/storygraph-api/) — StoryGraph ratings *(optional)*
+Run the test suite with:
+
+```bash
+python -m unittest discover -s tests
+```
+
+## License
+
+Annie Search is released under the [MIT License](LICENSE).
+
+---
+
+<p align="center">Made with ❤️ for readers · <a href="https://t.me/AnnieBooks_bot">@AnnieBooks_bot</a></p>
