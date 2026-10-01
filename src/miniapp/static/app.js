@@ -99,7 +99,7 @@
 
   window.AnnieRecommendations?.mount(elements.recommendations, api, (book) => {
     openDetails(book, { collection: "recommendations", book: { ...book } });
-  });
+  }, renderBookLoader);
 
   function node(tag, className, text) {
     const element = document.createElement(tag);
@@ -189,7 +189,12 @@
   }
 
   function showMessage(text, kind = "") {
-    elements.message.textContent = text;
+    elements.message.replaceChildren();
+    if (kind === "loading" && text) {
+      elements.message.append(renderBookLoader(text, "message-loader"));
+    } else {
+      elements.message.textContent = text;
+    }
     elements.message.className = `message${kind ? ` ${kind}` : ""}`;
     elements.message.hidden = !text;
   }
@@ -353,21 +358,18 @@
   }
 
   function renderBookLoader(message, variant) {
-    const loader = node("div", `book-loader ${variant}`, undefined);
+    const loader = node("div", `recommendation-loading ${variant || ""}`.trim());
     loader.setAttribute("role", "status");
     loader.setAttribute("aria-live", "polite");
-    const icon = node("span", "book-loader-icon");
-    icon.setAttribute("aria-hidden", "true");
-    icon.innerHTML = '<svg viewBox="0 0 32 32" focusable="false"><path d="M16 8.2c-3.2-2-7.1-2.1-10.3-.5v16.1c3.2-1.6 7.1-1.5 10.3.5m0-16.1c3.2-2 7.1-2.1 10.3-.5v16.1c-3.2-1.6-7.1-1.5-10.3.5m0-16.1v16.1"/><path class="book-loader-page" d="M8.5 12.2c2-.6 4-.3 5.7.6m-5.7 3c2-.6 4-.3 5.7.6m7-4.2c-1.1-.3-2.2-.3-3.3-.1m3.3 3.1c-1.1-.3-2.2-.3-3.3-.1"/></svg>';
-    loader.append(icon, node("span", "book-loader-label", message));
-    const dots = node("span", "book-loader-dots", "•••");
-    dots.setAttribute("aria-hidden", "true");
-    loader.append(dots);
+    const books = node("span", "recommendation-loading-books");
+    books.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 4; index += 1) books.append(node("span", "recommendation-loading-book"));
+    loader.append(books, node("span", "recommendation-loading-copy", message));
     return loader;
   }
 
   function renderGenreTabs() {
-    const genres = ["All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics"];
+    const genres = ["All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics", "Biography"];
     elements.genreTabs.replaceChildren();
     genres.forEach((genre) => {
       const tab = node("button", `genre-tab${state.featuredGenre === genre ? " active" : ""}`, genre);
@@ -629,7 +631,7 @@
     }
     hero.append(node("p", "detail-author", book.author || "Unknown author"));
     hero.append(makeRatingDisplay(book, "detail-rating"));
-    if (loadingMessage) hero.append(node("p", "detail-status", loadingMessage));
+    if (loadingMessage) hero.append(renderBookLoader(loadingMessage, "detail-loader"));
     elements.detail.append(hero);
 
     const metadata = node("div", "metadata");
@@ -1011,7 +1013,10 @@
     elements.resultsTitle.textContent = query;
     elements.resultCount.textContent = "";
     elements.typingIndicator.hidden = query.length < 2;
-    showMessage(query.length < 3 ? "Type at least 3 characters to search." : "Searching when you pause typing…", "loading");
+    showMessage(
+      query.length < 3 ? "Type at least 3 characters to search." : "Searching when you pause typing…",
+      query.length < 3 ? "" : "loading",
+    );
     setBusy(false);
   }
 

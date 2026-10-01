@@ -22,7 +22,7 @@ class MiniAppSearchService:
     TRENDING_LIMIT = 20
     TRENDING_TARGET_SIZE = 10
     RELATED_LIMIT = 10
-    TRENDING_GENRES = ("All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics")
+    TRENDING_GENRES = ("All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics", "Biography")
     TRENDING_SEARCH_TERMS = {
         "All": ("*",),
         "Fantasy": ("Fantasy",),
@@ -32,6 +32,7 @@ class MiniAppSearchService:
         "Sci-Fi": ("Science Fiction", "Sci-Fi", "Science-Fiction"),
         "Horror": ("Horror",),
         "Classics": ("Classics", "Classic literature"),
+        "Biography": ("Biography", "Biographies", "Memoir"),
     }
 
     def __init__(self, aggregator, result_processor):
@@ -182,6 +183,7 @@ class MiniAppSearchService:
             "science fiction": ("science fiction", "science fiction fantasy", "sci fi"),
             "horror": ("horror", "horror fiction"),
             "classics": ("classic", "classics", "classic literature"),
+            "biography": ("biography", "biographies", "memoir", "autobiography"),
         }.get(wanted_genre, (wanted_genre,))
         return any(
             normalized == alias
