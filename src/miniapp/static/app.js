@@ -43,7 +43,7 @@
   };
 
   const state = {
-    initData: "", query: "", page: 1, pageSize: 5, total: 0,
+    initData: "", inlineSessionToken: "", query: "", page: 1, pageSize: 5, total: 0,
     hasMore: false, ready: false, requestId: 0, activeController: null,
     detailsController: null, detailsRequestId: 0, translationController: null,
     translationRequestId: 0, relatedController: null, relatedRequestId: 0,
@@ -267,6 +267,7 @@
       ...options,
       headers: {
         "X-Telegram-Init-Data": state.initData,
+        ...(state.inlineSessionToken ? { "X-Annie-Inline-Session": state.inlineSessionToken } : {}),
         ...(options.body ? { "Content-Type": "application/json" } : {}),
         ...options.headers,
       },
@@ -283,7 +284,7 @@
   }
 
   function explainError(error) {
-    if (error.status === 401) return "Telegram could not verify this session. Close and reopen the Mini App from the bot.";
+    if (error.status === 401) return "Telegram could not verify this session. Close and reopen the Mini App from Telegram.";
     if (error.status === 429 || error.message === "rate_limited") return "You’re searching quickly. Please wait a moment and try again.";
     if (error.message === "service_unavailable") return "Search is starting up. Please try again in a moment.";
     if (error.message === "invalid_query") return "Enter at least 2 characters to search.";
@@ -1030,14 +1031,33 @@
     }
 
     state.initData = webApp?.initData || "";
-    if (!state.initData) {
+    const launchParams = new URLSearchParams(window.location.search);
+    const inlineTicket = launchParams.get("inline_ticket") || "";
+    if (!state.initData && !inlineTicket) {
       showStartupMessage("Open this page inside Telegram from your bot to search books.", "error");
       dismissLaunchWelcome();
       return;
     }
 
     try {
-      const response = await api("session");
+      let response;
+      if (state.initData) {
+        response = await api("session");
+      } else {
+        response = await api("inline-session", {
+          method: "POST",
+          body: JSON.stringify({ ticket: inlineTicket }),
+        });
+        state.inlineSessionToken = response.session_token || "";
+        if (!state.inlineSessionToken) throw new Error("inline_session_unavailable");
+        launchParams.delete("inline_ticket");
+        const cleanQuery = launchParams.toString();
+        window.history.replaceState(
+          window.history.state,
+          "",
+          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash}`,
+        );
+      }
       state.ready = true;
       showStartupMessage("");
       elements.greeting.textContent = response.user.first_name

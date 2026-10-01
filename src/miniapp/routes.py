@@ -15,6 +15,7 @@ from .service import MiniAppSearchService
 
 
 INIT_DATA_HEADER = "X-Telegram-Init-Data"
+INLINE_SESSION_HEADER = "X-Annie-Inline-Session"
 _RATE_LIMIT_WINDOW_SECONDS = 60
 _RATE_LIMIT_MAX_REQUESTS = 12
 
@@ -27,6 +28,13 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
     request_times: dict[tuple[int, str], deque[float]] = defaultdict(deque)
 
     def authenticate():
+        inline_token = request.headers.get(INLINE_SESSION_HEADER, "")
+        if inline_token:
+            bot = runtime.get("bot")
+            user = bot._get_inline_app_session(inline_token) if bot else None
+            if user:
+                return user, None
+            return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         try:
             return validate_init_data(
@@ -83,6 +91,28 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             "first_name": user["first_name"],
             "language_code": user["language_code"],
         }})
+
+    @blueprint.post("/api/inline-session")
+    def inline_session():
+        """Exchange Telegram's inline launch ticket for a temporary API session."""
+        payload = request.get_json(silent=True)
+        ticket = payload.get("ticket") if isinstance(payload, dict) else None
+        bot = runtime.get("bot")
+        if not isinstance(ticket, str) or bot is None:
+            return jsonify({"success": False, "error": "unauthorized"}), 401
+        exchange = getattr(bot, "_exchange_inline_app_ticket", None)
+        exchanged = exchange(ticket) if exchange else None
+        if not exchanged:
+            return jsonify({"success": False, "error": "unauthorized"}), 401
+        session_token, user = exchanged
+        return jsonify({
+            "success": True,
+            "session_token": session_token,
+            "user": {
+                "first_name": user["first_name"],
+                "language_code": user["language_code"],
+            },
+        })
 
     @blueprint.post("/api/search")
     def search():

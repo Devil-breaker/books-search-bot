@@ -1,6 +1,7 @@
 """Tests for launching Annie Search from bot commands."""
 
 import os
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -146,6 +147,11 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
     async def _run_launch(self, query):
         bot = object.__new__(GoodreadsBot)
         bot._active_clarification_restriction = MagicMock(return_value=None)
+        bot._inline_app_auth_lock = threading.Lock()
+        bot._inline_app_tickets = {}
+        bot._inline_app_sessions = {}
+        bot._INLINE_APP_TICKET_TTL = 120
+        bot._INLINE_APP_SESSION_TTL = 3600
         update = MagicMock()
         update.inline_query.query = query
         update.inline_query.from_user.id = 123
@@ -163,13 +169,37 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
         button = await self._run_launch(".portal")
 
         self.assertEqual(button.text, "📚 Open Annie Search Portal")
-        self.assertEqual(button.web_app.url, "https://books.example/miniapp/")
+        parsed = urlsplit(button.web_app.url)
+        self.assertEqual(parsed.path, "/miniapp/")
+        self.assertTrue(parse_qs(parsed.query)["inline_ticket"][0])
 
     async def test_recom_inline_query_opens_recommendations_page(self):
         button = await self._run_launch(".recom")
 
         self.assertEqual(button.text, "✨ Open Annie Recommendations")
-        self.assertEqual(button.web_app.url, "https://books.example/miniapp/?page=recommendations")
+        parsed = urlsplit(button.web_app.url)
+        self.assertEqual(parse_qs(parsed.query)["page"], ["recommendations"])
+        self.assertTrue(parse_qs(parsed.query)["inline_ticket"][0])
+
+    def test_inline_launch_ticket_is_one_use_and_creates_user_session(self):
+        bot = object.__new__(GoodreadsBot)
+        bot._inline_app_auth_lock = threading.Lock()
+        bot._inline_app_tickets = {}
+        bot._inline_app_sessions = {}
+        bot._INLINE_APP_TICKET_TTL = 120
+        bot._INLINE_APP_SESSION_TTL = 3600
+        telegram_user = MagicMock(
+            id=321, first_name="Nero", language_code="en"
+        )
+
+        ticket = bot._issue_inline_app_ticket(telegram_user)
+        exchange = bot._exchange_inline_app_ticket(ticket)
+
+        self.assertIsNotNone(exchange)
+        session_token, user = exchange
+        self.assertEqual(user["id"], 321)
+        self.assertEqual(bot._get_inline_app_session(session_token), user)
+        self.assertIsNone(bot._exchange_inline_app_ticket(ticket))
 
 
 if __name__ == "__main__":
