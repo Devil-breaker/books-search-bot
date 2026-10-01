@@ -69,6 +69,19 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         self.assertEqual(markup.inline_keyboard[0][0].text, "← Back to start")
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, "start_back")
 
+    def test_help_explains_inline_mini_app_shortcuts(self):
+        text = GoodreadsBot._help_text()
+
+        self.assertIn("@AnnieBooks_bot .portal", text)
+        self.assertIn("@AnnieBooks_bot .recom", text)
+        self.assertIn("launch button above the results", text)
+
+    def test_start_welcome_mentions_inline_mini_app_shortcuts(self):
+        text = GoodreadsBot._start_text()
+
+        self.assertIn("@AnnieBooks_bot .portal", text)
+        self.assertIn(".recom", text)
+
 
 class TestStartCommand(unittest.IsolatedAsyncioTestCase):
     async def test_recommendation_deep_link_opens_recommendations_directly(self):
@@ -127,6 +140,36 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("portal", command_names)
         self.assertIn("recom", command_names)
         self.assertNotIn("annie_app", command_names)
+
+
+class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
+    async def _run_launch(self, query):
+        bot = object.__new__(GoodreadsBot)
+        bot._active_clarification_restriction = MagicMock(return_value=None)
+        update = MagicMock()
+        update.inline_query.query = query
+        update.inline_query.from_user.id = 123
+        update.inline_query.answer = AsyncMock()
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"}):
+            await bot.inline_search(update, context)
+
+        update.inline_query.answer.assert_awaited_once()
+        self.assertEqual(update.inline_query.answer.await_args.args[0], [])
+        return update.inline_query.answer.await_args.kwargs["button"]
+
+    async def test_portal_inline_query_shows_mini_app_button(self):
+        button = await self._run_launch(".portal")
+
+        self.assertEqual(button.text, "📚 Open Annie Search Portal")
+        self.assertEqual(button.web_app.url, "https://books.example/miniapp/")
+
+    async def test_recom_inline_query_opens_recommendations_page(self):
+        button = await self._run_launch(".recom")
+
+        self.assertEqual(button.text, "✨ Open Annie Recommendations")
+        self.assertEqual(button.web_app.url, "https://books.example/miniapp/?page=recommendations")
 
 
 if __name__ == "__main__":

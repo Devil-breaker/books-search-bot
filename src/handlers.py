@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from telegram import (
     Update,
     WebAppInfo,
+    InlineQueryResultsButton,
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
@@ -1431,10 +1432,13 @@ class GoodreadsBot:
     @staticmethod
     def _start_text() -> str:
         return (
-            "<b>Welcome to Annie Search</b> ✨\n"
-            "Find your next read with quick book search, thoughtful details, "
-            "and personalized recommendations.\n"
-            "Search by title or author, or let Annie find a story for your mood."
+            "✨ <b>Welcome to Annie Search</b>\n"
+            "<i>Your next great read starts here.</i>\n\n"
+            "Search books, explore their details, and find recommendations "
+            "shaped around what you love to read.\n\n"
+            "<b>Opening the Mini App inline?</b>\n"
+            "Type <code>@AnnieBooks_bot .portal</code> or "
+            "<code>@AnnieBooks_bot .recom</code>, then tap Annie’s launch button."
         )
 
     @staticmethod
@@ -1453,6 +1457,7 @@ Tap a result to open its details. Use the buttons to browse results or download 
 
 <b>Search inline</b>
 Type <code>@AnnieBooks_bot title or author</code> in any chat, then choose a result to share.
+To open the Mini App inline, type <code>@AnnieBooks_bot .portal</code> or <code>@AnnieBooks_bot .recom</code>, then tap the launch button above the results.
 
 <b>Annie Search Portal</b>
 Open the portal to search books, explore trending and genre shelves, and browse similar titles with <i>More Like This</i>.
@@ -2082,6 +2087,26 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         # Inline mode is another search entry point; apply the same user cooldown.
         if self._active_clarification_restriction(user_id) is not None:
             await update.inline_query.answer([], cache_time=1, is_personal=True)
+            return
+
+        # Inline Mini App launch shortcuts return Telegram's native launch
+        # button above the results list, without inserting a filler message.
+        launch_pages = {
+            ".portal": ("", "📚 Open Annie Search Portal"),
+            ".recom": ("recommendations", "✨ Open Annie Recommendations"),
+        }
+        launch = launch_pages.get(query.casefold())
+        if launch:
+            page, label = launch
+            url = self._mini_app_url(page)
+            button = (
+                InlineQueryResultsButton(text=label, web_app=WebAppInfo(url=url))
+                if url else None
+            )
+            await update.inline_query.answer(
+                [], cache_time=0, is_personal=True, button=button
+            )
+            logger.info("Inline Mini App launch requested: page=%s user=%s", page or "portal", user_id)
             return
 
         # ── 1. Short queries: return empty immediately ────────────────────────────

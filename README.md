@@ -82,6 +82,8 @@ Inline search works in chats that support it:
 2. Choose a book result.
 3. Send it to the chat or open its details.
 
+To launch the Mini App inline, type `@AnnieBooks_bot .portal` or `@AnnieBooks_bot .recom` and tap the launch button above the results.
+
 ## Quick start
 
 ### Requirements
