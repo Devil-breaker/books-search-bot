@@ -40,6 +40,12 @@ class FakeMongoCollection:
         self.calls.append((args, kwargs))
         return {"entries": []}
 
+    def find_one_and_update(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        expression = args[1][0]["$set"]["entries"]["$let"]["in"]["$cond"]
+        entry = expression[2]["$cond"][1]["$concatArrays"][1][0]["$literal"]
+        return {"_id": args[0]["_id"], "entries": [entry]}
+
 
 class MiniAppBookshelfTests(unittest.TestCase):
     def setUp(self):
@@ -83,11 +89,13 @@ class MiniAppBookshelfTests(unittest.TestCase):
         self.assertEqual(len(repository.users.calls), 1)
         args, kwargs = repository.users.calls[0]
         self.assertEqual(args[0]["_id"], 1234)
-        self.assertTrue(args[0]["$expr"])
+        self.assertNotIn("$expr", args[0])
         self.assertTrue(kwargs["upsert"])
         pipeline = args[1]
         self.assertIn("$let", pipeline[0]["$set"]["entries"])
         self.assertIn("$map", str(pipeline[0]["$set"]["entries"]))
+        self.assertIn("$size", str(pipeline[0]["$set"]["entries"]))
+        self.assertIn("$lt", str(pipeline[0]["$set"]["entries"]))
 
     def test_bulk_remove_is_one_database_write(self):
         repository = object.__new__(MongoBookshelfRepository)

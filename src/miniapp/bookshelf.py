@@ -7,7 +7,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 
@@ -113,6 +113,7 @@ class MongoBookshelfRepository:
         key = entry["book_key"]
         current = {"$ifNull": ["$entries", []]}
         matching_key = {"$in": [key, {"$map": {"input": "$$current", "as": "item", "in": "$$item.book_key"}}]}
+        can_add = {"$lt": [{"$size": "$$current"}, BOOKSHELF_LIMIT]}
         replace_entry = {
             "$map": {
                 "input": "$$current",
@@ -133,7 +134,11 @@ class MongoBookshelfRepository:
                     "in": {"$cond": [
                         matching_key,
                         replace_entry,
-                        {"$concatArrays": ["$$current", [{"$literal": entry}]]},
+                        {"$cond": [
+                            can_add,
+                            {"$concatArrays": ["$$current", [{"$literal": entry}]]},
+                            "$$current",
+                        ]},
                     ]},
                 }
             },
@@ -163,32 +168,25 @@ class MongoBookshelfRepository:
             "added_at": now,
             "book": book,
         }
-        current_entries = {"$ifNull": ["$entries", []]}
-        current_keys = {"$map": {"input": current_entries, "as": "item", "in": "$$item.book_key"}}
-        filter_document = {
-            "_id": int(user_id),
-            "$expr": {"$or": [
-                {"$in": [key, current_keys]},
-                {"$lt": [{"$size": current_entries}, BOOKSHELF_LIMIT]},
-            ]},
-        }
         try:
-            result = self.users.update_one(
-                filter_document,
+            document = self.users.find_one_and_update(
+                {"_id": int(user_id)},
                 self._entry_pipeline(entry),
                 upsert=True,
+                return_document=ReturnDocument.AFTER,
             )
         except DuplicateKeyError:
-            # The conditional upsert can race with another request at the cap.
-            # Retry once without the cap filter only if this key now exists.
-            result = self.users.update_one(
-                {"_id": int(user_id), "entries.book_key": key},
+            # Another request may have created this user's document concurrently.
+            document = self.users.find_one_and_update(
+                {"_id": int(user_id)},
                 self._entry_pipeline(entry),
                 upsert=False,
+                return_document=ReturnDocument.AFTER,
             )
-            if not result.matched_count:
-                return False
-        return bool(result.matched_count or result.upserted_id is not None)
+        return any(
+            item.get("book_key") == key and item.get("collection") == collection
+            for item in (document or {}).get("entries", [])
+        )
 
     def remove_entries(self, user_id: int, collection: str, keys: list[str]) -> int:
         if not keys:
