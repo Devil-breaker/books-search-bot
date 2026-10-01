@@ -6,10 +6,10 @@
   <meta name="theme-color" content="#130e1b">
   <title>Book Discovery</title>
   <link rel="preload" as="image" href="/miniapp/assets/images/welcome.jpg?v=20260930-app-assets-v1" fetchpriority="high">
-  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261001-unified-loading-v1">
+  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261001-bookshelf-v10">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="/miniapp/assets/recommendations.js?v=20261001-unified-loading-v1" defer></script>
-  <script src="/miniapp/assets/app.js?v=20261001-inline-auth-v1" defer></script>
+  <script src="/miniapp/assets/app.js?v=20261001-bookshelf-v10" defer></script>
 </head>
 <body>
   <section id="launch-welcome" class="launch-welcome" role="status" aria-live="polite" aria-label="Welcome to Annie Search">
@@ -125,6 +125,7 @@
     </section>
 
     <section id="recommendations-view" class="recommendations-view" aria-labelledby="recommendations-title" hidden></section>
+    <section id="bookshelf-view" class="bookshelf-view" aria-labelledby="bookshelf-title" hidden></section>
 
     <footer class="footer">
       <span>Powered by Annie search</span>
@@ -146,11 +147,11 @@
           </span>
           <span class="quick-menu-copy"><strong>Search History</strong><small>Coming later</small></span>
         </button>
-        <button class="quick-menu-item coming-soon" type="button" disabled aria-label="My Bookshelf, coming soon">
+        <button class="quick-menu-item" type="button" data-page="bookshelf">
           <span class="quick-menu-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24"><path d="M4 5.5h4v13H4zM10 4h4v14.5h-4zM16 6h4v12.5h-4zM3 20.5h18"/></svg>
           </span>
-          <span class="quick-menu-copy"><strong>My Bookshelf</strong><small>Saved books · coming later</small></span>
+          <span class="quick-menu-copy"><strong>My Bookshelf</strong><small>Your saved stories</small></span>
         </button>
       </div>
       <button id="quick-nav-toggle" class="quick-nav-toggle" type="button" aria-expanded="false" aria-controls="quick-menu-items" aria-label="Open quick navigation">
@@ -178,6 +179,18 @@
       <button id="close-dialog" class="close-dialog" type="button" aria-label="Close details">×</button>
     </nav>
     <div id="book-detail" class="book-detail"></div>
+  </dialog>
+
+  <dialog id="bookshelf-confirm-dialog" class="bookshelf-confirm-dialog" aria-labelledby="bookshelf-confirm-title">
+    <div class="bookshelf-confirm-content">
+      <span class="bookshelf-confirm-mark" aria-hidden="true">✦</span>
+      <h2 id="bookshelf-confirm-title">Keep this book?</h2>
+      <p id="bookshelf-confirm-copy"></p>
+      <div class="bookshelf-confirm-actions">
+        <button id="bookshelf-confirm-cancel" class="bookshelf-secondary-button" type="button">Cancel</button>
+        <button id="bookshelf-confirm-accept" class="bookshelf-primary-button" type="button">Add book</button>
+      </div>
+    </div>
   </dialog>
 </body>
 </html>

@@ -24,6 +24,10 @@ Results are cached in process for 30 minutes; user preferences are not stored
 in a database. Recommendation requests have a separate, tighter per-user rate
 limit because each request can query multiple providers.
 
+## Bookshelf storage
+
+Set `MONGODB_URI` (and optionally `MONGODB_DB_NAME`, default `annie_db`) to sync My Books and Favourites across devices. The first bookshelf write creates the `bookshelf_users` collection automatically. Each Telegram account is limited to 100 unique books shared between both lists. One atomic document update handles an add or move, and one update handles a single or bulk removal. Opening the bookshelf reads once and the Mini App reuses that response for 30 seconds; local sorting, searching, and tab changes do not make database or catalog requests. Descriptions are stored in bounded snapshots to avoid refetching full details each time a saved book is opened. With no MongoDB URI, the app keeps using its per-user browser cache.
+
 ## Open the screen locally
 
 Start the bot with the project's virtual environment and open

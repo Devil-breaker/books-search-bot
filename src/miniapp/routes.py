@@ -7,10 +7,18 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 from flask import Blueprint, current_app, jsonify, request, send_from_directory
 
 from .auth import InitDataError, validate_init_data
+from .bookshelf import (
+    BOOKSHELF_COLLECTIONS,
+    BOOKSHELF_LIMIT,
+    MongoBookshelfRepository,
+    normalize_book_key,
+    sanitize_book,
+)
 from .service import MiniAppSearchService
 
 
@@ -25,6 +33,7 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
     blueprint = Blueprint("miniapp_api", __name__)
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     rate_lock = threading.Lock()
+    bookshelf_repo_lock = threading.Lock()
     request_times: dict[tuple[int, str], deque[float]] = defaultdict(deque)
 
     def authenticate():
@@ -50,7 +59,7 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             requests_for_user = request_times[bucket]
             while requests_for_user and now - requests_for_user[0] >= _RATE_LIMIT_WINDOW_SECONDS:
                 requests_for_user.popleft()
-            action_limit = 4 if action == "recommendations" else _RATE_LIMIT_MAX_REQUESTS
+            action_limit = 4 if action == "recommendations" else 30 if action == "bookshelf_write" else _RATE_LIMIT_MAX_REQUESTS
             if len(requests_for_user) >= action_limit:
                 return False
             requests_for_user.append(now)
@@ -67,6 +76,23 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             service = MiniAppSearchService(bot.aggregator, bot)
             runtime["miniapp_search_service"] = service
         return service
+
+    def get_bookshelf_repository():
+        repository = runtime.get("bookshelf_repository")
+        if repository is not None:
+            return repository
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            return None
+        with bookshelf_repo_lock:
+            repository = runtime.get("bookshelf_repository")
+            if repository is None:
+                repository = MongoBookshelfRepository(
+                    uri,
+                    os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db",
+                )
+                runtime["bookshelf_repository"] = repository
+        return repository
 
     @blueprint.get("/")
     def index():
@@ -88,9 +114,11 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
         if error:
             return error
         return jsonify({"success": True, "user": {
+            "id": user["id"],
             "first_name": user["first_name"],
             "language_code": user["language_code"],
-        }})
+        }, "bookshelf_enabled": bool(os.getenv("MONGODB_URI", "").strip()),
+            "bookshelf_limit": BOOKSHELF_LIMIT})
 
     @blueprint.post("/api/inline-session")
     def inline_session():
@@ -109,10 +137,102 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             "success": True,
             "session_token": session_token,
             "user": {
+                "id": user["id"],
                 "first_name": user["first_name"],
                 "language_code": user["language_code"],
             },
+            "bookshelf_enabled": bool(os.getenv("MONGODB_URI", "").strip()),
+            "bookshelf_limit": BOOKSHELF_LIMIT,
         })
+
+    @blueprint.get("/api/bookshelf")
+    def get_bookshelf():
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "bookshelf_read"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+        try:
+            repository = get_bookshelf_repository()
+            if repository is None:
+                return jsonify({"success": False, "error": "bookshelf_not_configured"}), 503
+            books = repository.get_user_books(user["id"])
+        except Exception as exc:
+            # Driver errors may contain connection details; never log the URI.
+            current_app.logger.error("Mini App bookshelf read failed (%s)", type(exc).__name__)
+            return jsonify({"success": False, "error": "bookshelf_unavailable"}), 503
+        return jsonify({"success": True, "data": {"bookshelf": books, "limit": BOOKSHELF_LIMIT}})
+
+    @blueprint.post("/api/bookshelf")
+    def update_bookshelf():
+        user, error = authenticate()
+        if error:
+            return error
+        if not within_rate_limit(user["id"], "bookshelf_write"):
+            return jsonify({"success": False, "error": "rate_limited"}), 429
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid_json"}), 400
+        action = payload.get("action")
+        collection = payload.get("collection")
+        if collection not in BOOKSHELF_COLLECTIONS:
+            return jsonify({"success": False, "error": "invalid_collection"}), 400
+        try:
+            repository = get_bookshelf_repository()
+            if repository is None:
+                return jsonify({"success": False, "error": "bookshelf_not_configured"}), 503
+            if action == "upsert":
+                book = sanitize_book(payload.get("book"))
+                book_key = normalize_book_key(book)
+                accepted = repository.upsert_entry(user["id"], collection, book)
+                if not accepted:
+                    return jsonify({"success": False, "error": "bookshelf_full", "limit": BOOKSHELF_LIMIT}), 409
+                return jsonify({"success": True, "data": {"book_key": book_key, "limit": BOOKSHELF_LIMIT}})
+            if action == "import_if_empty":
+                raw_entries = payload.get("entries")
+                if not isinstance(raw_entries, list):
+                    return jsonify({"success": False, "error": "invalid_bookshelf"}), 400
+                if len(raw_entries) > BOOKSHELF_LIMIT:
+                    return jsonify({"success": False, "error": "bookshelf_full", "limit": BOOKSHELF_LIMIT}), 409
+                entries_by_key = {}
+                for raw_entry in raw_entries:
+                    if not isinstance(raw_entry, dict) or raw_entry.get("collection") not in BOOKSHELF_COLLECTIONS:
+                        return jsonify({"success": False, "error": "invalid_bookshelf"}), 400
+                    book = sanitize_book(raw_entry.get("book"))
+                    key = normalize_book_key(book)
+                    collection_name = raw_entry["collection"]
+                    # Keep the favourite copy if old local data contains a duplicate.
+                    if key in entries_by_key and entries_by_key[key]["collection"] == "favorites":
+                        continue
+                    try:
+                        added_ms = int(raw_entry.get("addedAt") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        added_ms = 0
+                    added_at = time.time() if added_ms <= 0 else min(added_ms / 1000, time.time())
+                    entries_by_key[key] = {
+                        "book_key": key,
+                        "collection": collection_name,
+                        "added_at": datetime.fromtimestamp(added_at, timezone.utc),
+                        "book": book,
+                    }
+                if len(entries_by_key) > BOOKSHELF_LIMIT:
+                    return jsonify({"success": False, "error": "bookshelf_full", "limit": BOOKSHELF_LIMIT}), 409
+                imported = repository.import_entries_if_empty(user["id"], list(entries_by_key.values()))
+                return jsonify({"success": True, "data": {"imported": imported, "limit": BOOKSHELF_LIMIT}})
+            if action in {"remove", "remove_many"}:
+                raw_keys = [payload.get("book_key")] if action == "remove" else payload.get("book_keys")
+                if not isinstance(raw_keys, list) or not raw_keys or len(raw_keys) > BOOKSHELF_LIMIT:
+                    return jsonify({"success": False, "error": "invalid_book_keys"}), 400
+                if any(not isinstance(key, str) or not key or len(key) > 600 for key in raw_keys):
+                    return jsonify({"success": False, "error": "invalid_book_keys"}), 400
+                removed = repository.remove_entries(user["id"], collection, list(set(raw_keys)))
+                return jsonify({"success": True, "data": {"removed": removed}})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc) or "invalid_book"}), 400
+        except Exception as exc:
+            current_app.logger.error("Mini App bookshelf write failed (%s)", type(exc).__name__)
+            return jsonify({"success": False, "error": "bookshelf_unavailable"}), 503
+        return jsonify({"success": False, "error": "invalid_action"}), 400
 
     @blueprint.post("/api/search")
     def search():

@@ -34,6 +34,7 @@ Annie Search helps readers find books and decide what to read next. Use the bot 
 - 🪄 Explore a **More Like This** shelf based on genre and book relevance
 - 📤 Share a book in a Telegram chat using inline results
 - 🎨 Choose Purple, Light, or AMOLED Dark appearance in the Mini App
+- 📚 Keep separate My Books and Favourites lists synced to your Telegram account
 
 ## Book sources
 
@@ -141,6 +142,8 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 |---|---:|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot authentication |
 | `ANNIE_APP_URL` | For Mini App | Public HTTPS Mini App URL, ending in `/miniapp/` |
+| `MONGODB_URI` | Optional | MongoDB Atlas connection string for syncing Bookshelf across devices |
+| `MONGODB_DB_NAME` | Optional | Database name; defaults to `annie_db` |
 | `GOOGLE_BOOKS_API_KEY` | No | Higher Google Books API quota |
 | `HARDCOVER_API_KEY` | No | Hardcover catalog search, trending, and community ratings |
 | `AZURE_TRANSLATOR_KEY` | No | Translate non-English descriptions into English |
@@ -151,6 +154,12 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 | `BOT_OWNER_ID` | No | Telegram user ID exempt from cancellation abuse limits |
 
 The Mini App can show cached and provider-backed features without every optional key, but missing provider keys can reduce coverage. Keep real credentials out of Git and never put them in the README.
+
+### Enable bookshelf sync
+
+Create a MongoDB Atlas database user and cluster, then set `MONGODB_URI` to its connection string in local `.env` or Koyeb environment variables. Add the bot host to the cluster's network access list. The app creates its `bookshelf_users` collection on the first bookshelf change; no manual schema or index setup is required. Leave `MONGODB_URI` empty to use the browser's temporary, per-user cache instead.
+
+The bookshelf allows up to **100 unique books per Telegram user across both tabs**. Favourites and My Books share this limit, and moving a book between them does not create another entry. Each user is stored in one bounded document; adding or moving a book is one atomic database write, removing selected books is one write, and opening the bookshelf reads the saved document once (then reuses it for 30 seconds). Searches, sorting, filtering, and switching tabs do not query MongoDB. Book descriptions are stored with a size limit so opening the same saved book does not repeatedly request its full catalog details.
 
 ## Project structure
 
