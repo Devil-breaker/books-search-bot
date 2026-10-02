@@ -11,7 +11,7 @@
     discover: document.querySelector("#discover-section"),
     genreTabs: document.querySelector("#genre-tabs"),
     discoverTitle: document.querySelector("#discover-title"),
-    discoverNote: document.querySelector(".discover-note"),
+    featuredBookSlot: document.querySelector("#featured-book-slot"),
     discoverMessage: document.querySelector("#discover-message"),
     trendingBooks: document.querySelector("#trending-books"),
     moreSection: document.querySelector("#more-section"),
@@ -41,6 +41,7 @@
     quickNavToggle: document.querySelector("#quick-nav-toggle"),
     quickMenuItems: document.querySelector("#quick-menu-items"),
     quickMenuBackdrop: document.querySelector("#quick-menu-backdrop"),
+    appTabbar: document.querySelector("#app-tabbar"),
     themeButtons: Array.from(document.querySelectorAll("[data-theme-choice]")),
   };
 
@@ -53,7 +54,7 @@
     relatedMessage: "", detailLoadingMessage: "", visibleBooks: [], selectedIndex: null,
     debounceTimer: null, activeDetailContext: null, featuredQuery: "",
     featuredBooks: [], featuredGenre: "All", featuredRequestId: 0, featuredCache: {},
-    currentPage: "home", homeScrollY: 0, bookshelfAddMode: false,
+    currentPage: "home", previousPage: "home", searchFocused: false, homeScrollY: 0, bookshelfAddMode: false,
     bookshelf: { saved: [], favorites: [] }, bookshelfUi: {
       saved: { query: "", sort: "newest", view: "grid", selecting: false, selected: [] },
       favorites: { query: "", sort: "newest", view: "grid", selecting: false, selected: [] },
@@ -82,7 +83,8 @@
   let BOOKSHELF_STORAGE_KEY = `annie-bookshelf-v1:${webApp?.initDataUnsafe?.user?.id || "guest"}`;
   const HOME_SHELF_SIZE = 10;
   const HOME_TRENDING_CACHE_MS = 60 * 60 * 1000;
-  const THEME_COLORS = { purple: "#130e1b", light: "#eeeeef", amoled: "#000000" };
+  const HOME_TRENDING_CACHE_VERSION = "v4";
+  const THEME_COLORS = { purple: "#111c1b", light: "#e4eee8", amoled: "#000000" };
 
   function applyTheme(theme, { persist = true } = {}) {
     const selected = Object.prototype.hasOwnProperty.call(THEME_COLORS, theme) ? theme : "purple";
@@ -146,13 +148,6 @@
 
   function refreshDesktopScrollControls(scroller) {
     window.requestAnimationFrame(() => scroller.updateDesktopScrollControls?.());
-  }
-
-  function updateShelfInstruction() {
-    if (elements.discoverNote) {
-      elements.discoverNote.textContent = window.matchMedia("(min-width: 700px)").matches
-        ? "Use arrows to explore" : "Swipe to explore";
-    }
   }
 
   function safeHttpUrl(value) {
@@ -223,23 +218,74 @@
     if (restoreFocus) elements.quickNavToggle.focus();
   }
 
-  function showHomePage({ restoreScroll = true } = {}) {
+  function updateAppTabbar() {
+    if (!elements.appTabbar) return;
+    const activeTab = state.currentPage === "home"
+      ? (state.searchFocused || state.query ? "search" : "discover")
+      : state.currentPage;
+    elements.appTabbar.querySelectorAll("[data-app-tab]").forEach((button) => {
+      const active = button.dataset.appTab === activeTab;
+      button.classList.toggle("active", active);
+      if (active) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
+  }
+
+  function navigateBack() {
+    const destination = state.previousPage || "home";
+    if (destination === "bookshelf") showBookshelfPage();
+    else if (destination === "recommendations") showRecommendationsPage();
+    else showHomePage({ restoreScroll: true, searchFocused: state.searchFocused });
+  }
+
+  function makePageBackButton(label) {
+    const button = node("button", "page-back-button");
+    button.type = "button";
+    button.setAttribute("aria-label", `Back to ${label}`);
+    button.title = `Back to ${label}`;
+    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 5-7 7 7 7M8 12h12"/></svg>';
+    button.addEventListener("click", navigateBack);
+    return button;
+  }
+
+  function navigateToSearch() {
+    if (state.currentPage !== "home") showHomePage({ restoreScroll: false, searchFocused: true });
+    else {
+      state.searchFocused = true;
+      document.body.classList.add("search-focused");
+      if (!state.query) {
+        elements.discover.hidden = true;
+        elements.resultsSection.hidden = true;
+        elements.welcome.hidden = false;
+      }
+      updateAppTabbar();
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.setTimeout(() => elements.input.focus({ preventScroll: true }), 80);
+  }
+
+  function showHomePage({ restoreScroll = true, searchFocused = false } = {}) {
+    if (state.currentPage !== "home") state.previousPage = state.currentPage;
     state.currentPage = "home";
+    state.searchFocused = searchFocused;
     elements.homeSticky.hidden = false;
-    elements.discover.hidden = Boolean(state.query);
+    elements.discover.hidden = Boolean(state.query) || searchFocused;
     elements.resultsSection.hidden = !state.query;
-    elements.welcome.hidden = true;
+    elements.welcome.hidden = !searchFocused || Boolean(state.query);
     elements.recommendations.hidden = true;
     elements.bookshelf.hidden = true;
     document.body.classList.remove("recommendations-active", "bookshelf-active");
     document.body.classList.toggle("search-active", Boolean(state.query));
+    document.body.classList.toggle("search-focused", searchFocused);
     elements.quickNavToggle.setAttribute("aria-label", "Open quick navigation");
     closeQuickMenu();
+    updateAppTabbar();
     if (restoreScroll) window.requestAnimationFrame(() => window.scrollTo(0, state.homeScrollY));
   }
 
   function showRecommendationsPage() {
     if (state.currentPage === "home") state.homeScrollY = window.scrollY;
+    if (state.currentPage !== "recommendations") state.previousPage = state.currentPage;
     state.currentPage = "recommendations";
     closeQuickMenu();
     elements.homeSticky.hidden = true;
@@ -247,17 +293,25 @@
     elements.welcome.hidden = true;
     elements.resultsSection.hidden = true;
     elements.recommendations.hidden = false;
+    let recommendationsBack = elements.recommendations.querySelector(".recommendations-back-row");
+    if (!recommendationsBack) {
+      recommendationsBack = node("div", "recommendations-back-row");
+      recommendationsBack.append(makePageBackButton("previous page"));
+    }
+    elements.recommendations.prepend(recommendationsBack);
     elements.bookshelf.hidden = true;
     document.body.classList.remove("bookshelf-active");
+    document.body.classList.remove("search-focused");
     document.body.classList.add("recommendations-active");
     document.body.classList.remove("search-active");
     elements.quickNavToggle.setAttribute("aria-label", "Return home");
+    updateAppTabbar();
     window.scrollTo(0, 0);
-    elements.quickNavToggle.focus();
   }
 
   function showBookshelfPage() {
     if (state.currentPage === "home") state.homeScrollY = window.scrollY;
+    if (state.currentPage !== "bookshelf") state.previousPage = state.currentPage;
     state.currentPage = "bookshelf";
     closeQuickMenu();
     elements.homeSticky.hidden = true;
@@ -267,12 +321,13 @@
     elements.recommendations.hidden = true;
     elements.bookshelf.hidden = false;
     document.body.classList.remove("recommendations-active", "search-active");
+    document.body.classList.remove("search-focused");
     document.body.classList.add("bookshelf-active");
     elements.quickNavToggle.setAttribute("aria-label", "Return home");
+    updateAppTabbar();
     renderBookshelf();
     void syncRemoteBookshelf();
     window.scrollTo(0, 0);
-    elements.quickNavToggle.focus();
   }
 
   function loadBookshelfCache() {
@@ -496,7 +551,7 @@
     elements.input.value = "";
     state.query = "";
     resetResultsForInput("");
-    showHomePage({ restoreScroll: false });
+    showHomePage({ restoreScroll: false, searchFocused: true });
     elements.input.focus();
     showStartupMessage("Search for a book, open its details, then choose Add to My Bookshelf.", "info");
   }
@@ -506,20 +561,22 @@
     const activeTab = root.dataset.activeTab || "saved";
     root.replaceChildren();
     const header = node("header", "bookshelf-header");
-    header.append(node("p", "eyebrow", "YOUR READING CORNER"));
+    const headingCopy = node("div", "library-heading-copy");
+    headingCopy.append(node("p", "eyebrow", "YOUR COLLECTION"));
     const title = node("h1", "bookshelf-title", "My Bookshelf");
     title.id = "bookshelf-title";
-    header.append(title, node("p", "bookshelf-subtitle", "Keep the stories you want close, and the ones you love closer."));
-    const addButton = node("button", "bookshelf-add-button");
+    headingCopy.append(title);
+    const subtitle = node("p", "bookshelf-subtitle", "Books worth keeping close.");
+    headingCopy.append(subtitle);
+    const headingGroup = node("div", "library-title-group");
+    headingGroup.append(makePageBackButton("previous page"), headingCopy);
+    header.append(headingGroup);
+    const addButton = node("button", "bookshelf-add-button library-add-button");
     addButton.type = "button";
     addButton.setAttribute("aria-label", "Search and add a book");
-    addButton.innerHTML = '<span aria-hidden="true">＋</span><span>Add a book</span>';
+    addButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Add books</span>';
     addButton.addEventListener("click", beginBookshelfSearch);
     header.append(addButton);
-    const headerArt = node("span", "bookshelf-header-art");
-    headerArt.setAttribute("aria-hidden", "true");
-    headerArt.innerHTML = '<svg viewBox="0 0 88 88"><path d="M15 24 35 17v52l-20 7zM38 15h18v54H38zM61 23l13-5v49l-13 4zM10 78l26-8h22l18-6"/><path d="M21 31l8-3m-8 9 8-3m15-10h8m-8 7h8m18 1 5-2m-5 8 5-2"/></svg>';
-    header.append(headerArt);
     root.append(header);
 
     const tabs = node("div", "bookshelf-tabs");
@@ -624,7 +681,7 @@
       const empty = node("div", "bookshelf-empty");
       empty.append(node("span", "bookshelf-empty-mark", activeTab === "saved" ? "▤" : "♡"));
       empty.append(node("h2", "bookshelf-empty-title", searchNeedle ? "No matches found" : activeTab === "saved" ? "Your shelf is waiting" : "Save a book you love"));
-      empty.append(node("p", "bookshelf-empty-copy", searchNeedle ? "Try another title or author." : activeTab === "saved" ? "Add books you want to find again, all in one lovely place." : "Tap the heart on any book’s details to keep it here."));
+      empty.append(node("p", "bookshelf-empty-copy", searchNeedle ? "Try another title or author." : activeTab === "saved" ? "Add books you want to find again, all in one lovely place." : "Tap the Like button on a book’s details page to save it here."));
       if (!searchNeedle && activeTab === "saved") {
         const emptyAdd = node("button", "bookshelf-add-button empty-add", "Find a book to add");
         emptyAdd.type = "button"; emptyAdd.addEventListener("click", beginBookshelfSearch); empty.append(emptyAdd);
@@ -654,6 +711,7 @@
           openDetails(book, { collection: "bookshelf", book: { ...book } });
         });
         card.append(open);
+        const gridActions = ui.view === "grid" ? node("div", "bookshelf-card-actions") : null;
         if (activeTab === "saved" && !ui.selecting) {
           const favorite = node("button", "bookshelf-favorite-book");
           favorite.type = "button";
@@ -661,7 +719,7 @@
           favorite.setAttribute("aria-label", `Move ${book.title} to Favourites`);
           favorite.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.8c0 5.1-8.8 10.2-8.8 10.2S3.2 13.9 3.2 8.8A4.4 4.4 0 0 1 12 6.6a4.4 4.4 0 0 1 8.8 2.2Z"/></svg>';
           favorite.addEventListener("click", () => void addToCollection("favorites", book));
-          card.append(favorite);
+          (gridActions || card).append(favorite);
         }
         const remove = node("button", "bookshelf-remove-book");
         remove.type = "button"; remove.title = activeTab === "favorites" ? "Remove from favourites" : "Remove from My Books"; remove.setAttribute("aria-label", remove.title);
@@ -673,7 +731,9 @@
           if (!removedRemotely) return;
           state.bookshelf[activeTab] = state.bookshelf[activeTab].filter((item) => item.id !== book.id); persistBookshelfCache(); renderBookshelf();
         });
-        card.append(remove); list.append(card);
+        (gridActions || card).append(remove);
+        if (gridActions) card.append(gridActions);
+        list.append(card);
       });
       panel.append(list);
     }
@@ -824,38 +884,65 @@
     });
   }
 
+  function renderHomeShelf(books, query) {
+    elements.featuredBookSlot.replaceChildren();
+    elements.trendingBooks.replaceChildren();
+    elements.moreTrendingBooks.replaceChildren();
+    const [featuredBook, ...remainingBooks] = books;
+    if (!featuredBook) {
+      elements.featuredBookSlot.hidden = true;
+      elements.moreSection.hidden = true;
+      return;
+    }
+
+    const featuredCard = renderBookCard(featuredBook, 0, { query, page: 1, collection: "featured" });
+    featuredCard.classList.add("featured-book-card");
+    const copy = featuredCard.querySelector(".book-copy");
+    copy.prepend(node("span", "featured-book-kicker", "A place to start"));
+    const summary = String(featuredBook.description || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    if (summary) {
+      const shortSummary = summary.length > 148 ? `${summary.slice(0, 145).replace(/\s+\S*$/, "")}…` : summary;
+      copy.insertBefore(node("p", "featured-book-summary", shortSummary), copy.querySelector(".book-categories"));
+    }
+    elements.featuredBookSlot.append(featuredCard);
+    elements.featuredBookSlot.hidden = false;
+
+    remainingBooks.slice(0, HOME_SHELF_SIZE - 1).forEach((book, index) => {
+      const absoluteIndex = index + 1;
+      elements.trendingBooks.append(renderBookCard(book, absoluteIndex, {
+        query, page: Math.floor(absoluteIndex / 5) + 1, collection: "featured",
+      }));
+    });
+    books.slice(HOME_SHELF_SIZE).forEach((book, index) => {
+      const absoluteIndex = index + HOME_SHELF_SIZE;
+      elements.moreTrendingBooks.append(renderBookCard(book, absoluteIndex, {
+        query, page: Math.floor(absoluteIndex / 5) + 1, collection: "more",
+      }));
+    });
+    elements.moreSection.hidden = books.length <= HOME_SHELF_SIZE;
+    refreshDesktopScrollControls(elements.trendingBooks);
+  }
+
   async function loadTrending(genre) {
     const requestId = ++state.featuredRequestId;
     state.featuredBooks = [];
+    elements.featuredBookSlot.replaceChildren();
+    elements.featuredBookSlot.hidden = true;
     elements.discoverTitle.textContent = genre === "All" ? "Top books" : `Top ${genre} books`;
     elements.trendingBooks.replaceChildren();
     elements.moreTrendingBooks.replaceChildren();
     elements.moreSection.hidden = true;
-    const cached = state.featuredCache[genre];
+    const cacheKey = `${HOME_TRENDING_CACHE_VERSION}:${genre}`;
+    const cached = state.featuredCache[cacheKey];
     const cacheIsFresh = cached && Date.now() - cached.loadedAt < HOME_TRENDING_CACHE_MS;
     if (cached && !cacheIsFresh) {
-      delete state.featuredCache[genre];
+      delete state.featuredCache[cacheKey];
     }
     if (cacheIsFresh) {
       state.featuredBooks = cached.books;
       state.featuredQuery = cached.query;
-      cached.books.slice(0, HOME_SHELF_SIZE).forEach((book, index) => {
-        elements.trendingBooks.append(renderBookCard(book, index, {
-          query: cached.query,
-          page: 1,
-          collection: "featured",
-        }));
-      });
-      cached.books.slice(HOME_SHELF_SIZE).forEach((book, index) => {
-        elements.moreTrendingBooks.append(renderBookCard(book, index + HOME_SHELF_SIZE, {
-          query: cached.query,
-          page: 2,
-          collection: "more",
-        }));
-      });
-      elements.moreSection.hidden = cached.books.length <= HOME_SHELF_SIZE;
+      renderHomeShelf(cached.books, cached.query);
       setDiscoverMessage(cached.books.length ? "" : "No picks found for this genre yet.");
-      refreshDesktopScrollControls(elements.trendingBooks);
       return;
     }
     setDiscoverMessage("");
@@ -873,31 +960,18 @@
         setDiscoverMessage("No picks found for this genre yet.");
         return;
       }
-      state.featuredCache[genre] = {
+      state.featuredCache[cacheKey] = {
         query: state.featuredQuery,
         books: state.featuredBooks,
         loadedAt: Date.now(),
       };
       setDiscoverMessage("");
-      state.featuredBooks.slice(0, HOME_SHELF_SIZE).forEach((book, index) => {
-        elements.trendingBooks.append(renderBookCard(book, index, {
-          query: state.featuredQuery,
-          page: 1,
-          collection: "featured",
-        }));
-      });
-      state.featuredBooks.slice(HOME_SHELF_SIZE).forEach((book, index) => {
-        elements.moreTrendingBooks.append(renderBookCard(book, index + HOME_SHELF_SIZE, {
-          query: state.featuredQuery,
-          page: 2,
-          collection: "more",
-        }));
-      });
-      elements.moreSection.hidden = state.featuredBooks.length <= HOME_SHELF_SIZE;
-      refreshDesktopScrollControls(elements.trendingBooks);
+      renderHomeShelf(state.featuredBooks, state.featuredQuery);
     } catch (error) {
       if (requestId !== state.featuredRequestId || error.name === "AbortError") return;
       elements.trendingBooks.replaceChildren();
+      elements.featuredBookSlot.replaceChildren();
+      elements.featuredBookSlot.hidden = true;
       setDiscoverMessage(explainError(error), "error");
     }
   }
@@ -1065,7 +1139,7 @@
     detailActions.append(shareButton);
     const favoriteButton = node("button", `favorite-book-button${shelfContains("favorites", bookCacheId(book)) ? " is-favorite" : ""}`);
     favoriteButton.type = "button";
-    favoriteButton.setAttribute("aria-label", shelfContains("favorites", bookCacheId(book)) ? "Remove from favourites" : "Add to favourites");
+    favoriteButton.setAttribute("aria-label", shelfContains("favorites", bookCacheId(book)) ? "Unlike this book" : "Like this book");
     favoriteButton.title = favoriteButton.getAttribute("aria-label");
     favoriteButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.8c0 5.1-8.8 10.2-8.8 10.2S3.2 13.9 3.2 8.8A4.4 4.4 0 0 1 12 6.6a4.4 4.4 0 0 1 8.8 2.2Z"/></svg>';
     favoriteButton.addEventListener("click", () => void addToCollection("favorites", book));
@@ -1263,6 +1337,7 @@
     state.pageSize = data.page_size;
     state.total = data.total;
     state.hasMore = data.has_more;
+    updateAppTabbar();
     elements.welcome.hidden = true;
     elements.resultsSection.hidden = false;
     elements.resultsTitle.textContent = data.query;
@@ -1454,18 +1529,21 @@
     state.activeController = null;
     state.detailsController = null;
     state.query = query;
+    if (query) state.searchFocused = true;
+    updateAppTabbar();
     state.page = 1;
     state.total = 0;
     state.hasMore = false;
     state.visibleBooks = [];
     document.body.classList.toggle("search-active", Boolean(query));
+    document.body.classList.toggle("search-focused", state.searchFocused);
     elements.results.replaceChildren();
     elements.pagination.hidden = true;
     elements.moreSection.hidden = true;
     if (!query) {
       elements.resultsSection.hidden = true;
-      elements.discover.hidden = false;
-      elements.welcome.hidden = true;
+      elements.discover.hidden = state.searchFocused;
+      elements.welcome.hidden = !state.searchFocused;
       showMessage("");
       elements.typingIndicator.hidden = true;
       setBusy(false);
@@ -1506,15 +1584,20 @@
 
     try {
       let response;
-      if (state.initData) {
-        response = await api("session");
-      } else {
-        response = await api("inline-session", {
-          method: "POST",
-          body: JSON.stringify({ ticket: inlineTicket }),
-        });
-        state.inlineSessionToken = response.session_token || "";
-        if (!state.inlineSessionToken) throw new Error("inline_session_unavailable");
+      if (inlineTicket) {
+        try {
+          response = await api("inline-session", {
+            method: "POST",
+            body: JSON.stringify({ ticket: inlineTicket }),
+          });
+          state.inlineSessionToken = response.session_token || "";
+          if (!state.inlineSessionToken) throw new Error("inline_session_unavailable");
+        } catch (ticketError) {
+          // Older start-menu buttons can contain an expired one-use ticket.
+          // Fall back to Telegram's signed launch data when it is still valid.
+          if (!state.initData) throw ticketError;
+          response = await api("session");
+        }
         launchParams.delete("inline_ticket");
         const cleanQuery = launchParams.toString();
         window.history.replaceState(
@@ -1522,6 +1605,8 @@
           "",
           `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash}`,
         );
+      } else {
+        response = await api("session");
       }
       state.bookshelfCloudEnabled = Boolean(response.bookshelf_enabled);
       state.bookshelfLimit = Number(response.bookshelf_limit) || 100;
@@ -1536,10 +1621,18 @@
       const startParam = webApp?.initDataUnsafe?.start_param
         || new URLSearchParams(window.location.search).get("tgWebAppStartParam")
         || "";
-      const recommendationLaunch = ["recom", "annie_recommend", "annie_recommendation"]
-        .includes(startParam);
-      if (recommendationLaunch || new URLSearchParams(window.location.search).get("page") === "recommendations") {
+      const launchParams = new URLSearchParams(window.location.search);
+      const page = launchParams.get("page") || ({
+        recom: "recommendations", bookshelf: "bookshelf", favorites: "favorites",
+      }[startParam] || "");
+      if (page === "recommendations") {
         showRecommendationsPage();
+        dismissLaunchWelcome();
+        return;
+      }
+      if (page === "bookshelf" || page === "favorites") {
+        elements.bookshelf.dataset.activeTab = page === "favorites" ? "favorites" : "saved";
+        showBookshelfPage();
         dismissLaunchWelcome();
         return;
       }
@@ -1562,6 +1655,24 @@
   elements.quickMenuBackdrop.addEventListener("click", () => closeQuickMenu({ restoreFocus: true }));
   elements.quickMenuItems.querySelector('[data-page="recommendations"]').addEventListener("click", showRecommendationsPage);
   elements.quickMenuItems.querySelector('[data-page="bookshelf"]').addEventListener("click", showBookshelfPage);
+  elements.appTabbar.addEventListener("click", (event) => {
+    const tab = event.target.closest("[data-app-tab]");
+    if (!tab) return;
+    if (tab.dataset.appTab === "discover") {
+      if (state.query || elements.input.value) {
+        elements.input.value = "";
+        resetResultsForInput("");
+      }
+      showHomePage({ restoreScroll: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (tab.dataset.appTab === "search") {
+      navigateToSearch();
+    } else if (tab.dataset.appTab === "recommendations") {
+      showRecommendationsPage();
+    } else if (tab.dataset.appTab === "bookshelf") {
+      showBookshelfPage();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !elements.quickMenuItems.hidden) {
       event.preventDefault();
@@ -1576,6 +1687,17 @@
       state.debounceTimer = window.setTimeout(() => search(query, 1), 650);
     }
   });
+  elements.input.addEventListener("focus", () => {
+    if (state.currentPage !== "home") return;
+    state.searchFocused = true;
+    document.body.classList.add("search-focused");
+    if (!state.query) {
+      elements.discover.hidden = true;
+      elements.resultsSection.hidden = true;
+      elements.welcome.hidden = false;
+    }
+    updateAppTabbar();
+  });
   elements.previous.addEventListener("click", () => {
     if (state.page > 1) search(state.query, state.page - 1);
   });
@@ -1583,13 +1705,7 @@
     if (state.hasMore) search(state.query, state.page + 1);
   });
   elements.closeDialog.addEventListener("click", () => elements.dialog.close());
-  elements.homeButton.addEventListener("click", () => {
-    elements.dialog.close();
-    elements.input.value = "";
-    elements.detailSearchInput.value = "";
-    resetResultsForInput("");
-    window.scrollTo({ top: 0, behavior: "auto" });
-  });
+  elements.homeButton.addEventListener("click", () => elements.dialog.close());
   elements.detailSearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const query = elements.detailSearchInput.value.trim();
@@ -1639,8 +1755,7 @@
   addDesktopScrollControls(elements.trendingBooks, "Top Books");
   window.addEventListener("resize", () => {
     document.querySelectorAll(".trending-books, .related-shelf").forEach(refreshDesktopScrollControls);
-    updateShelfInstruction();
   }, { passive: true });
-  updateShelfInstruction();
+  updateAppTabbar();
   initialize();
 })();

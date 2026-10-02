@@ -21,6 +21,7 @@ class MiniAppSearchService:
     TRENDING_CACHE_TTL_SECONDS = 3600
     TRENDING_LIMIT = 20
     TRENDING_TARGET_SIZE = 10
+    TRENDING_CACHE_VERSION = "v4"
     RELATED_LIMIT = 10
     TRENDING_GENRES = ("All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics", "Biography")
     TRENDING_SEARCH_TERMS = {
@@ -57,15 +58,15 @@ class MiniAppSearchService:
         if genre not in self.TRENDING_GENRES:
             raise ValueError("invalid_genre")
 
-        cache_key = f"topbooks:{genre}"
+        cache_key = f"topbooks:{self.TRENDING_CACHE_VERSION}:{genre}"
         now = time.time()
         with self._cache_lock:
-            cached = self._trending_cache.get(genre)
+            cached = self._trending_cache.get(cache_key)
             cached_ttl = self.TRENDING_CACHE_TTL_SECONDS if cached and cached[1] else 300
             if cached and now - cached[0] < cached_ttl:
                 books = copy.deepcopy(cached[1])
             else:
-                self._trending_cache.pop(genre, None)
+                self._trending_cache.pop(cache_key, None)
                 books = None
 
         if books is None:
@@ -113,7 +114,7 @@ class MiniAppSearchService:
                         break
             if books:
                 with self._cache_lock:
-                    self._trending_cache[genre] = (time.time(), copy.deepcopy(books))
+                    self._trending_cache[cache_key] = (time.time(), copy.deepcopy(books))
                 self._set_cached(cache_key, books)
             logger.info(
                 "[miniapp] top books genre=%s elapsed_ms=%d candidates=%d results=%d",

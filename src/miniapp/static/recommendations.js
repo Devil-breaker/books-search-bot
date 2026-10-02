@@ -386,17 +386,23 @@
         if (typeof onBookSelect === "function") onBookSelect(book);
       });
       const coverUrl = safeUrl(book.cover_url);
+      const art = element("div", "recommendation-result-art");
       if (coverUrl) {
+        art.style.setProperty("--recommendation-cover", `url("${coverUrl}")`);
         const cover = element("img", "recommendation-result-cover");
         cover.src = coverUrl;
         cover.alt = `Cover of ${book.title || "recommended book"}`;
         cover.loading = "lazy";
         cover.decoding = "async";
-        cover.addEventListener("error", () => cover.replaceWith(element("div", "recommendation-result-cover recommendation-result-cover-empty", "✧")), { once: true });
-        card.append(cover);
+        cover.addEventListener("error", () => {
+          art.style.removeProperty("--recommendation-cover");
+          cover.replaceWith(element("div", "recommendation-result-cover recommendation-result-cover-empty", "✧"));
+        }, { once: true });
+        art.append(cover);
       } else {
-        card.append(element("div", "recommendation-result-cover recommendation-result-cover-empty", "✧"));
+        art.append(element("div", "recommendation-result-cover recommendation-result-cover-empty", "✧"));
       }
+      card.append(art);
       const copy = element("div", "recommendation-result-copy");
       copy.append(element("h3", "recommendation-result-title", book.title || "Untitled"));
       copy.append(element("p", "recommendation-result-author", book.author || "Unknown author"));

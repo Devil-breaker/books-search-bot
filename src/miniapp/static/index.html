@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#130e1b">
+  <meta name="theme-color" content="#111c1b">
   <title>Book Discovery</title>
   <link rel="preload" as="image" href="/miniapp/assets/images/welcome.jpg?v=20260930-app-assets-v1" fetchpriority="high">
-  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261001-bookshelf-v10">
+  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261002-seaglass-v10">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/miniapp/assets/recommendations.js?v=20261001-unified-loading-v1" defer></script>
-  <script src="/miniapp/assets/app.js?v=20261001-bookshelf-v10" defer></script>
+  <script src="/miniapp/assets/recommendations.js?v=20261002-cover-frame-v1" defer></script>
+  <script src="/miniapp/assets/app.js?v=20261002-seaglass-v12" defer></script>
 </head>
 <body>
   <section id="launch-welcome" class="launch-welcome" role="status" aria-live="polite" aria-label="Welcome to Annie Search">
@@ -29,7 +29,7 @@
         <div class="topbar-meta">
           <p id="greeting" class="hello">Hi</p>
           <div class="theme-switch" role="group" aria-label="Color theme">
-            <button class="theme-option" type="button" data-theme-choice="purple" aria-label="Purple theme" title="Purple theme" aria-pressed="true">
+            <button class="theme-option" type="button" data-theme-choice="purple" aria-label="Ink theme" title="Ink theme" aria-pressed="true">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></svg>
             </button>
             <button class="theme-option" type="button" data-theme-choice="light" aria-label="Light theme" title="Light theme" aria-pressed="false">
@@ -87,8 +87,8 @@
           <p class="eyebrow">DISCOVER SOMETHING GOOD</p>
           <h2 id="discover-title">Top books</h2>
         </div>
-        <span class="discover-note">Swipe to explore</span>
       </div>
+      <div id="featured-book-slot" class="featured-book-slot" hidden></div>
       <div id="discover-message" class="message" role="status" aria-live="polite" hidden></div>
       <div id="trending-books" class="trending-books" aria-label="Trending books"></div>
       <div id="more-section" class="more-section" hidden>
@@ -132,6 +132,21 @@
       <span class="made-with">Made with ❤️</span>
     </footer>
 
+    <nav id="app-tabbar" class="app-tabbar" aria-label="Main navigation">
+      <button class="app-tab" type="button" data-app-tab="discover" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7M5 9v11h14V9M9 20v-6h6v6"/></svg><span>Discover</span>
+      </button>
+      <button class="app-tab" type="button" data-app-tab="search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><span>Search</span>
+      </button>
+      <button class="app-tab" type="button" data-app-tab="recommendations">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2L12 3Z"/></svg><span>For You</span>
+      </button>
+      <button class="app-tab" type="button" data-app-tab="bookshelf">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16M10 3v17M15 5v15M19 4v16"/><path d="M3.5 20.5h17"/></svg><span>Bookshelf</span>
+      </button>
+    </nav>
+
     <button id="quick-menu-backdrop" class="quick-menu-backdrop" type="button" aria-label="Close navigation menu" hidden></button>
     <nav id="quick-nav" class="quick-nav" aria-label="Quick navigation">
       <div id="quick-menu-items" class="quick-menu-items" hidden>
@@ -163,9 +178,9 @@
 
   <dialog id="book-dialog" class="book-dialog" aria-labelledby="detail-title">
     <nav class="detail-navigation" aria-label="Book details navigation">
-      <button id="home-button" class="home-button" type="button" aria-label="Back to home">
+      <button id="home-button" class="home-button" type="button" aria-label="Back to previous page">
         <svg class="home-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path d="m3.5 10 8.5-7 8.5 7v10.5a1 1 0 0 1-1 1h-5.2v-7h-4.6v7H4.5a1 1 0 0 1-1-1V10Z" />
+          <path d="m14.5 5-7 7 7 7M8 12h12" />
         </svg>
       </button>
       <form id="detail-search-form" class="detail-search-form" role="search" autocomplete="off">
