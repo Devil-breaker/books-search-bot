@@ -1582,9 +1582,11 @@
       return;
     }
 
+    let startupStage = "session-authentication";
     try {
       let response;
       if (inlineTicket) {
+        startupStage = "inline-session-exchange";
         try {
           response = await api("inline-session", {
             method: "POST",
@@ -1598,6 +1600,7 @@
           if (!state.initData) throw ticketError;
           response = await api("session");
         }
+        startupStage = "inline-ticket-url-cleanup";
         launchParams.delete("inline_ticket");
         const cleanQuery = launchParams.toString();
         // Telegram clients can restrict history changes in some Mini App
@@ -1613,6 +1616,7 @@
       } else {
         response = await api("session");
       }
+      startupStage = "apply-session-response";
       state.bookshelfCloudEnabled = Boolean(response.bookshelf_enabled);
       state.bookshelfLimit = Number(response.bookshelf_limit) || 100;
       setBookshelfCacheUser(response.user.id);
@@ -1622,7 +1626,9 @@
         ? `Hi, ${response.user.first_name}`
         : "Hi there";
       setBusy(false);
+      startupStage = "render-navigation";
       renderGenreTabs();
+      startupStage = "route-initial-page";
       const startParam = webApp?.initDataUnsafe?.start_param
         || new URLSearchParams(window.location.search).get("tgWebAppStartParam")
         || "";
@@ -1641,8 +1647,23 @@
         dismissLaunchWelcome();
         return;
       }
+      startupStage = "load-trending";
       await loadTrending("All");
     } catch (error) {
+      if (inlineTicket && state.inlineSessionToken) {
+        const diagnostic = {
+          stage: startupStage,
+          name: String(error?.name || "Error").slice(0, 80),
+          message: String(error?.message || error || "unknown_error").slice(0, 240),
+        };
+        console.error("Mini App inline startup failed", diagnostic);
+        try {
+          await api("client-diagnostic", {
+            method: "POST",
+            body: JSON.stringify(diagnostic),
+          });
+        } catch (_) { /* Diagnostics must not replace the original startup error. */ }
+      }
       showStartupMessage(explainError(error), "error");
     } finally {
       dismissLaunchWelcome();
