@@ -1258,6 +1258,21 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(42, bot._clarification)
         bot.app.bot.send_message.assert_not_awaited()
 
+    def test_harry_potter_distractor_author_cannot_match_via_cross_script_fallback(self):
+        """A non-ASCII author must not turn a title token into an author clue."""
+        bot = make_bot()
+        needs_clarification, title_hint, author_hint = bot._is_clarification_query(
+            "Harry Potter"
+        )
+        self.assertTrue(needs_clarification)
+        candidate = bot._candidate_from_search_books(
+            [{"title": "Good vs. Evil in Harry Potter", "author": "Sarah Müller"}],
+            "Harry Potter",
+            title_hint or "",
+            author_hint or "",
+        )
+        self.assertIsNone(candidate)
+
     async def test_harry_potter_joanne_knight_rowling_also_matches(self):
         """The same flow works with "Joanne Kathleen Rowling" in the GB response."""
         import time

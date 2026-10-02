@@ -686,7 +686,33 @@ class MultiSourceBookAggregator:
 
         # If no results from any source – try Goodreads scraping as a last resort
         if not google_books and not itunes_books:
-            logger.warning("No results from any source – trying Goodreads fallback")
+            logger.warning("No results from Google Books or iTunes – trying Hardcover fallback")
+            hardcover_started = time.perf_counter()
+            hardcover_books = await asyncio.to_thread(
+                MultiSourceBookAggregator.search_hardcover, query, limit
+            )
+            logger.info(
+                "[perf] provider=hardcover_fallback elapsed_ms=%d results=%d",
+                round((time.perf_counter() - hardcover_started) * 1000),
+                len(hardcover_books or []),
+            )
+            if hardcover_books:
+                for book in hardcover_books[:limit]:
+                    try:
+                        rating = float(book.get("rating") or 0)
+                    except (TypeError, ValueError):
+                        rating = 0.0
+                    try:
+                        rating_count = int(book.get("rating_count") or 0)
+                    except (TypeError, ValueError):
+                        rating_count = 0
+                    book["search_rating"] = rating
+                    book["search_rating_count"] = rating_count
+                    book["search_rating_formatted"] = f"{rating:.2f}" if rating > 0 else "N/A"
+                    book["cover_source"] = "hardcover"
+                return hardcover_books[:limit]
+
+            logger.warning("Hardcover fallback had no results – trying Goodreads fallback")
             gr_data = await asyncio.to_thread(scrape_goodreads, query)
             if gr_data:
                 book = {

@@ -558,7 +558,7 @@ class GoodreadsBot:
                 self._score_author_hint(author_norm, normalized_author)
                 if author_is_independent else 0.0
             )
-            if author_score == 0 and author_norm:
+            if author_score == 0 and author_norm and author_is_independent:
                 try:
                     ascii_hint = author_norm.encode("ascii").decode("ascii")
                     if ascii_hint and any(ord(char) > 127 for char in author):
@@ -1747,7 +1747,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         )
 
     async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """List authorized IDs; available only to the configured bot owner."""
+        """List the owner and authorized users; available only to the owner."""
         if not self._is_bot_owner(update):
             await self._reply_owner_command_denied(update)
             return
@@ -1762,12 +1762,54 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             )
             await update.effective_message.reply_text(message)
             return
-        if not self._authorized_bot_admin_ids:
-            await update.effective_message.reply_text("No additional users are authorized.")
-            return
-        ids = "\n".join(f"<code>{user_id}</code>" for user_id in sorted(self._authorized_bot_admin_ids))
+        owner_id = self._owner_user_id
+        owner_user = update.effective_user
+        admin_ids = sorted(
+            user_id for user_id in self._authorized_bot_admin_ids
+            if user_id != owner_id
+        )
+
+        async def fetch_profile(user_id: int):
+            try:
+                return await context.bot.get_chat(user_id)
+            except Exception as exc:
+                logger.debug(
+                    "Could not fetch Telegram profile for bot admin %s (%s)",
+                    user_id, type(exc).__name__,
+                )
+                return None
+
+        profiles = await asyncio.gather(*(fetch_profile(user_id) for user_id in admin_ids))
+        entries = [(owner_id, owner_user, "Owner")]
+        entries.extend((user_id, profile, "Admin") for user_id, profile in zip(admin_ids, profiles))
+
+        lines = ["👥 <b>Admin Management</b>", f"Total admins: {len(entries)}", ""]
+        for index, (user_id, profile, role) in enumerate(entries, start=1):
+            first_name = str(getattr(profile, "first_name", "") or "").strip()
+            last_name = str(getattr(profile, "last_name", "") or "").strip()
+            display_name = " ".join(part for part in (first_name, last_name) if part)
+            username = str(getattr(profile, "username", "") or "").strip().lstrip("@")
+            if not display_name:
+                display_name = "Telegram user"
+            if username:
+                safe_username = html_escape(username)
+                name_line = (
+                    f"<b>{html_escape(display_name)}</b> "
+                    f"(<a href=\"https://t.me/{safe_username}\">@{safe_username}</a>)"
+                )
+            else:
+                name_line = f"<b>{html_escape(display_name)}</b>"
+            role_line = "👑 Owner" if role == "Owner" else "✅ Admin"
+            lines.extend((
+                f"{index}. {name_line}",
+                f"   {role_line}",
+                f"   ID: <code>{user_id}</code>",
+                "",
+            ))
+        lines.append("<i>Use /authorize and /unauthorize to manage access.</i>")
         await update.effective_message.reply_text(
-            f"<b>Authorized users</b>\n{ids}", parse_mode=ParseMode.HTML
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1797,6 +1839,9 @@ Save books to My Books or move favourites into their own list. Search, sort, and
 
     async def ping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Report process uptime and basic configured runtime status."""
+        ping_started = time.perf_counter()
+        pong_message = await update.message.reply_text("🏓 Pong…")
+        latency_ms = round((time.perf_counter() - ping_started) * 1000)
         uptime_seconds = max(0, int(time.time() - getattr(self, "_started_at", time.time())))
         days, remainder = divmod(uptime_seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
@@ -1811,7 +1856,8 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         uptime_parts.append(f"{seconds}s")
         mode = "Webhook" if getattr(self, "webhook_mode", False) else "Polling"
         mini_app = "Configured" if self._mini_app_url() else "Not configured"
-        await update.message.reply_text(
+        await pong_message.edit_text(
+            f"<b>🏓 Pong: {latency_ms} ms</b>\n"
             "<b>✅ Annie is online</b>\n\n"
             f"⏱ <b>Uptime:</b> {' '.join(uptime_parts)}\n"
             f"🔌 <b>Connection:</b> {mode}\n"
@@ -2624,6 +2670,27 @@ Save books to My Books or move favourites into their own list. Search, sort, and
 
     # ── Inline photo helpers ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _unique_book_categories(categories) -> list[str]:
+        """Normalize provider genre labels and remove casing/spacing duplicates."""
+        if isinstance(categories, str):
+            categories = [categories]
+        if not isinstance(categories, (list, tuple)):
+            return []
+        unique = []
+        seen = set()
+        for category in categories:
+            if isinstance(category, dict):
+                category = category.get("name") or category.get("title") or ""
+            if not isinstance(category, str):
+                continue
+            category = " ".join(category.split())
+            key = category.casefold()
+            if category and key not in seen:
+                seen.add(key)
+                unique.append(category)
+        return unique
+
     def _build_inline_photo_caption(self, book: dict) -> str:
         """Build compact caption for inline photo results (initial selection)."""
         title = html_escape(book.get("title", "Unknown"))
@@ -2639,7 +2706,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             f"✍️ Author: {author}",
         ]
 
-        categories = book.get("categories", [])
+        categories = self._unique_book_categories(book.get("categories", []))
         if categories:
             genres_str = ", ".join(categories[:5])
             parts.append(f"🏷️ Genres: {html_escape(genres_str)}")
@@ -2705,7 +2772,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         ]
 
         # Genres
-        categories = book.get("categories", [])
+        categories = self._unique_book_categories(book.get("categories", []))
         if categories:
             genres_str = ", ".join(categories)
             parts.append(f"🏷️ <b>Genres:</b> {html_escape(genres_str)}")
@@ -3033,7 +3100,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             parts.append(f"📅 <b>Year:</b> <code>{year}</code>")
 
         # Genres
-        categories = book.get("categories", [])
+        categories = self._unique_book_categories(book.get("categories", []))
         if categories:
             genres_str = ", ".join(categories[:5])
             parts.append(f"🏷️ <b>Genres:</b> {html_escape(genres_str)}")
@@ -4099,17 +4166,10 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             parts.insert(1, f"🌐 <i>English title: {html_escape(translated_title)}</i>")
 
         # Genres: limit to 5, remove duplicates
-        categories = book.get("categories", [])
+        categories = GoodreadsBot._unique_book_categories(book.get("categories", []))
         if categories:
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_categories = []
-            for cat in categories:
-                if cat not in seen:
-                    seen.add(cat)
-                    unique_categories.append(cat)
             # Limit to 5
-            limited_categories = unique_categories[:5]
+            limited_categories = categories[:5]
             genres_str = ", ".join(limited_categories)
             parts.append(f"🏷️ <b>Genres:</b> {html_escape(genres_str)}")
 

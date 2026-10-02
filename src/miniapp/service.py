@@ -53,6 +53,26 @@ class MiniAppSearchService:
         """Run the standalone recommendation module without changing search flows."""
         return await self.recommendation_engine.recommend(preferences)
 
+    @staticmethod
+    def _clean_categories(categories: object) -> list[str]:
+        if isinstance(categories, str):
+            categories = [categories]
+        if not isinstance(categories, (list, tuple)):
+            return []
+        cleaned = []
+        seen = set()
+        for category in categories:
+            if isinstance(category, dict):
+                category = category.get("name") or category.get("title") or ""
+            if not isinstance(category, str):
+                continue
+            category = " ".join(category.split())[:120]
+            normalized = category.casefold()
+            if category and normalized not in seen:
+                seen.add(normalized)
+                cleaned.append(category)
+        return cleaned
+
     async def trending(self, genre: str) -> dict:
         """Return genre-specific Hardcover picks for the Mini App discovery shelf."""
         if genre not in self.TRENDING_GENRES:
@@ -274,12 +294,7 @@ class MiniAppSearchService:
         if not title:
             raise ValueError("invalid_book")
 
-        categories = raw_book.get("categories") or []
-        if isinstance(categories, str):
-            categories = [categories]
-        if not isinstance(categories, list):
-            categories = []
-        categories = [str(value).strip()[:120] for value in categories[:10] if str(value).strip()]
+        categories = self._clean_categories(raw_book.get("categories"))[:10]
         try:
             page_count = int(raw_book.get("page_count") or 0)
         except (TypeError, ValueError):
@@ -864,11 +879,7 @@ class MiniAppSearchService:
             rating_count = int(float(str(rating_count).replace(",", "")))
         except (TypeError, ValueError):
             rating_count = 0
-        categories = book.get("categories") or []
-        if isinstance(categories, str):
-            categories = [categories]
-        elif not isinstance(categories, (list, tuple)):
-            categories = []
+        unique_categories = MiniAppSearchService._clean_categories(book.get("categories"))
         return {
             "title": str(book.get("title") or ""),
             "author": str(book.get("author") or ""),
@@ -876,7 +887,7 @@ class MiniAppSearchService:
             "description": str(book.get("description") or ""),
             "rating": rating,
             "rating_count": rating_count,
-            "categories": list(categories),
+            "categories": unique_categories,
             "isbn": str(book.get("isbn") or ""),
             "page_count": int(book.get("page_count") or 0),
             "published_date": str(book.get("published_date") or ""),

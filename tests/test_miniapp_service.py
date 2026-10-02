@@ -249,6 +249,19 @@ class MiniAppRecommendationDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["book"]["title"], "Complete Book")
         self.assertFalse(result["metadata_enriched"])
 
+    async def test_detail_metadata_deduplicates_genres_case_insensitively(self):
+        raw_book = {
+            "title": "Genre Duplicates",
+            "author": "An Author",
+            "source": "google_books",
+            "description": "Description",
+            "categories": ["Fantasy", " fantasy ", "SCI-FI", "Sci-Fi", {"name": "Mystery"}],
+        }
+
+        result = await self.service.recommendation_book_details(raw_book)
+
+        self.assertEqual(result["book"]["categories"], ["Fantasy", "SCI-FI", "Mystery"])
+
     async def test_google_books_source_is_not_queried_again(self):
         raw_book = {
             "title": "Google Book",

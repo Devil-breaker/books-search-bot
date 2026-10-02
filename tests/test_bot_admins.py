@@ -65,6 +65,34 @@ class TestOwnerAdminCommands(unittest.IsolatedAsyncioTestCase):
         bot._load_bot_admin_ids.assert_not_awaited()
         self.assertIn("only available to the bot owner", update.effective_message.reply_text.await_args.args[0])
 
+    async def test_admins_command_shows_owner_names_usernames_and_ids(self):
+        bot = self._bot()
+        bot._authorized_bot_admin_ids = {42, 43}
+        bot._load_bot_admin_ids = AsyncMock(return_value=True)
+        update = self._update(1)
+        update.effective_user.first_name = "Nero"
+        update.effective_user.last_name = "Owner"
+        update.effective_user.username = "NeroTag"
+        context = MagicMock(args=[])
+        context.bot.get_chat = AsyncMock(side_effect=[
+            MagicMock(first_name="Alex", last_name="Blaze", username="Evangelist"),
+            MagicMock(first_name="Taylor", last_name="", username=None),
+        ])
+
+        await bot.admins_command(update, context)
+
+        text = update.effective_message.reply_text.await_args.args[0]
+        self.assertIn("Total admins: 3", text)
+        self.assertIn("Nero Owner", text)
+        self.assertIn("@NeroTag", text)
+        self.assertIn("@Evangelist", text)
+        self.assertIn("Alex Blaze", text)
+        self.assertIn("Taylor", text)
+        self.assertIn("👑 Owner", text)
+        self.assertIn("✅ Admin", text)
+        self.assertIn("<code>42</code>", text)
+        self.assertIn("<code>43</code>", text)
+
     async def test_owner_can_authorize_and_revoke_user_and_cache_updates(self):
         bot = self._bot()
         bot._load_bot_admin_ids = AsyncMock(return_value=True)

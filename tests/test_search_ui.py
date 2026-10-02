@@ -967,6 +967,27 @@ class TestBookTitleTranslation(unittest.IsolatedAsyncioTestCase):
         self.assertIn("English title: Three Days of Happiness", normal_output)
         self.assertIn("English title: Three Days of Happiness", inline_output)
 
+    def test_normal_and_inline_details_deduplicate_repeated_genres(self):
+        bot = _make_bot()
+        book = {
+            "title": "Genre Duplicates",
+            "author": "An Author",
+            "source": "hardcover",
+            "categories": ["Fantasy", " fantasy ", "SCI-FI", "Sci-Fi"],
+        }
+
+        outputs = (
+            bot.format_book_message(book),
+            bot._build_inline_photo_caption(book),
+            bot._build_expanded_inline_caption(book),
+        )
+
+        for output in outputs:
+            with self.subTest(output=output[:40]):
+                self.assertIn("Fantasy, SCI-FI", output)
+                self.assertNotIn("Fantasy, fantasy", output)
+                self.assertNotIn("SCI-FI, Sci-Fi", output)
+
 
 class TestBuildSearchResultsMessage(unittest.TestCase):
     """_build_search_results_message produces the correct text and keyboard."""

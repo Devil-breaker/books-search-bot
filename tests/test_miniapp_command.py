@@ -163,6 +163,9 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         bot.webhook_mode = True
         update = MagicMock()
         update.message.reply_text = AsyncMock()
+        pong_message = MagicMock()
+        pong_message.edit_text = AsyncMock()
+        update.message.reply_text.return_value = pong_message
         context = MagicMock()
 
         with patch("src.handlers.time.time", return_value=100000), patch.dict(
@@ -170,7 +173,9 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.ping_command(update, context)
 
-        text = update.message.reply_text.await_args.args[0]
+        text = pong_message.edit_text.await_args.args[0]
+        self.assertIn("Pong:", text)
+        self.assertRegex(text, r"Pong: \d+ ms")
         self.assertIn("Uptime:</b> 1d 1h 1m 1s", text)
         self.assertIn("Connection:</b> Webhook", text)
         self.assertIn("Mini App URL:</b> Configured", text)
