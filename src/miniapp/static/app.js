@@ -1600,11 +1600,16 @@
         }
         launchParams.delete("inline_ticket");
         const cleanQuery = launchParams.toString();
-        window.history.replaceState(
-          window.history.state,
-          "",
-          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash}`,
-        );
+        // Telegram clients can restrict history changes in some Mini App
+        // launch contexts. Removing the ticket from the address bar is only
+        // cosmetic; it must not prevent the authenticated app from starting.
+        try {
+          window.history.replaceState(
+            window.history.state,
+            "",
+            `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash}`,
+          );
+        } catch (_) { /* Keep going with the ticket in the URL if cleanup is blocked. */ }
       } else {
         response = await api("session");
       }
