@@ -315,6 +315,23 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
             [], cache_time=0, is_personal=True
         )
 
+    async def test_portal_launch_is_not_hidden_by_search_cooldown(self):
+        bot = object.__new__(GoodreadsBot)
+        bot.token = "test-bot-token"
+        bot._active_clarification_restriction = MagicMock(return_value=("cooldown", 60))
+        bot._load_bot_admin_ids = AsyncMock()
+        update = MagicMock()
+        update.inline_query.query = ".portal"
+        update.inline_query.from_user.id = 123
+        update.inline_query.answer = AsyncMock()
+
+        with patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"}):
+            await bot.inline_search(update, MagicMock())
+
+        kwargs = update.inline_query.answer.await_args.kwargs
+        self.assertIsNotNone(kwargs["button"].web_app)
+        bot._active_clarification_restriction.assert_not_called()
+
     def test_inline_launch_ticket_is_signed_and_verifiable_without_bot_state(self):
         bot = object.__new__(GoodreadsBot)
         bot.token = "test-bot-token"

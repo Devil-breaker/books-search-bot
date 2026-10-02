@@ -660,16 +660,109 @@ class MiniAppSearchService:
         books = self._get_cached(cache_key)
         if books is None:
             started = time.perf_counter()
-            # Reuse the same Google Books + iTunes merge used by normal search,
-            # but call the provider aggregator directly. Flask runs each async
-            # request on its own event loop; the bot's in-flight asyncio task
-            # cache cannot safely be shared across those loops. Mini App has
-            # its own short-lived result cache, so each query still fetches once.
             from src.aggregator import MultiSourceBookAggregator
 
-            books = await MultiSourceBookAggregator.aggregate_book_data(query, limit=40)
+            async def timed_provider(name: str, function, *args) -> list[dict]:
+                provider_started = time.perf_counter()
+                try:
+                    result = await asyncio.to_thread(function, *args)
+                    return result if isinstance(result, list) else []
+                except Exception as exc:
+                    logger.warning(
+                        "[miniapp] search provider failed provider=%s error=%s",
+                        name, type(exc).__name__,
+                    )
+                    return []
+                finally:
+                    logger.info(
+                        "[miniapp] provider=%s elapsed_ms=%d",
+                        name, round((time.perf_counter() - provider_started) * 1000),
+                    )
+
+            # Do not use aggregate_book_data here: it intentionally clears list
+            # ratings for lazy Telegram detail lookups and does not include
+            # Hardcover's richer edition records. Mini App results need those
+            # ratings and edition fields immediately, so fetch providers once
+            # in parallel and merge them through the shared duplicate resolver.
+            google_books, hardcover_books, itunes_books = await asyncio.gather(
+                timed_provider(
+                    "google_books", MultiSourceBookAggregator.search_google_books,
+                    query, 40, False,
+                ),
+                timed_provider(
+                    "hardcover", MultiSourceBookAggregator.search_hardcover,
+                    query, 40,
+                ),
+                timed_provider("itunes", MultiSourceBookAggregator.search_itunes, query),
+            )
+
+            # Hardcover ratings/genres/edition identifiers enrich Google Books
+            # records; iTunes remains a cover fallback. Keep unmatched records
+            # from each provider so standalone titles and foreign editions are
+            # still discoverable.
+            merged_candidates: list[dict] = []
+            used_hardcover: set[int] = set()
+            used_itunes: set[int] = set()
+            for google_book in google_books:
+                item = dict(google_book)
+                hardcover_match = MultiSourceBookAggregator._find_matching_book_strict(
+                    item.get("title", ""), item.get("author", ""), hardcover_books,
+                )
+                if hardcover_match:
+                    hardcover_index = next(
+                        (idx for idx, candidate in enumerate(hardcover_books)
+                         if idx not in used_hardcover and candidate is hardcover_match),
+                        None,
+                    )
+                    if hardcover_index is not None:
+                        used_hardcover.add(hardcover_index)
+                    self.result_processor._merge_duplicate_book_data(item, hardcover_match)
+                    try:
+                        hardcover_rating = float(hardcover_match.get("rating") or 0)
+                        hardcover_rating_count = int(hardcover_match.get("rating_count") or 0)
+                    except (TypeError, ValueError):
+                        hardcover_rating = 0.0
+                        hardcover_rating_count = 0
+                    if hardcover_rating > 0:
+                        # List cards read these fields before the raw provider
+                        # fields; prefer Hardcover's sourced community rating.
+                        item["search_rating"] = hardcover_rating
+                        item["search_rating_count"] = hardcover_rating_count
+                        item["search_rating_formatted"] = f"{hardcover_rating:.2f}"
+
+                itunes_match = MultiSourceBookAggregator._find_matching_book_strict(
+                    item.get("title", ""), item.get("author", ""), itunes_books,
+                )
+                if itunes_match:
+                    itunes_index = next(
+                        (idx for idx, candidate in enumerate(itunes_books)
+                         if idx not in used_itunes and candidate is itunes_match),
+                        None,
+                    )
+                    if itunes_index is not None:
+                        used_itunes.add(itunes_index)
+                    if itunes_match.get("cover_url") and not item.get("cover_url"):
+                        item["cover_url"] = itunes_match["cover_url"]
+                        item["cover_source"] = "itunes"
+                merged_candidates.append(item)
+
+            merged_candidates.extend(
+                dict(item) for idx, item in enumerate(hardcover_books)
+                if idx not in used_hardcover
+            )
+            merged_candidates.extend(
+                dict(item) for idx, item in enumerate(itunes_books)
+                if idx not in used_itunes
+            )
+            has_latin_query = any(char.isascii() and char.isalpha() for char in query)
+            has_non_latin_query = any(char.isalpha() and not char.isascii() for char in query)
+            preferred_language = "en" if has_latin_query and not has_non_latin_query else None
             books = self.result_processor._rank_search_results(
-                self.result_processor._deduplicate_search_results(books, query), query
+                self.result_processor._deduplicate_search_results(
+                    merged_candidates, query, preferred_language=preferred_language,
+                ),
+                query,
+                preferred_language=preferred_language,
             )
             self._set_cached(cache_key, books)
             logger.info(

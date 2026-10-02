@@ -125,16 +125,73 @@ class MiniAppSearchDeduplicationTests(unittest.IsolatedAsyncioTestCase):
             ),
         ]
         with patch(
-            "src.aggregator.MultiSourceBookAggregator.aggregate_book_data",
-            new=AsyncMock(return_value=duplicates),
-        ) as aggregate:
+            "src.aggregator.MultiSourceBookAggregator.search_google_books",
+            return_value=duplicates,
+        ) as google, patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover",
+            return_value=[],
+        ) as hardcover, patch(
+            "src.aggregator.MultiSourceBookAggregator.search_itunes",
+            return_value=[],
+        ):
             results = await service._get_search_books("三日間の幸福")
 
-        aggregate.assert_awaited_once_with("三日間の幸福", limit=40)
+        google.assert_called_once_with("三日間の幸福", 40, False)
+        hardcover.assert_called_once_with("三日間の幸福", 40)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["title"], "三日間の幸福")
         self.assertEqual(results[0]["cover_url"], "https://example.test/complete.jpg")
         self.assertEqual(results[0]["rating_count"], 250)
+
+    async def test_miniapp_merges_hardcover_rating_and_edition_metadata(self):
+        processor = object.__new__(GoodreadsBot)
+        service = MiniAppSearchService(None, processor)
+        google_book = book(
+            "Harry Potter and the Prisoner of Azkaban", "Juvenile Fiction",
+            author="J. K. Rowling", source="google_books", rating=0,
+            rating_count=0, page_count=0, isbn="", cover_url="https://covers.test/hp.jpg",
+        )
+        hardcover_book = book(
+            "Harry Potter and the Prisoner of Azkaban", "Fantasy",
+            author="J. K. Rowling", source="hardcover", rating=4.58,
+            rating_count=1800000, page_count=435, isbn="9780439136365",
+            published_date="1999", cover_url="https://covers.test/hp-hc.jpg",
+        )
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.search_google_books",
+            return_value=[google_book],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover",
+            return_value=[hardcover_book],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.search_itunes",
+            return_value=[],
+        ):
+            results = await service._get_search_books("harry potter")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["rating"], 4.58)
+        self.assertEqual(results[0]["rating_count"], 1800000)
+        self.assertEqual(results[0]["page_count"], 435)
+        self.assertEqual(results[0]["isbn"], "9780439136365")
+        self.assertIn("Fantasy", results[0]["categories"])
+
+    async def test_miniapp_search_keeps_unmatched_hardcover_books(self):
+        processor = object.__new__(GoodreadsBot)
+        service = MiniAppSearchService(None, processor)
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.search_google_books",
+            return_value=[],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover",
+            return_value=[book("Hardcover-only title", "Fantasy", source="hardcover")],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.search_itunes",
+            return_value=[],
+        ):
+            results = await service._get_search_books("Hardcover-only title")
+
+        self.assertEqual([item["title"] for item in results], ["Hardcover-only title"])
 
     async def test_search_translation_returns_title_and_description_together(self):
         service = MiniAppSearchService(None, object.__new__(GoodreadsBot))

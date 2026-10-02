@@ -2344,13 +2344,6 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         user_id = update.inline_query.from_user.id
         query_id = update.inline_query.id
 
-        # Inline mode is another search entry point; apply the same user cooldown.
-        if self._active_clarification_restriction(user_id) is not None:
-            await self._load_bot_admin_ids()
-        if self._active_clarification_restriction(user_id) is not None:
-            await update.inline_query.answer([], cache_time=1, is_personal=True)
-            return
-
         # Inline Mini App launch shortcuts return Telegram's native launch
         # button above the results list, without inserting a filler message.
         launch_pages = {
@@ -2387,6 +2380,14 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 [], cache_time=0, is_personal=True, button=button
             )
             logger.info("Inline Mini App launch requested: page=%s user=%s", page or "portal", user_id)
+            return
+
+        # Launch shortcuts remain available even if a user is cooling down from
+        # book searches. Apply search restrictions only to actual catalog queries.
+        if self._active_clarification_restriction(user_id) is not None:
+            await self._load_bot_admin_ids()
+        if self._active_clarification_restriction(user_id) is not None:
+            await update.inline_query.answer([], cache_time=1, is_personal=True)
             return
 
         # ── 1. Short queries: return empty immediately ────────────────────────────
