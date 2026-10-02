@@ -124,13 +124,13 @@ class MiniAppSearchDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                 rating=4.6, rating_count=250,
             ),
         ]
-        processor._aggregate_search_results = AsyncMock(return_value=duplicates)
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.aggregate_book_data",
+            new=AsyncMock(return_value=duplicates),
+        ) as aggregate:
+            results = await service._get_search_books("三日間の幸福")
 
-        results = await service._get_search_books("三日間の幸福")
-
-        processor._aggregate_search_results.assert_awaited_once_with(
-            "三日間の幸福", limit=10
-        )
+        aggregate.assert_awaited_once_with("三日間の幸福", limit=40)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["title"], "三日間の幸福")
         self.assertEqual(results[0]["cover_url"], "https://example.test/complete.jpg")

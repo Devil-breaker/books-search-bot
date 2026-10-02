@@ -78,7 +78,10 @@ class MultiSourceBookAggregator:
 
             params = {
                 "q": primary_query,
-                "maxResults": min(limit, 8),
+                # Google Books permits up to 40 results per request. Keep
+                # normal Telegram searches small via their limit=10, while
+                # allowing the paginated Mini App author search to ask for more.
+                "maxResults": min(limit, 40),
                 "printType": "books",
                 "orderBy": "relevance",
             }

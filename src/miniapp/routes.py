@@ -36,21 +36,27 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
     bookshelf_repo_lock = threading.Lock()
     request_times: dict[tuple[int, str], deque[float]] = defaultdict(deque)
 
+    def get_bot_token() -> str:
+        # Prefer the token used by the running bot instance so launch-token
+        # signing and validation cannot diverge if deployment env aliases differ.
+        bot = runtime.get("bot")
+        return str(getattr(bot, "token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+
     def authenticate():
         inline_token = request.headers.get(INLINE_SESSION_HEADER, "")
         if inline_token:
             try:
                 user = validate_inline_token(
-                    inline_token, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                    inline_token, get_bot_token(),
                     purpose="session", max_lifetime=3600,
                 )
                 return user, None
-            except InitDataError:
+            except InitDataError as exc:
+                current_app.logger.warning("Mini App inline session rejected: %s", exc)
                 return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         try:
             return validate_init_data(
-                request.headers.get(INIT_DATA_HEADER, ""), token
+                request.headers.get(INIT_DATA_HEADER, ""), get_bot_token()
             ), None
         except InitDataError:
             return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
@@ -132,13 +138,14 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             return jsonify({"success": False, "error": "unauthorized"}), 401
         try:
             user = validate_inline_token(
-                ticket, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-                purpose="ticket", max_lifetime=300,
+                ticket, get_bot_token(),
+                purpose="ticket", max_lifetime=900,
             )
-        except InitDataError:
+        except InitDataError as exc:
+            current_app.logger.warning("Mini App inline ticket rejected: %s", exc)
             return jsonify({"success": False, "error": "unauthorized"}), 401
         session_token = issue_inline_token(
-            user, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            user, get_bot_token(),
             purpose="session", ttl_seconds=3600,
         )
         return jsonify({

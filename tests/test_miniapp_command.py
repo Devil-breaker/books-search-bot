@@ -325,7 +325,7 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
         ticket = bot._issue_inline_app_ticket(telegram_user)
         from src.miniapp.auth import validate_inline_token
         user = validate_inline_token(
-            ticket, "test-bot-token", purpose="ticket", max_lifetime=300
+            ticket, "test-bot-token", purpose="ticket", max_lifetime=900
         )
         self.assertEqual(user["id"], 321)
 

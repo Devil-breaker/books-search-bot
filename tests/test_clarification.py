@@ -551,22 +551,22 @@ class TestCooldown(unittest.IsolatedAsyncioTestCase):
 # ── Test: search_command ordering ───────────────────────────────────────────────
 
 class TestSearchCommandOrdering(unittest.IsolatedAsyncioTestCase):
-    """Clarification must run BEFORE aggregate_book_data; stop on prompt, continue on miss."""
+    """Clarify explicit/verified title-author pairs without interrupting title searches."""
 
-    async def test_clarification_before_normal_search(self):
-        """_try_clarification is called before aggregate_book_data; stop on prompt."""
+    async def test_explicit_pair_clarification_precedes_normal_search(self):
+        """An explicit title-by-author query is verified before catalog search."""
         bot = make_bot()
         bot.aggregator = AsyncMock()
         bot._clarification = {}
         bot._clarification_rate_limit = {}
 
-        update = make_mock_update("harry potter rowling", user_id=42, chat_id=99)
+        update = make_mock_update("Harry Potter by J.K. Rowling", user_id=42, chat_id=99)
 
         # Mock _try_clarification to return True (prompt was shown)
         with patch.object(bot, "_try_clarification", return_value=True) as mock_clar:
             with patch.object(bot, "_preload_hardcover_ratings_for_page", new_callable=AsyncMock):
-                await bot.search_command(update, MagicMock(args=["harry","potter","rowling"]))
-                mock_clar.assert_called_once_with(update, "harry potter rowling")
+                await bot.search_command(update, MagicMock(args=["Harry", "Potter", "by", "J.K.", "Rowling"]))
+                mock_clar.assert_called_once_with(update, "Harry Potter by J.K. Rowling")
                 # aggregate_book_data must NOT be called when clarification stops the pipeline
                 bot.aggregator.aggregate_book_data.assert_not_called()
 
@@ -577,14 +577,15 @@ class TestSearchCommandOrdering(unittest.IsolatedAsyncioTestCase):
         bot._clarification = {}
         bot._clarification_rate_limit = {}
 
-        update = make_mock_update("harry potter rowling", user_id=42, chat_id=99)
+        update = make_mock_update("Harry Potter", user_id=42, chat_id=99)
 
-        # _try_clarification returns False (not a clarification query)
-        with patch.object(bot, "_try_clarification", return_value=False):
+        # A title-like query isn't sent to speculative clarification discovery.
+        with patch.object(bot, "_try_clarification", new_callable=AsyncMock) as clarify:
             with patch.object(bot, "_preload_hardcover_ratings_for_page", new_callable=AsyncMock):
-                await bot.search_command(update, MagicMock(args=["harry","potter","rowling"]))
+                await bot.search_command(update, MagicMock(args=["Harry", "Potter"]))
+                clarify.assert_not_awaited()
                 bot.aggregator.aggregate_book_data.assert_called_once_with(
-                    "harry potter rowling", limit=10)
+                    "Harry Potter", limit=10)
 
 
 # ── Test: button actions ───────────────────────────────────────────────────────
@@ -1295,7 +1296,7 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
         bot.app.bot.send_message = AsyncMock()
         bot.app.bot.send_chat_action = AsyncMock()
 
-        update = make_mock_update("Harry Potter Rowling", user_id=42, chat_id=99)
+        update = make_mock_update("Harry Potter by J.K. Rowling", user_id=42, chat_id=99)
 
         # Provide a realistic GB response so _discover_candidate finds a match
         gb_response = make_gb_response([
@@ -1306,7 +1307,7 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot, "_preload_hardcover_ratings_for_page", new_callable=AsyncMock):
                 with patch.object(bot, "_build_search_results_message", new_callable=MagicMock):
                     await bot.search_command(
-                        update, MagicMock(args=["Harry", "Potter", "Rowling"])
+                        update, MagicMock(args=["Harry", "Potter", "by", "J.K.", "Rowling"])
                     )
 
         # aggregate_book_data must NOT have been called
@@ -1368,10 +1369,13 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Harry Potter", state["canonical_title"])
         self.assertIn("Rowling", state["canonical_author"])
 
-        # search_command must not call aggregator when clarification is shown
+        # A non-explicit pair is clarified only after catalog results verify it.
         bot2 = make_bot()
         bot2.aggregator = MagicMock()
-        bot2.aggregator.aggregate_book_data = AsyncMock(return_value=[])
+        bot2.aggregator.aggregate_book_data = AsyncMock(return_value=[{
+            "title": "Harry Potter and the Sorcerer's Stone",
+            "author": "J.K. Rowling", "source": "google_books",
+        }])
         bot2.app = MagicMock()
         bot2.app.bot.send_message = AsyncMock()
         bot2.app.bot.send_chat_action = AsyncMock()
@@ -1383,7 +1387,9 @@ class TestHPClarificationIntegration(unittest.IsolatedAsyncioTestCase):
                 with patch.object(bot2, "_build_search_results_message", new_callable=MagicMock):
                     await bot2.search_command(update2, MagicMock(args=["Harry", "Potter", "Rowling"]))
 
-        bot2.aggregator.aggregate_book_data.assert_not_called()
+        bot2.aggregator.aggregate_book_data.assert_awaited_once_with(
+            "Harry Potter Rowling", limit=10
+        )
         self.assertIn(42, bot2._clarification)
 
 

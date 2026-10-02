@@ -1,6 +1,7 @@
 """HTTP smoke tests for public Mini App assets and protected API routes."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from flask import Flask
@@ -42,9 +43,10 @@ class MiniAppRouteTests(unittest.TestCase):
         from src.miniapp.auth import issue_inline_token
         ticket = issue_inline_token(
             {"id": 987, "first_name": "Nero", "language_code": "en"},
-            "test-bot-token", purpose="ticket", ttl_seconds=300,
+            "test-bot-token", purpose="ticket", ttl_seconds=900,
         )
-        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+        self.runtime["bot"] = SimpleNamespace(token="test-bot-token")
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "different-env-token"}):
             exchange = self.client.post(
                 "/miniapp/api/inline-session", json={"ticket": ticket}
             )
@@ -52,7 +54,7 @@ class MiniAppRouteTests(unittest.TestCase):
         payload = exchange.get_json()
         self.assertEqual(payload["user"]["first_name"], "Nero")
 
-        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "different-env-token"}):
             session = self.client.get(
                 "/miniapp/api/session",
                 headers={"X-Annie-Inline-Session": payload["session_token"]},
@@ -61,8 +63,9 @@ class MiniAppRouteTests(unittest.TestCase):
         self.assertEqual(session.get_json()["user"]["language_code"], "en")
 
         other_app = Flask(__name__)
-        other_app.register_blueprint(create_miniapp_blueprint({}), url_prefix="/miniapp")
-        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+        other_runtime = {"bot": SimpleNamespace(token="test-bot-token")}
+        other_app.register_blueprint(create_miniapp_blueprint(other_runtime), url_prefix="/miniapp")
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "different-env-token"}):
             session = other_app.test_client().get(
                 "/miniapp/api/session",
                 headers={"X-Annie-Inline-Session": payload["session_token"]},

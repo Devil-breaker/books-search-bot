@@ -660,29 +660,14 @@ class MiniAppSearchService:
         books = self._get_cached(cache_key)
         if books is None:
             started = time.perf_counter()
-            # Keep Mini App search on the exact catalog-merge path used by
-            # normal bot search (Google Books + iTunes). The former custom
-            # Hardcover-first path omitted Google Books whenever Hardcover had
-            # any hit, leaving weak duplicates without covers/ratings ahead of
-            # richer copies. The bot helper also shares its short-lived search
-            # cache, so this doesn't add a second provider call for the same
-            # query made through normal search.
-            aggregate_search = getattr(
-                self.result_processor, "_aggregate_search_results", None
-            )
-            if aggregate_search:
-                books = await aggregate_search(query, limit=10)
-            else:
-                # Lightweight fallback for isolated service users without a
-                # GoodreadsBot result processor.
-                books, itunes_books = await self._search_fast_sources(query)
-                if not books:
-                    from src.aggregator import MultiSourceBookAggregator
+            # Reuse the same Google Books + iTunes merge used by normal search,
+            # but call the provider aggregator directly. Flask runs each async
+            # request on its own event loop; the bot's in-flight asyncio task
+            # cache cannot safely be shared across those loops. Mini App has
+            # its own short-lived result cache, so each query still fetches once.
+            from src.aggregator import MultiSourceBookAggregator
 
-                    google_books = await asyncio.to_thread(
-                        MultiSourceBookAggregator.search_google_books, query, 10, False
-                    )
-                    books = self._merge_google_fallback(google_books, itunes_books)
+            books = await MultiSourceBookAggregator.aggregate_book_data(query, limit=40)
             books = self.result_processor._rank_search_results(
                 self.result_processor._deduplicate_search_results(books, query), query
             )

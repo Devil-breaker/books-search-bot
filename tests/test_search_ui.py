@@ -39,6 +39,7 @@ def _make_bot():
     bot._group_admin_status_cache = {}
     bot._started_at = time.time()
     bot._clarification = {}
+    bot._clarification_rate_limit = {}
     bot._clarification_cancel_abuse = {}
     bot._clarification_abuse_notice_rate_limit = {}
     bot._group_search_rate_limit = {}

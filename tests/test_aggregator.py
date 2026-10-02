@@ -121,6 +121,15 @@ class TestAggregatorNetworkPaths(unittest.TestCase):
         self.assertEqual(books, [])
 
     @patch("requests.get")
+    def test_search_google_books_supports_full_catalog_page(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"items": []}
+
+        MultiSourceBookAggregator.search_google_books("J.K. Rowling", limit=40)
+
+        self.assertEqual(mock_get.call_args.kwargs["params"]["maxResults"], 40)
+
+    @patch("requests.get")
     def test_explicit_title_author_search_falls_back_across_languages(self, mock_get):
         primary = MagicMock(status_code=200)
         primary.json.return_value = {"items": []}

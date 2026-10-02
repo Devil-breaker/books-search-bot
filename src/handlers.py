@@ -1482,7 +1482,7 @@ class GoodreadsBot:
             "id": telegram_user.id,
             "first_name": getattr(telegram_user, "first_name", ""),
             "language_code": getattr(telegram_user, "language_code", ""),
-        }, self.token, purpose="ticket", ttl_seconds=300)
+        }, self.token, purpose="ticket", ttl_seconds=900)
 
     def _mini_app_markup(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -3279,15 +3279,23 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 "page": 1,
             }
 
-            # Check if clarification is needed BEFORE calling the aggregator.
-            stop = await self._try_clarification(update, query_text)
-            if stop:
-                self._clear_active_result_message(session_key, status_message.message_id)
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
-                return
+            # An explicit "Title by Author" query can be verified directly.
+            # For ordinary multiword searches, first inspect actual catalog
+            # results; otherwise a title like "Harry Potter" can be split into
+            # the false pair "Harry by Potter" by the discovery fallback.
+            normalized_query = query_text.casefold().strip()
+            has_clarification_cooldown = (
+                (user_id, normalized_query) in self._clarification_rate_limit
+            )
+            if " by " in normalized_query or has_clarification_cooldown:
+                stop = await self._try_clarification(update, query_text)
+                if stop:
+                    self._clear_active_result_message(session_key, status_message.message_id)
+                    try:
+                        await status_message.delete()
+                    except Exception:
+                        pass
+                    return
 
             # Keep matching and ranking synchronous with the original search flow.
             # Only the slow list-rating preload moves after the first result render.
@@ -3309,10 +3317,6 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                         except Exception:
                             pass
                         return
-                else:
-                    books = self._filter_clarification_like_results(
-                        books, query_text, title_hint or "", author_hint or ""
-                    )
 
             if not books:
                 logger.warning(f"No books found for: {query_text}")
