@@ -114,15 +114,27 @@ class MiniAppSearchDeduplicationTests(unittest.IsolatedAsyncioTestCase):
         processor = object.__new__(GoodreadsBot)
         service = MiniAppSearchService(None, processor)
         duplicates = [
-            book("三日間の幸福", "Fiction", isbn="9781111111111"),
-            book("三日間の幸福", "Fiction", isbn="9782222222222"),
+            book(
+                "三日間の幸福", "Fiction", author="三秋縋",
+                isbn="9781111111111", cover_url="", rating=0, rating_count=0,
+            ),
+            book(
+                "三日間の幸福", "Fiction", author="三秋縋",
+                isbn="9782222222222", cover_url="https://example.test/complete.jpg",
+                rating=4.6, rating_count=250,
+            ),
         ]
-        service._search_fast_sources = AsyncMock(return_value=(duplicates, []))
+        processor._aggregate_search_results = AsyncMock(return_value=duplicates)
 
         results = await service._get_search_books("三日間の幸福")
 
+        processor._aggregate_search_results.assert_awaited_once_with(
+            "三日間の幸福", limit=10
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["title"], "三日間の幸福")
+        self.assertEqual(results[0]["cover_url"], "https://example.test/complete.jpg")
+        self.assertEqual(results[0]["rating_count"], 250)
 
     async def test_search_translation_returns_title_and_description_together(self):
         service = MiniAppSearchService(None, object.__new__(GoodreadsBot))

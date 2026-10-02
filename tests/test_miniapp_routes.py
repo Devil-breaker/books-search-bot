@@ -1,13 +1,11 @@
 """HTTP smoke tests for public Mini App assets and protected API routes."""
 
 import unittest
-import threading
-from types import SimpleNamespace
+from unittest.mock import patch
 
 from flask import Flask
 
 from src.miniapp import create_miniapp_blueprint
-from src.handlers import GoodreadsBot
 
 
 class MiniAppRouteTests(unittest.TestCase):
@@ -40,36 +38,36 @@ class MiniAppRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
 
-    def test_inline_ticket_exchange_authenticates_followup_api_calls(self):
-        bot = object.__new__(GoodreadsBot)
-        bot._inline_app_auth_lock = threading.Lock()
-        bot._inline_app_tickets = {}
-        bot._inline_app_sessions = {}
-        bot._INLINE_APP_TICKET_TTL = 120
-        bot._INLINE_APP_SESSION_TTL = 3600
-        ticket = bot._issue_inline_app_ticket(
-            SimpleNamespace(id=987, first_name="Nero", language_code="en")
+    def test_inline_ticket_exchange_works_without_shared_process_state(self):
+        from src.miniapp.auth import issue_inline_token
+        ticket = issue_inline_token(
+            {"id": 987, "first_name": "Nero", "language_code": "en"},
+            "test-bot-token", purpose="ticket", ttl_seconds=300,
         )
-        self.runtime["bot"] = bot
-
-        exchange = self.client.post(
-            "/miniapp/api/inline-session", json={"ticket": ticket}
-        )
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+            exchange = self.client.post(
+                "/miniapp/api/inline-session", json={"ticket": ticket}
+            )
         self.assertEqual(exchange.status_code, 200)
         payload = exchange.get_json()
         self.assertEqual(payload["user"]["first_name"], "Nero")
 
-        session = self.client.get(
-            "/miniapp/api/session",
-            headers={"X-Annie-Inline-Session": payload["session_token"]},
-        )
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+            session = self.client.get(
+                "/miniapp/api/session",
+                headers={"X-Annie-Inline-Session": payload["session_token"]},
+            )
         self.assertEqual(session.status_code, 200)
         self.assertEqual(session.get_json()["user"]["language_code"], "en")
 
-        replay = self.client.post(
-            "/miniapp/api/inline-session", json={"ticket": ticket}
-        )
-        self.assertEqual(replay.status_code, 401)
+        other_app = Flask(__name__)
+        other_app.register_blueprint(create_miniapp_blueprint({}), url_prefix="/miniapp")
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test-bot-token"}):
+            session = other_app.test_client().get(
+                "/miniapp/api/session",
+                headers={"X-Annie-Inline-Session": payload["session_token"]},
+            )
+        self.assertEqual(session.status_code, 200)
 
 
 if __name__ == "__main__":

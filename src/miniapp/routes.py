@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, current_app, jsonify, request, send_from_directory
 
-from .auth import InitDataError, validate_init_data
+from .auth import InitDataError, issue_inline_token, validate_init_data, validate_inline_token
 from .bookshelf import (
     BOOKSHELF_COLLECTIONS,
     BOOKSHELF_LIMIT,
@@ -39,11 +39,14 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
     def authenticate():
         inline_token = request.headers.get(INLINE_SESSION_HEADER, "")
         if inline_token:
-            bot = runtime.get("bot")
-            user = bot._get_inline_app_session(inline_token) if bot else None
-            if user:
+            try:
+                user = validate_inline_token(
+                    inline_token, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                    purpose="session", max_lifetime=3600,
+                )
                 return user, None
-            return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
+            except InitDataError:
+                return None, (jsonify({"success": False, "error": "unauthorized"}), 401)
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         try:
             return validate_init_data(
@@ -122,17 +125,22 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
 
     @blueprint.post("/api/inline-session")
     def inline_session():
-        """Exchange Telegram's inline launch ticket for a temporary API session."""
+        """Exchange a signed inline launch ticket for a temporary API session."""
         payload = request.get_json(silent=True)
         ticket = payload.get("ticket") if isinstance(payload, dict) else None
-        bot = runtime.get("bot")
-        if not isinstance(ticket, str) or bot is None:
+        if not isinstance(ticket, str):
             return jsonify({"success": False, "error": "unauthorized"}), 401
-        exchange = getattr(bot, "_exchange_inline_app_ticket", None)
-        exchanged = exchange(ticket) if exchange else None
-        if not exchanged:
+        try:
+            user = validate_inline_token(
+                ticket, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                purpose="ticket", max_lifetime=300,
+            )
+        except InitDataError:
             return jsonify({"success": False, "error": "unauthorized"}), 401
-        session_token, user = exchanged
+        session_token = issue_inline_token(
+            user, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            purpose="session", ttl_seconds=3600,
+        )
         return jsonify({
             "success": True,
             "session_token": session_token,

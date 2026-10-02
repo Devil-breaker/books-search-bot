@@ -270,12 +270,8 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
 class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
     async def _run_launch(self, query):
         bot = object.__new__(GoodreadsBot)
+        bot.token = "test-bot-token"
         bot._active_clarification_restriction = MagicMock(return_value=None)
-        bot._inline_app_auth_lock = threading.Lock()
-        bot._inline_app_tickets = {}
-        bot._inline_app_sessions = {}
-        bot._INLINE_APP_TICKET_TTL = 120
-        bot._INLINE_APP_SESSION_TTL = 3600
         update = MagicMock()
         update.inline_query.query = query
         update.inline_query.from_user.id = 123
@@ -319,25 +315,19 @@ class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):
             [], cache_time=0, is_personal=True
         )
 
-    def test_inline_launch_ticket_is_one_use_and_creates_user_session(self):
+    def test_inline_launch_ticket_is_signed_and_verifiable_without_bot_state(self):
         bot = object.__new__(GoodreadsBot)
-        bot._inline_app_auth_lock = threading.Lock()
-        bot._inline_app_tickets = {}
-        bot._inline_app_sessions = {}
-        bot._INLINE_APP_TICKET_TTL = 120
-        bot._INLINE_APP_SESSION_TTL = 3600
+        bot.token = "test-bot-token"
         telegram_user = MagicMock(
             id=321, first_name="Nero", language_code="en"
         )
 
         ticket = bot._issue_inline_app_ticket(telegram_user)
-        exchange = bot._exchange_inline_app_ticket(ticket)
-
-        self.assertIsNotNone(exchange)
-        session_token, user = exchange
+        from src.miniapp.auth import validate_inline_token
+        user = validate_inline_token(
+            ticket, "test-bot-token", purpose="ticket", max_lifetime=300
+        )
         self.assertEqual(user["id"], 321)
-        self.assertEqual(bot._get_inline_app_session(session_token), user)
-        self.assertIsNone(bot._exchange_inline_app_ticket(ticket))
 
 
 if __name__ == "__main__":

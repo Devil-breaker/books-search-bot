@@ -6,13 +6,13 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import threading
 import tempfile
 import time
 import requests
 import unicodedata
 from src.admins import MongoBotAdminRepository
+from src.miniapp.auth import issue_inline_token
 from io import BytesIO
 from PIL import Image
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -87,12 +87,6 @@ class GoodreadsBot:
         # Entries expire after _INLINE_CALLBACK_CACHE_TTL seconds.
         self._inline_callback_cache: dict = {}
         self._INLINE_CALLBACK_CACHE_TTL: int = 30 * 60  # 30 minutes
-        self._inline_app_auth_lock = threading.Lock()
-        self._inline_app_tickets: dict[str, tuple[dict, float]] = {}
-        self._inline_app_sessions: dict[str, tuple[dict, float]] = {}
-        # Buttons in /start and /portal may be opened after a short delay.
-        self._INLINE_APP_TICKET_TTL = 900
-        self._INLINE_APP_SESSION_TTL = 60 * 60
         # Short-lived shared cache avoids repeating provider requests for the same query.
         self._aggregate_search_cache: dict[str, tuple[float, list[dict]]] = {}
         self._AGGREGATE_SEARCH_CACHE_TTL: int = 120
@@ -1463,7 +1457,7 @@ class GoodreadsBot:
 
     @staticmethod
     def _mini_app_url(page: str = "", inline_ticket: str = "") -> str | None:
-        """Return the configured Mini App URL, optionally targeting a page or launch."""
+        """Return the configured Mini App URL, optionally targeting a page/launch."""
         configured = os.getenv("ANNIE_APP_URL", "").strip()
         if not configured:
             return None
@@ -1483,61 +1477,12 @@ class GoodreadsBot:
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), parsed.fragment))
 
     def _issue_inline_app_ticket(self, telegram_user) -> str:
-        """Create a short-lived, one-use ticket for an inline Mini App launch."""
-        user = {
-            "id": int(telegram_user.id),
-            "first_name": str(getattr(telegram_user, "first_name", "") or ""),
-            "language_code": str(getattr(telegram_user, "language_code", "") or ""),
-        }
-        now = time.time()
-        ticket = secrets.token_urlsafe(32)
-        with self._inline_app_auth_lock:
-            self._inline_app_tickets = {
-                key: value for key, value in self._inline_app_tickets.items()
-                if value[1] > now
-            }
-            if len(self._inline_app_tickets) >= 1000:
-                oldest = min(self._inline_app_tickets, key=lambda key: self._inline_app_tickets[key][1])
-                self._inline_app_tickets.pop(oldest, None)
-            self._inline_app_tickets[ticket] = (user, now + self._INLINE_APP_TICKET_TTL)
-        return ticket
-
-    def _exchange_inline_app_ticket(self, ticket: str) -> tuple[str, dict] | None:
-        """Redeem one inline launch ticket and issue a short-lived session token."""
-        if not ticket or len(ticket) > 128:
-            return None
-        now = time.time()
-        with self._inline_app_auth_lock:
-            entry = self._inline_app_tickets.pop(ticket, None)
-            if entry is None or entry[1] <= now:
-                return None
-            self._inline_app_sessions = {
-                key: value for key, value in self._inline_app_sessions.items()
-                if value[1] > now
-            }
-            if len(self._inline_app_sessions) >= 1000:
-                oldest = min(self._inline_app_sessions, key=lambda key: self._inline_app_sessions[key][1])
-                self._inline_app_sessions.pop(oldest, None)
-            session_token = secrets.token_urlsafe(32)
-            user = entry[0]
-            self._inline_app_sessions[session_token] = (
-                user, now + self._INLINE_APP_SESSION_TTL
-            )
-            return session_token, user.copy()
-
-    def _get_inline_app_session(self, session_token: str) -> dict | None:
-        """Return a trusted Telegram user for an unexpired inline session token."""
-        if not session_token or len(session_token) > 128:
-            return None
-        now = time.time()
-        with self._inline_app_auth_lock:
-            entry = self._inline_app_sessions.get(session_token)
-            if entry is None:
-                return None
-            if entry[1] <= now:
-                self._inline_app_sessions.pop(session_token, None)
-                return None
-            return entry[0].copy()
+        """Issue a short-lived signed launch token usable across Koyeb replicas."""
+        return issue_inline_token({
+            "id": telegram_user.id,
+            "first_name": getattr(telegram_user, "first_name", ""),
+            "language_code": getattr(telegram_user, "language_code", ""),
+        }, self.token, purpose="ticket", ttl_seconds=300)
 
     def _mini_app_markup(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -2428,18 +2373,16 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         if launch:
             page, label = launch
             url = self._mini_app_url(page)
-            if url:
-                # Inline-query Mini Apps may launch without usable initData in
-                # some Telegram clients. Mint a short-lived ticket for the
-                # same bot/API process; the frontend redeems it only when
-                # Telegram initData is unavailable.
-                ticket = self._issue_inline_app_ticket(update.inline_query.from_user)
-                url = self._mini_app_url(page, inline_ticket=ticket)
-                button = InlineQueryResultsButton(
-                    text=label, web_app=WebAppInfo(url=url)
-                )
-            else:
-                button = None
+            if not url:
+                await update.inline_query.answer([], cache_time=0, is_personal=True)
+                return
+            # Signed ticket validation is stateless, so the API can be handled
+            # by any Koyeb replica without redirecting the user to private chat.
+            ticket = self._issue_inline_app_ticket(update.inline_query.from_user)
+            url = self._mini_app_url(page, inline_ticket=ticket)
+            button = InlineQueryResultsButton(
+                text=label, web_app=WebAppInfo(url=url)
+            )
             await update.inline_query.answer(
                 [], cache_time=0, is_personal=True, button=button
             )
