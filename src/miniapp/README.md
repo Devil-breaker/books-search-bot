@@ -45,8 +45,13 @@ end-to-end test:
 2. Run this project locally and expose its port through an HTTPS tunnel.
 3. In BotFather, configure that test bot's Main Mini App URL as
    `https://<your-tunnel-host>/miniapp/`.
-4. Open the test bot's Mini App. It sends Telegram's signed `initData` to the
-   local API, which verifies it using that test bot's `TELEGRAM_BOT_TOKEN`.
+4. Set the local bot's `ANNIE_APP_URL` to that same tunnel URL, then open the
+   test bot's Mini App. It sends Telegram's signed `initData` to the local API,
+   which verifies it using that test bot's `TELEGRAM_BOT_TOKEN`.
+
+Do not point a separate local test bot at the production Mini App URL: the
+production API validates Telegram launch data with its own bot token, and
+inline launch tickets are held by the bot/API process that issued them.
 
 Run only one polling process per bot token while testing. The web page and API
 use the same origin, so no cross-origin configuration is needed.

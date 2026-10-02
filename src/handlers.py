@@ -12,6 +12,7 @@ import tempfile
 import time
 import requests
 import unicodedata
+from src.admins import MongoBotAdminRepository
 from io import BytesIO
 from PIL import Image
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -23,6 +24,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -88,7 +90,8 @@ class GoodreadsBot:
         self._inline_app_auth_lock = threading.Lock()
         self._inline_app_tickets: dict[str, tuple[dict, float]] = {}
         self._inline_app_sessions: dict[str, tuple[dict, float]] = {}
-        self._INLINE_APP_TICKET_TTL = 120
+        # Buttons in /start and /portal may be opened after a short delay.
+        self._INLINE_APP_TICKET_TTL = 900
         self._INLINE_APP_SESSION_TTL = 60 * 60
         # Short-lived shared cache avoids repeating provider requests for the same query.
         self._aggregate_search_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -106,6 +109,11 @@ class GoodreadsBot:
         # Escalating abuse controls for repeated clarification cancellations.
         self._clarification_cancel_abuse: dict[int, dict] = {}
         self._clarification_abuse_notice_rate_limit: dict[int, float] = {}
+        self._authorized_bot_admin_ids: set[int] = set()
+        self._bot_admin_cache_loaded = False
+        self._bot_admin_cache_expires_at = 0.0
+        self._bot_admin_cache_lock = asyncio.Lock()
+        self._bot_admin_repository: MongoBotAdminRepository | None = None
         # Cache group-admin checks briefly so restriction checks do not add a
         # Telegram API call to every search/cancel interaction.
         self._group_admin_status_cache: dict[tuple[int, int], tuple[float, bool]] = {}
@@ -158,8 +166,9 @@ class GoodreadsBot:
         return text.lower().strip(" ,;:!?'\"-()[]{}")
 
     async def _is_owner_or_group_admin(self, user_id: int, chat) -> bool:
-        """Return whether the user is the configured owner or an admin in this group."""
-        if self._owner_user_id is not None and user_id == self._owner_user_id:
+        """Return whether the user is privileged or an admin in this group."""
+        await self._load_bot_admin_ids()
+        if self._is_privileged_bot_user(user_id):
             return True
         if chat is None or getattr(chat, "type", "private") not in ("group", "supergroup"):
             return False
@@ -176,6 +185,68 @@ class GoodreadsBot:
             is_admin = False
         self._group_admin_status_cache[key] = (now + 60, is_admin)
         return is_admin
+
+    def _is_privileged_bot_user(self, user_id: int) -> bool:
+        return (
+            (getattr(self, "_owner_user_id", None) is not None
+             and user_id == self._owner_user_id)
+            or user_id in getattr(self, "_authorized_bot_admin_ids", set())
+        )
+
+    def _get_bot_admin_repository(self) -> MongoBotAdminRepository | None:
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            return None
+        if getattr(self, "_bot_admin_repository", None) is None:
+            database_name = os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db"
+            self._bot_admin_repository = MongoBotAdminRepository(uri, database_name)
+        return self._bot_admin_repository
+
+    async def _load_bot_admin_ids(self, force: bool = False) -> bool:
+        """Load the small allowlist once; writes update the in-memory copy."""
+        lock = getattr(self, "_bot_admin_cache_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._bot_admin_cache_lock = lock
+        async with lock:
+            return await self._refresh_bot_admin_ids(force)
+
+    async def _refresh_bot_admin_ids(self, force: bool = False) -> bool:
+        owner_id = getattr(self, "_owner_user_id", None)
+        if owner_id is None:
+            self._authorized_bot_admin_ids = set()
+            self._bot_admin_cache_loaded = True
+            self._bot_admin_cache_expires_at = float("inf")
+            return False
+        now = time.monotonic()
+        if (getattr(self, "_bot_admin_cache_loaded", False) and not force
+                and getattr(self, "_bot_admin_cache_expires_at", float("inf")) > now):
+            return True
+        repository = self._get_bot_admin_repository()
+        if repository is None:
+            self._bot_admin_cache_loaded = True
+            self._bot_admin_cache_expires_at = float("inf")
+            return False
+        try:
+            user_ids = await asyncio.to_thread(repository.list_user_ids)
+        except Exception as exc:
+            # Keep the owner exempt and fail closed for DB-managed users.
+            self._authorized_bot_admin_ids = set()
+            self._bot_admin_cache_loaded = True
+            self._bot_admin_cache_expires_at = now + 30
+            try:
+                repository.close()
+            except Exception:
+                pass
+            self._bot_admin_repository = None
+            logger.warning("Could not load bot admin allowlist (%s)", type(exc).__name__)
+            return False
+        if getattr(self, "_owner_user_id", None) is not None:
+            user_ids.discard(self._owner_user_id)
+        self._authorized_bot_admin_ids = user_ids
+        self._bot_admin_cache_loaded = True
+        self._bot_admin_cache_expires_at = now + 60
+        return True
 
     async def _group_search_is_rate_limited(self, update: Update) -> bool:
         """Apply a small per-user, per-group cooldown to repeated /search commands."""
@@ -298,7 +369,7 @@ class GoodreadsBot:
 
     def _record_clarification_cancel(self, user_id: int, exempt: bool = False) -> str | None:
         """Count cancel cycles and return an escalation action when a limit is reached."""
-        if exempt or (self._owner_user_id is not None and user_id == self._owner_user_id):
+        if exempt or self._is_privileged_bot_user(user_id):
             return None
         now = time.time()
         state = self._clarification_cancel_abuse.setdefault(
@@ -330,7 +401,7 @@ class GoodreadsBot:
 
     def _active_clarification_restriction(self, user_id: int) -> tuple[str, int] | None:
         """Return the active restriction and seconds remaining, if any."""
-        if self._owner_user_id is not None and user_id == self._owner_user_id:
+        if self._is_privileged_bot_user(user_id):
             return None
         now = time.time()
         state = self._clarification_cancel_abuse.get(user_id, {})
@@ -1285,11 +1356,13 @@ class GoodreadsBot:
         """Register all command and callback handlers."""
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
-        self.app.add_handler(CommandHandler(["portal", "annie_app"], self.annie_app_command))
-        self.app.add_handler(CommandHandler(
-            ["recom", "annie_recommend", "annie_recommendation"],
-            self.annie_recommend_command,
-        ))
+        self.app.add_handler(CommandHandler("portal", self.portal_command))
+        self.app.add_handler(CommandHandler("recom", self.recom_command))
+        self.app.add_handler(CommandHandler("bookshelf", self.bookshelf_command))
+        self.app.add_handler(CommandHandler("favorites", self.favorites_command))
+        self.app.add_handler(CommandHandler("authorize", self.authorize_command))
+        self.app.add_handler(CommandHandler("unauthorize", self.unauthorize_command))
+        self.app.add_handler(CommandHandler("admins", self.admins_command))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("ping", self.ping_command))
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
@@ -1298,11 +1371,14 @@ class GoodreadsBot:
     async def _configure_telegram_commands(self, application: Application | None = None):
         """Publish command suggestions through Telegram so BotFather setup is unnecessary."""
         bot = (application or self.app).bot
+        await self._load_bot_admin_ids(force=True)
         commands = [
             BotCommand("start", "Welcome to Annie Search"),
             BotCommand("help", "How to use Annie"),
             BotCommand("portal", "Open Annie Search Portal"),
             BotCommand("recom", "Open Annie Recommendations"),
+            BotCommand("bookshelf", "Open your Bookshelf"),
+            BotCommand("favorites", "Open your Favourites"),
             BotCommand("search", "Search books by title or author"),
             BotCommand("ping", "Check bot status and uptime"),
         ]
@@ -1320,6 +1396,19 @@ class GoodreadsBot:
             except Exception as exc:
                 # Command menu setup is helpful but should never prevent startup.
                 logger.warning("Could not publish Telegram command menu: %s", type(exc).__name__)
+        owner_id = getattr(self, "_owner_user_id", None)
+        if owner_id is not None:
+            owner_commands = commands + [
+                BotCommand("authorize", "Authorize a user ID"),
+                BotCommand("unauthorize", "Revoke an authorized user"),
+                BotCommand("admins", "List authorized users"),
+            ]
+            try:
+                await bot.set_my_commands(
+                    owner_commands, scope=BotCommandScopeChat(chat_id=owner_id)
+                )
+            except Exception as exc:
+                logger.warning("Could not publish owner command menu: %s", type(exc).__name__)
 
     def process_update(self, raw_update: dict) -> bool:
         """Process a single update dict received from Telegram webhook.
@@ -1457,30 +1546,43 @@ class GoodreadsBot:
         url = self._mini_app_url(page)
         if not url:
             return None
-        if update.effective_chat and update.effective_chat.type == "private":
-            button = InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
-        else:
-            username = (context.bot.username or "").lstrip("@")
-            if not username:
-                return None
-            start_parameter = "recom" if page == "recommendations" else "portal"
-            button = InlineKeyboardButton(
-                label,
-                url=f"https://t.me/{username}?startapp={start_parameter}",
-            )
+        username = (context.bot.username or "").lstrip("@")
+        chat_type = getattr(getattr(update, "effective_chat", None), "type", "private")
+        # Telegram permits Web App buttons in private chats and supplies signed
+        # initData directly to the configured HTTPS URL. Group chats require a
+        # bot deep link, which launches the bot's configured Main Mini App.
+        if chat_type == "private":
+            return InlineKeyboardMarkup([[
+                InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
+            ]])
+        if not username:
+            return None
+        start_parameter = {
+            "recommendations": "recom",
+            "bookshelf": "bookshelf",
+            "favorites": "favorites",
+        }.get(page, "portal")
+        # Reusable Telegram Main Mini App link for group chats. It creates fresh
+        # signed launch data and avoids process-local one-use tickets.
+        button = InlineKeyboardButton(
+            label,
+            url=f"https://t.me/{username}?startapp={start_parameter}",
+        )
         return InlineKeyboardMarkup([[button]])
 
     def _start_keyboard(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> InlineKeyboardMarkup:
         """Build the compact welcome menu, retaining a fallback if unconfigured."""
-        portal = self._mini_app_markup(update, context, label="📚 Annie Search Portal")
+        portal = self._mini_app_markup(update, context, label="🔎 Annie Search Portal")
         recommendations = self._mini_app_markup(
             update, context, "recommendations", "✨ Annie Recommendations"
         )
+        bookshelf = self._mini_app_markup(update, context, "bookshelf", "📚 My Bookshelf")
+        favorites = self._mini_app_markup(update, context, "favorites", "♥ Favourites")
         portal_button = (
             portal.inline_keyboard[0][0] if portal else
-            InlineKeyboardButton("📚 Annie Search Portal", callback_data="start_portal")
+            InlineKeyboardButton("🔎 Annie Search Portal", callback_data="start_portal")
         )
         recommendations_button = (
             recommendations.inline_keyboard[0][0] if recommendations else
@@ -1488,11 +1590,20 @@ class GoodreadsBot:
                 "✨ Annie Recommendations", callback_data="start_recommendations"
             )
         )
+        bookshelf_button = (
+            bookshelf.inline_keyboard[0][0] if bookshelf else
+            InlineKeyboardButton("📚 My Bookshelf", callback_data="start_bookshelf")
+        )
+        favorites_button = (
+            favorites.inline_keyboard[0][0] if favorites else
+            InlineKeyboardButton("♥ Favourites", callback_data="start_favorites")
+        )
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("❔ Help", callback_data="start_help"),
              InlineKeyboardButton("✦ Features List", callback_data="start_features")],
             [portal_button],
             [recommendations_button],
+            [bookshelf_button, favorites_button],
         ])
 
     @staticmethod
@@ -1501,7 +1612,8 @@ class GoodreadsBot:
             "✨ <b>Welcome to Annie Search</b>\n"
             "<i>Your next great read starts here.</i>\n\n"
             "Search books, explore their details, and find recommendations "
-            "shaped around what you love to read.\n\n"
+            "shaped around what you love to read. Save books to your Bookshelf "
+            "or keep favourites close at hand.\n\n"
             "<b>Opening the Mini App inline?</b>\n"
             "Type <code>@AnnieBooks_bot .portal</code> or "
             "<code>@AnnieBooks_bot .recom</code>, then tap Annie’s launch button."
@@ -1531,9 +1643,14 @@ Open the portal to search books, explore trending and genre shelves, and browse 
 <b>Annie Recommendations</b>
 Add at least one book or author you’ve read or liked, choose genres, or pick moods. Annie will use those clues to suggest books.
 
+<b>My Bookshelf</b>
+Save books to My Books, move the ones you love to Favourites with the Like button, and search, sort, or switch between grid and list views. Your lists sync to your Telegram account when cloud sync is configured.
+
 <b>Commands</b>
 <code>/portal</code> · Open the portal
 <code>/recom</code> · Open recommendations
+<code>/bookshelf</code> · Open My Bookshelf
+<code>/favorites</code> · Open Favourites
 <code>/help</code> · Show this guide
 <code>/ping</code> · Check bot status"""
 
@@ -1554,7 +1671,10 @@ Download a book cover from its details.
 Browse trending picks, genre shelves, search, and <i>More Like This</i>.
 
 ✨ <b>Find your next read</b>
-Get recommendations from books you’ve read or liked, genres, and moods."""
+Get recommendations from books you’ve read or liked, genres, and moods.
+
+📚 <b>Build your Bookshelf</b>
+Save books to My Books or move favourites into their own list. Search, sort, and choose grid or list view for each section; your bookshelf can sync to your Telegram account."""
 
     async def _send_mini_app(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: str = "") -> None:
         markup = self._mini_app_markup(update, context, page)
@@ -1566,25 +1686,154 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         prompt = "Open Annie Search to explore books."
         if page == "recommendations":
             prompt = "Open Annie’s recommendation studio and tell her what you like."
+        elif page == "bookshelf":
+            prompt = "Open your Bookshelf to browse My Books and Favourites."
+        elif page == "favorites":
+            prompt = "Open your Favourites."
         await update.effective_message.reply_text(prompt, reply_markup=markup)
 
-    async def annie_app_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def portal_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Open the Annie Search Mini App from a regular bot chat."""
         await self._send_mini_app(update, context)
 
-    async def annie_recommend_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def recom_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Open the recommendations screen directly inside the Mini App."""
         await self._send_mini_app(update, context, "recommendations")
+
+    async def bookshelf_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Open My Bookshelf directly inside the Mini App."""
+        await self._send_mini_app(update, context, "bookshelf")
+
+    async def favorites_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Open the Favourites tab directly inside the Mini App."""
+        await self._send_mini_app(update, context, "favorites")
+
+    def _is_bot_owner(self, update: Update) -> bool:
+        return bool(
+            self._owner_user_id is not None
+            and update.effective_user is not None
+            and update.effective_user.id == self._owner_user_id
+        )
+
+    async def _reply_owner_command_denied(self, update: Update) -> None:
+        message = update.effective_message
+        if self._owner_user_id is None:
+            await message.reply_text("Owner commands are disabled: BOT_OWNER_ID is not configured.")
+        else:
+            await message.reply_text("This command is only available to the bot owner.")
+
+    async def _admin_command_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+        if not self._is_bot_owner(update):
+            await self._reply_owner_command_denied(update)
+            return None
+        if len(context.args) != 1:
+            await update.effective_message.reply_text("Usage: /authorize <telegram_user_id>")
+            return None
+        try:
+            user_id = int(context.args[0])
+        except (TypeError, ValueError):
+            user_id = 0
+        if not 0 < user_id <= 2**63 - 1:
+            await update.effective_message.reply_text("Enter a valid positive Telegram user ID.")
+            return None
+        if user_id == self._owner_user_id:
+            await update.effective_message.reply_text("The bot owner is already exempt from restrictions.")
+            return None
+        return user_id
+
+    async def authorize_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Add one Telegram user ID to the owner-managed exemption list."""
+        user_id = await self._admin_command_target(update, context)
+        if user_id is None:
+            return
+        if not await self._load_bot_admin_ids(force=True):
+            message = (
+                "Admin storage is unavailable. Configure MONGODB_URI, then try again."
+                if not os.getenv("MONGODB_URI", "").strip()
+                else "Could not reach MongoDB. No change was made; try again shortly."
+            )
+            await update.effective_message.reply_text(message)
+            return
+        repository = self._get_bot_admin_repository()
+        try:
+            inserted = await asyncio.to_thread(
+                repository.authorize, user_id, self._owner_user_id
+            )
+        except Exception as exc:
+            logger.warning("Could not authorize bot user (%s)", type(exc).__name__)
+            await update.effective_message.reply_text("Could not reach MongoDB. No change was made; try again shortly.")
+            return
+        self._authorized_bot_admin_ids.add(user_id)
+        self._bot_admin_cache_loaded = True
+        self._bot_admin_cache_expires_at = time.monotonic() + 60
+        await update.effective_message.reply_text(
+            f"User <code>{user_id}</code> is now authorized for cooldown and block exemptions."
+            if inserted else f"User <code>{user_id}</code> is already authorized.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def unauthorize_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Remove one Telegram user ID from the owner-managed exemption list."""
+        user_id = await self._admin_command_target(update, context)
+        if user_id is None:
+            return
+        if not await self._load_bot_admin_ids(force=True):
+            message = (
+                "Admin storage is unavailable. Configure MONGODB_URI, then try again."
+                if not os.getenv("MONGODB_URI", "").strip()
+                else "Could not reach MongoDB. No change was made; try again shortly."
+            )
+            await update.effective_message.reply_text(message)
+            return
+        repository = self._get_bot_admin_repository()
+        try:
+            removed = await asyncio.to_thread(repository.unauthorize, user_id)
+        except Exception as exc:
+            logger.warning("Could not revoke bot user authorization (%s)", type(exc).__name__)
+            await update.effective_message.reply_text("Could not reach MongoDB. No change was made; try again shortly.")
+            return
+        self._authorized_bot_admin_ids.discard(user_id)
+        self._bot_admin_cache_loaded = True
+        self._bot_admin_cache_expires_at = time.monotonic() + 60
+        await update.effective_message.reply_text(
+            f"Authorization removed for <code>{user_id}</code>."
+            if removed else f"User <code>{user_id}</code> was not on the authorized list.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """List authorized IDs; available only to the configured bot owner."""
+        if not self._is_bot_owner(update):
+            await self._reply_owner_command_denied(update)
+            return
+        if context.args:
+            await update.effective_message.reply_text("Usage: /admins")
+            return
+        if not await self._load_bot_admin_ids(force=True):
+            message = (
+                "Admin storage is unavailable. Configure MONGODB_URI, then try again."
+                if not os.getenv("MONGODB_URI", "").strip()
+                else "Could not reach MongoDB. Try again shortly."
+            )
+            await update.effective_message.reply_text(message)
+            return
+        if not self._authorized_bot_admin_ids:
+            await update.effective_message.reply_text("No additional users are authorized.")
+            return
+        ids = "\n".join(f"<code>{user_id}</code>" for user_id in sorted(self._authorized_bot_admin_ids))
+        await update.effective_message.reply_text(
+            f"<b>Authorized users</b>\n{ids}", parse_mode=ParseMode.HTML
+        )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send the concise welcome and action menu on /start."""
         start_parameter = context.args[0] if context.args else ""
-        if start_parameter in {
-            "portal", "recom", "annie_app", "annie_recommend", "annie_recommendation"
-        }:
-            page = "recommendations" if start_parameter in {
-                "recom", "annie_recommend", "annie_recommendation"
-            } else ""
+        page_parameters = {
+            "portal": "", "recom": "recommendations",
+            "bookshelf": "bookshelf", "favorites": "favorites",
+        }
+        if start_parameter in page_parameters:
+            page = page_parameters[start_parameter]
             await self._send_mini_app(update, context, page)
             return
         await update.message.reply_text(
@@ -2152,6 +2401,8 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
 
         # Inline mode is another search entry point; apply the same user cooldown.
         if self._active_clarification_restriction(user_id) is not None:
+            await self._load_bot_admin_ids()
+        if self._active_clarification_restriction(user_id) is not None:
             await update.inline_query.answer([], cache_time=1, is_personal=True)
             return
 
@@ -2160,6 +2411,8 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
         launch_pages = {
             ".portal": ("", "📚 Open Annie Search Portal"),
             ".recom": ("recommendations", "✨ Open Annie Recommendations"),
+            ".bookshelf": ("bookshelf", "📚 Open My Bookshelf"),
+            ".favorites": ("favorites", "♥ Open Favourites"),
         }
         normalized_inline_query = query.casefold()
         launch = launch_pages.get(normalized_inline_query)
@@ -2176,6 +2429,10 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
             page, label = launch
             url = self._mini_app_url(page)
             if url:
+                # Inline-query Mini Apps may launch without usable initData in
+                # some Telegram clients. Mint a short-lived ticket for the
+                # same bot/API process; the frontend redeems it only when
+                # Telegram initData is unavailable.
                 ticket = self._issue_inline_app_ticket(update.inline_query.from_user)
                 url = self._mini_app_url(page, inline_ticket=ticket)
                 button = InlineQueryResultsButton(
@@ -3209,6 +3466,14 @@ Get recommendations from books you’ve read or liked, genres, and moods."""
             if callback_data == "start_recommendations":
                 await query.answer()
                 await self._send_mini_app(update, context, "recommendations")
+                return
+            if callback_data == "start_bookshelf":
+                await query.answer()
+                await self._send_mini_app(update, context, "bookshelf")
+                return
+            if callback_data == "start_favorites":
+                await query.answer()
+                await self._send_mini_app(update, context, "favorites")
                 return
 
             # All normal search-result controls carry the original requester's

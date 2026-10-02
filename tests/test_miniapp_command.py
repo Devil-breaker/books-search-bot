@@ -23,45 +23,53 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         self.assertIsNone(GoodreadsBot._mini_app_url())
 
     @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
-    def test_private_chat_uses_telegram_web_app_button(self):
+    def test_private_chat_uses_direct_web_app_button(self):
         update = MagicMock()
         update.effective_chat.type = "private"
         context = MagicMock()
+        context.bot.username = "annie_search_bot"
 
-        markup = GoodreadsBot._mini_app_markup(object.__new__(GoodreadsBot), update, context, "recommendations")
+        markup = GoodreadsBot._mini_app_markup(
+            object.__new__(GoodreadsBot), update, context, "recommendations"
+        )
         button = markup.inline_keyboard[0][0]
 
-        self.assertEqual(button.web_app.url, "https://books.example/miniapp/?page=recommendations")
         self.assertIsNone(button.url)
+        self.assertEqual(
+            button.web_app.url,
+            "https://books.example/miniapp/?page=recommendations",
+        )
 
     @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
-    def test_start_menu_has_help_portal_recommendations_and_features(self):
+    def test_start_menu_has_help_portal_recommendations_bookshelf_and_favorites(self):
         update = MagicMock()
         update.effective_chat.type = "private"
         context = MagicMock()
+        context.bot.username = "annie_search_bot"
 
-        markup = GoodreadsBot._start_keyboard(
-            object.__new__(GoodreadsBot), update, context
-        )
+        markup = GoodreadsBot._start_keyboard(object.__new__(GoodreadsBot), update, context)
         buttons = [button for row in markup.inline_keyboard for button in row]
 
         self.assertEqual(buttons[0].callback_data, "start_help")
         self.assertEqual(buttons[1].callback_data, "start_features")
-        self.assertEqual(buttons[2].text, "📚 Annie Search Portal")
+        self.assertEqual(buttons[2].text, "🔎 Annie Search Portal")
         self.assertEqual(buttons[2].web_app.url, "https://books.example/miniapp/")
         self.assertEqual(buttons[3].text, "✨ Annie Recommendations")
-        self.assertEqual(
-            buttons[3].web_app.url,
-            "https://books.example/miniapp/?page=recommendations",
-        )
+        self.assertEqual(buttons[3].web_app.url, "https://books.example/miniapp/?page=recommendations")
+        self.assertEqual(buttons[4].text, "📚 My Bookshelf")
+        self.assertEqual(buttons[4].web_app.url, "https://books.example/miniapp/?page=bookshelf")
+        self.assertEqual(buttons[5].text, "♥ Favourites")
+        self.assertEqual(buttons[5].web_app.url, "https://books.example/miniapp/?page=favorites")
+        self.assertNotEqual(buttons[2].text.split()[0], buttons[4].text.split()[0])
 
-    def test_current_features_list_does_not_advertise_unbuilt_library(self):
+    def test_features_list_describes_bookshelf(self):
         text = GoodreadsBot._features_text()
 
         self.assertIn("trending picks", text)
         self.assertIn("Get recommendations", text)
         self.assertIn("\n\n🪄 <b>Explore details</b>", text)
-        self.assertNotIn("My Library", text)
+        self.assertIn("Build your Bookshelf", text)
+        self.assertIn("grid or list view", text)
         self.assertNotIn("Search History", text)
 
     def test_help_and_features_back_button_returns_to_start(self):
@@ -82,6 +90,8 @@ class TestMiniAppCommandLinks(unittest.TestCase):
 
         self.assertIn("@AnnieBooks_bot .portal", text)
         self.assertIn(".recom", text)
+        self.assertIn("Bookshelf", GoodreadsBot._help_text())
+        self.assertIn("/favorites", GoodreadsBot._help_text())
 
 
 class TestStartCommand(unittest.IsolatedAsyncioTestCase):
@@ -95,6 +105,57 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         await bot.start(update, context)
 
         bot._send_mini_app.assert_awaited_once_with(update, context, "recommendations")
+
+    async def test_bookshelf_and_favorites_deep_links_open_directly(self):
+        for parameter, page in (("bookshelf", "bookshelf"), ("favorites", "favorites")):
+            with self.subTest(parameter=parameter):
+                bot = object.__new__(GoodreadsBot)
+                bot._send_mini_app = AsyncMock()
+                update = MagicMock()
+                context = MagicMock()
+                context.args = [parameter]
+
+                await bot.start(update, context)
+
+                if page:
+                    bot._send_mini_app.assert_awaited_once_with(update, context, page)
+                else:
+                    bot._send_mini_app.assert_awaited_once_with(update, context)
+
+    async def test_page_commands_open_the_expected_page(self):
+        for method_name, page in (
+            ("portal_command", ""),
+            ("recom_command", "recommendations"),
+            ("bookshelf_command", "bookshelf"),
+            ("favorites_command", "favorites"),
+        ):
+            with self.subTest(command=method_name):
+                bot = object.__new__(GoodreadsBot)
+                bot._send_mini_app = AsyncMock()
+                update = MagicMock()
+                context = MagicMock()
+
+                await getattr(bot, method_name)(update, context)
+
+                if page:
+                    bot._send_mini_app.assert_awaited_once_with(update, context, page)
+                else:
+                    bot._send_mini_app.assert_awaited_once_with(update, context)
+
+    async def test_retired_startapp_alias_does_not_launch_a_page(self):
+        bot = object.__new__(GoodreadsBot)
+        bot._send_mini_app = AsyncMock()
+        bot._start_text = MagicMock(return_value="welcome")
+        bot._start_keyboard = MagicMock(return_value="keyboard")
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        context.args = ["annie_app"]
+
+        await bot.start(update, context)
+
+        bot._send_mini_app.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once()
 
     async def test_ping_reports_uptime_mode_and_mini_app_configuration(self):
         bot = object.__new__(GoodreadsBot)
@@ -127,6 +188,51 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.url, "https://t.me/annie_search_bot?startapp=recom")
         self.assertIsNone(button.web_app)
 
+    @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
+    def test_group_chat_bookshelf_button_targets_bookshelf_startapp(self):
+        update = MagicMock()
+        update.effective_chat.type = "group"
+        context = MagicMock()
+        context.bot.username = "annie_search_bot"
+
+        markup = GoodreadsBot._mini_app_markup(object.__new__(GoodreadsBot), update, context, "bookshelf")
+
+        self.assertEqual(markup.inline_keyboard[0][0].url,
+                         "https://t.me/annie_search_bot?startapp=bookshelf")
+
+    @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
+    def test_group_chat_favorites_button_targets_favorites_startapp(self):
+        update = MagicMock()
+        update.effective_chat.type = "group"
+        context = MagicMock()
+        context.bot.username = "annie_search_bot"
+
+        markup = GoodreadsBot._mini_app_markup(object.__new__(GoodreadsBot), update, context, "favorites")
+
+        self.assertEqual(markup.inline_keyboard[0][0].url,
+                         "https://t.me/annie_search_bot?startapp=favorites")
+
+    @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
+    def test_group_start_menu_buttons_open_all_pages(self):
+        update = MagicMock()
+        update.effective_chat.type = "group"
+        context = MagicMock()
+        context.bot.username = "annie_search_bot"
+
+        markup = GoodreadsBot._start_keyboard(object.__new__(GoodreadsBot), update, context)
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        page_buttons = buttons[2:]
+
+        self.assertEqual(
+            [button.url for button in page_buttons],
+            [
+                "https://t.me/annie_search_bot?startapp=portal",
+                "https://t.me/annie_search_bot?startapp=recom",
+                "https://t.me/annie_search_bot?startapp=bookshelf",
+                "https://t.me/annie_search_bot?startapp=favorites",
+            ],
+        )
+
     def test_command_menu_is_registered_for_private_and_group_chats(self):
         bot = object.__new__(GoodreadsBot)
         bot.app = MagicMock()
@@ -141,6 +247,24 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("portal", command_names)
         self.assertIn("recom", command_names)
         self.assertNotIn("annie_app", command_names)
+        self.assertIn("bookshelf", command_names)
+        self.assertIn("favorites", command_names)
+        self.assertNotIn("annie_recommendation", command_names)
+
+    def test_old_command_names_are_not_registered_as_aliases(self):
+        bot = object.__new__(GoodreadsBot)
+        bot.app = MagicMock()
+
+        bot.setup_handlers()
+
+        command_handlers = [
+            call.args[0].commands
+            for call in bot.app.add_handler.call_args_list
+            if call.args and hasattr(call.args[0], "commands")
+        ]
+        registered = {name for names in command_handlers for name in names}
+        self.assertTrue({"portal", "recom", "bookshelf", "favorites"}.issubset(registered))
+        self.assertTrue({"annie_app", "annie_recommend", "annie_recommendation"}.isdisjoint(registered))
 
 
 class TestInlineMiniAppLaunch(unittest.IsolatedAsyncioTestCase):

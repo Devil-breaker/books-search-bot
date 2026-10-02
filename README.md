@@ -2,7 +2,7 @@
 
 ### A Telegram book search and discovery bot
 
-Search for books by title, author, or ISBN, explore personalized recommendations, and open detailed book pages in Annie’s Mini App.
+Search for books by title, author, or ISBN, explore personalized recommendations, and save books to a synced personal Bookshelf in Annie’s Mini App.
 
 <p align="center">
   <a href="https://t.me/AnnieBooks_bot"><strong>Open @AnnieBooks_bot</strong></a>
@@ -35,6 +35,8 @@ Annie Search helps readers find books and decide what to read next. Use the bot 
 - 📤 Share a book in a Telegram chat using inline results
 - 🎨 Choose Purple, Light, or AMOLED Dark appearance in the Mini App
 - 📚 Keep separate My Books and Favourites lists synced to your Telegram account
+- 🔍 Search, sort, and switch between grid and list views independently in My Books and Favourites
+- 🗑️ Remove one book or select several for bulk removal
 
 ## Book sources
 
@@ -64,6 +66,8 @@ Results and metadata vary by catalog. Some titles may have more complete details
 | `/search <query>` | Search by title, author, or ISBN |
 | `/portal` | Open Annie Search Mini App |
 | `/recom` | Open the recommendations screen directly |
+| `/bookshelf` | Open My Bookshelf directly |
+| `/favorites` | Open the Favourites tab directly |
 | `/ping` | Check whether the bot is responding |
 
 The bot publishes these commands to Telegram on startup, so no `/setcommands` setup is needed. You can still override the command menu in [@BotFather](https://t.me/BotFather). Enable Inline Mode in BotFather to use inline search. The published commands are:
@@ -74,8 +78,12 @@ help - Show help and usage guide
 search - Search for books
 portal - Open the Annie Search Mini App
 recom - Open recommendations directly
+bookshelf - Open My Bookshelf
+favorites - Open Favourites
 ping - Check whether the bot is responding
 ```
+
+The bot owner can also use `/authorize <telegram_user_id>`, `/unauthorize <telegram_user_id>`, and `/admins` to manage users who are exempt from search cooldowns and temporary blocks. These commands appear in the owner’s command menu and are enforced as owner-only by the bot. The allowlist is stored in the separate `bot_admins` collection in MongoDB, so `MONGODB_URI` must be configured; it is loaded into memory at startup and changes made by the owner update the cache immediately. The bot checks this in-memory list during normal operation, with a brief refresh only when a restriction check needs to confirm an exemption.
 
 Inline search works in chats that support it:
 
@@ -120,7 +128,7 @@ pip install -r requirements.txt
 python goodreads_bot.py
 ```
 
-The polling entry point starts both the Telegram bot and the Flask server that serves the Mini App at `/miniapp/`.
+The polling entry point starts both the Telegram bot and the Flask server that serves the Mini App at `/miniapp/`. The `/start` menu includes direct launch buttons for the Portal, Recommendations, My Bookshelf, and Favourites.
 
 ## Deploy on Koyeb
 
@@ -142,7 +150,7 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 |---|---:|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot authentication |
 | `ANNIE_APP_URL` | For Mini App | Public HTTPS Mini App URL, ending in `/miniapp/` |
-| `MONGODB_URI` | Optional | MongoDB Atlas connection string for syncing Bookshelf across devices |
+| `MONGODB_URI` | Optional | MongoDB Atlas connection string for Bookshelf sync and the bot-admin allowlist |
 | `MONGODB_DB_NAME` | Optional | Database name; defaults to `annie_db` |
 | `GOOGLE_BOOKS_API_KEY` | No | Higher Google Books API quota |
 | `HARDCOVER_API_KEY` | No | Hardcover catalog search, trending, and community ratings |
@@ -151,7 +159,7 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 | `BIGBOOK_API_KEY` | No | Extra recommendation candidates from Big Book API |
 | `BIGBOOK_API_DAILY_BUDGET` | No | Daily request ceiling for Big Book API; defaults to `45` |
 | `OPEN_LIBRARY_CONTACT_EMAIL` | No | Contact information for Open Library requests |
-| `BOT_OWNER_ID` | No | Telegram user ID exempt from cancellation abuse limits |
+| `BOT_OWNER_ID` | No | Telegram user ID that can manage the authorized-user allowlist and is exempt from search restrictions |
 
 The Mini App can show cached and provider-backed features without every optional key, but missing provider keys can reduce coverage. Keep real credentials out of Git and never put them in the README.
 
