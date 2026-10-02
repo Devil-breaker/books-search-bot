@@ -129,32 +129,6 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
         }, "bookshelf_enabled": bool(os.getenv("MONGODB_URI", "").strip()),
             "bookshelf_limit": BOOKSHELF_LIMIT})
 
-    @blueprint.post("/api/client-diagnostic")
-    def client_diagnostic():
-        """Record a bounded client startup error for authenticated Mini App sessions."""
-        user, error = authenticate()
-        if error:
-            return error
-        if not within_rate_limit(user["id"], "client_diagnostic"):
-            return jsonify({"success": False, "error": "rate_limited"}), 429
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return jsonify({"success": False, "error": "invalid_json"}), 400
-
-        def safe_diagnostic(value, limit):
-            if not isinstance(value, str):
-                return "unknown"
-            return "".join(char for char in value[:limit] if char.isprintable())
-
-        stage = safe_diagnostic(payload.get("stage"), 80)
-        name = safe_diagnostic(payload.get("name"), 80)
-        message = safe_diagnostic(payload.get("message"), 240)
-        current_app.logger.warning(
-            "Mini App client startup failed user=%s stage=%s error=%s: %s",
-            user["id"], stage, name, message,
-        )
-        return jsonify({"success": True})
-
     @blueprint.post("/api/inline-session")
     def inline_session():
         """Exchange a signed inline launch ticket for a temporary API session."""
