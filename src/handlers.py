@@ -11,6 +11,7 @@ import tempfile
 import time
 import requests
 import unicodedata
+from html import unescape as html_unescape
 from src.admins import MongoBotAdminRepository
 from src.miniapp.auth import issue_inline_token
 from io import BytesIO
@@ -3042,21 +3043,39 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         isbn = html_escape(book.get("isbn", ""))
         pages = str(book.get("page_count", 0))
         year = book.get("published_date", "")[:4]
-        desc = (book.get("description") or "").strip()
+        desc = str(book.get("description") or "").strip()
 
-        # Clean HTML tags from description
+        # Preserve paragraph boundaries from HTML and plain-text descriptions.
+        desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)
+        desc = re.sub(
+            r"</(?:p|div|li|h[1-6]|blockquote)\s*>", "\n\n", desc,
+            flags=re.IGNORECASE,
+        )
         desc = re.sub(r"<[^>]+>", "", desc)
-        desc = re.sub(r"\s+", " ", desc).strip()
+        desc = html_unescape(desc)
+        desc = re.sub(r"[\t\f\v ]+", " ", desc)
+        desc = re.sub(r" *\n *", "\n", desc)
+        desc = re.sub(r"\n{3,}", "\n\n", desc).strip()
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", desc) if part.strip()]
 
-        # Truncate to ~800 chars at a word boundary
-        if len(desc) > 800:
-            cutoff = desc.rfind(" ", 0, 800)
-            if cutoff > 100:
-                desc = desc[:cutoff] + "..."
-            else:
-                desc = desc[:800] + "..."
-
-        desc_escaped = html_escape(desc)
+        # Some providers return one unbroken paragraph. Split long prose at
+        # sentence boundaries so it remains readable in Telegram captions.
+        if len(paragraphs) == 1 and len(paragraphs[0]) > 360:
+            sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"“'(])", paragraphs[0])
+            if len(sentences) > 1:
+                chunks = []
+                current = ""
+                for sentence in sentences:
+                    candidate = f"{current} {sentence}".strip()
+                    if current and len(candidate) > 300:
+                        chunks.append(current)
+                        current = sentence
+                    else:
+                        current = candidate
+                if current:
+                    chunks.append(current)
+                paragraphs = chunks
+        desc = "\n\n".join(paragraphs)
 
         # Source badge
         gr_enhanced = book.get("gr_enhanced", False)
@@ -3069,13 +3088,13 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         }.get(cover_source, "⚪")
         source_text = "Goodreads" if gr_enhanced else cover_source.replace("_", " ").title()
 
-        parts = []
+        header = []
 
         # Header
-        parts.append(f"<b>{title}</b>")
+        header.append(f"📖 Title: <b>{title}</b>")
         if translated_title and translated_title.casefold() != str(book.get("title") or "").strip().casefold():
-            parts.append(f"🌐 <i>English title: {html_escape(translated_title)}</i>")
-        parts.append(f"<i>{author}</i>")
+            header.append(f"🌐 <i>English title: {html_escape(translated_title)}</i>")
+        header.append(f"✍️ Author: <i>{author}</i>")
 
         # Rating line with stars
         if rating_cnt > 0:
@@ -3083,44 +3102,70 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 rating_for_float = str(book.get("rating", "")).replace(",", ".")
                 rating_num = float(rating_for_float)
                 stars = "⭐" * min(int(rating_num), 5)
-                parts.append(f"{stars} <b>{rating}</b>/5 (<b>{rating_cnt:,} ratings</b>)")
+                header.append(f"⭐ Rating: {stars} <b>{rating}</b>/5 (<b>{rating_cnt:,} ratings</b>)")
             except ValueError:
-                parts.append(f"<b>{rating}</b>/5 (<b>{rating_cnt:,} ratings</b>)")
+                header.append(f"⭐ Rating: <b>{rating}</b>/5 (<b>{rating_cnt:,} ratings</b>)")
         else:
-            parts.append("❓ <b>No ratings yet</b>")
-
-        parts.append("")  # blank line
+            header.append("⭐ Rating: ❓ <b>No ratings yet</b>")
 
         # Metadata
+        metadata = []
         if isbn:
-            parts.append(f"📖 <b>ISBN:</b> <code>{isbn}</code>")
+            metadata.append(f"🆔 ISBN: <code>{isbn}</code>")
         if pages and int(pages) > 0:
-            parts.append(f"📄 <b>Pages:</b> <code>{pages}</code>")
+            metadata.append(f"📄 Pages: <code>{pages}</code>")
         if year:
-            parts.append(f"📅 <b>Year:</b> <code>{year}</code>")
+            metadata.append(f"📅 Year: <code>{year}</code>")
 
         # Genres
         categories = self._unique_book_categories(book.get("categories", []))
         if categories:
             genres_str = ", ".join(categories[:5])
-            parts.append(f"🏷️ <b>Genres:</b> {html_escape(genres_str)}")
-
-        # Description
-        if desc_escaped:
-            parts.append("")
-            parts.append(desc_escaped)
+            metadata.append(f"🏷️ Genres: {html_escape(genres_str)}")
 
         # Footer
-        parts.append("")
-        parts.append(f"{source_emoji} <i>Source: {html_escape(source_text)}</i>")
+        footer = [f"{source_emoji} <i>Source: {html_escape(source_text)}</i>"]
 
         # Links
         if book.get("info_link"):
-            parts.append(f'<a href="{html_escape(book["info_link"])}">📚 More Info</a>')
+            footer.append(f'<a href="{html_escape(book["info_link"])}">📚 More Info</a>')
         if book.get("goodreads_url"):
-            parts.append(f'<a href="{html_escape(book["goodreads_url"])}">Goodreads Page</a>')
+            footer.append(f'<a href="{html_escape(book["goodreads_url"])}">Goodreads Page</a>')
 
-        return "\n".join(parts)
+        def compose(description: str) -> str:
+            groups = ["\n".join(header)]
+            if metadata:
+                # Keep metadata compact so the caption budget stays available
+                # for the book description.
+                groups.append("\n".join(metadata))
+            if description:
+                groups.append(f"📄 <b>Summary</b>\n\n{html_escape(description)}")
+            groups.append("\n".join(footer))
+            return "\n\n".join(groups)
+
+        caption = compose(desc)
+        max_caption_length = 950  # Telegram allows 1024 caption characters.
+        if len(caption) > max_caption_length and desc:
+            # Budget against the fully rendered HTML so escaping and links are
+            # counted too. Find the fitting prefix, then cut back to a complete
+            # word so the visible description never ends mid-word.
+            truncation_mark = "...."
+            low, high = 0, len(desc)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if len(compose(desc[:middle].rstrip() + truncation_mark)) <= max_caption_length:
+                    low = middle
+                else:
+                    high = middle - 1
+            shortened = desc[:low].rstrip()
+            if low < len(desc):
+                boundaries = [shortened.rfind(char) for char in (" ", "\n", "\t")]
+                boundary = max(boundaries)
+                shortened = shortened[:boundary].rstrip() if boundary >= 0 else ""
+                shortened += truncation_mark
+            caption = compose(shortened)
+
+        return caption
 
     @staticmethod
     async def _translate_book_text_fields(book: dict) -> dict:
@@ -3930,32 +3975,6 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             await self._translate_book_text_fields(book)
 
             text_info = self.format_book_message(book)
-
-            # Truncate caption to stay within Telegram's 1024 character limit.
-            #
-            # The caption is HTML, so we can't just slice at a fixed byte offset —
-            # truncating mid-<a ...> tag leaves broken markup that Telegram rejects
-            # ("Can't parse entities: unsupported start tag ..."). Any text-derived
-            # HTML tags (the <a href> links) may sit near the cutoff point, so:
-            # 1. Strip tags to get clean plain text
-            # 2. Truncate at a word boundary
-            # 3. Re-append the Goodreads link (exact, valid HTML) last
-            MAX_CAPTION = 950
-            if len(text_info) > MAX_CAPTION:
-                # Truncate HTML safely without breaking markup or collapsing lines.
-                # - Strip tags to "" (the message's real "\n" line breaks stay)
-                # - Replace any HTML-coded newlines with plain newlines
-                # - Collapse spaces around newlines, but keep the newlines
-                plain = re.sub(r"<br\s*/?>", "\n", text_info, flags=re.I)
-                plain = re.sub(r"<[^>]+>", "", plain)
-                plain = re.sub(r" *\n *", "\n", plain).strip()
-                cutoff = plain.rfind(" ", 0, MAX_CAPTION)
-                gr_url = build_goodreads_url(book)
-                suffix = f'\n\n<a href="{gr_url}">📖 View on Goodreads</a>'
-                if cutoff > 0:
-                    text_info = plain[:cutoff] + "..." + suffix
-                else:
-                    text_info = plain[:MAX_CAPTION] + "..." + suffix
 
             await query.delete_message()
 

@@ -6,10 +6,10 @@
   <meta name="theme-color" content="#111c1b">
   <title>Book Discovery</title>
   <link rel="preload" as="image" href="/miniapp/assets/images/welcome.jpg?v=20260930-app-assets-v1" fetchpriority="high">
-  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261002-seaglass-v12">
+  <link rel="stylesheet" href="/miniapp/assets/app.css?v=20261003-spacing-v5">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/miniapp/assets/recommendations.js?v=20261002-cover-frame-v1" defer></script>
-  <script src="/miniapp/assets/app.js?v=20261002-seaglass-v16" defer></script>
+  <script src="/miniapp/assets/recommendations.js?v=20261003-page-refresh-v1" defer></script>
+  <script src="/miniapp/assets/app.js?v=20261003-page-refresh-v2" defer></script>
 </head>
 <body>
   <section id="launch-welcome" class="launch-welcome" role="status" aria-live="polite" aria-label="Welcome to Annie Search">
@@ -28,6 +28,9 @@
       <header class="topbar">
         <div class="topbar-meta">
           <p id="greeting" class="hello">Hi</p>
+          <button class="page-refresh-button" type="button" data-page-refresh aria-label="Refresh this page" title="Refresh this page">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 1-2.35-5.66L20 8.7"/><path d="M20 4v4.7h-4.7"/></svg>
+          </button>
           <div class="theme-switch" role="group" aria-label="Color theme">
             <button class="theme-option" type="button" data-theme-choice="purple" aria-label="Ink theme" title="Ink theme" aria-pressed="true">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></svg>
@@ -182,6 +185,9 @@
         <svg class="home-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <path d="m14.5 5-7 7 7 7M8 12h12" />
         </svg>
+      </button>
+      <button class="page-refresh-button" type="button" data-page-refresh aria-label="Refresh this page" title="Refresh this page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 1-2.35-5.66L20 8.7"/><path d="M20 4v4.7h-4.7"/></svg>
       </button>
       <form id="detail-search-form" class="detail-search-form" role="search" autocomplete="off">
         <label class="sr-only" for="detail-query">Search books</label>

@@ -6,6 +6,7 @@
   const MOODS = ["Joyful", "Playful", "Hopeful", "Cozy", "Curious", "Adventurous", "Thoughtful", "Spiritual", "A little thrill", "Ready to cry"];
   const MORE_MOODS = ["Calm", "Inspired", "Nostalgic", "Romantic", "Courageous", "Reflective", "Surprised", "Escapist", "Motivated", "Mysterious"];
   const MAX_SELECTED = 5;
+  const refreshers = new WeakMap();
 
   function element(tag, className, text) {
     const item = document.createElement(tag);
@@ -378,6 +379,15 @@
       }
     });
 
+    refreshers.set(container, () => {
+      if (submit.disabled) return;
+      if (!currentPreferences) {
+        submitStatus.textContent = "Set your reading preferences before refreshing recommendations.";
+        return;
+      }
+      submit.click();
+    });
+
     function renderRecommendation(book) {
       const card = element("button", "recommendation-result-card");
       card.type = "button";
@@ -425,5 +435,8 @@
     } catch (_) { return ""; }
   }
 
-  window.AnnieRecommendations = Object.freeze({ mount });
+  window.AnnieRecommendations = Object.freeze({
+    mount,
+    refresh(container) { refreshers.get(container)?.(); },
+  });
 })();

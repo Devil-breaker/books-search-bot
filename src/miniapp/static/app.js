@@ -55,11 +55,12 @@
     debounceTimer: null, activeDetailContext: null, featuredQuery: "",
     featuredBooks: [], featuredGenre: "All", featuredRequestId: 0, featuredCache: {},
     currentPage: "home", previousPage: "home", searchFocused: false, homeScrollY: 0, bookshelfAddMode: false,
+    pageRefreshInProgress: false,
     bookshelf: { saved: [], favorites: [] }, bookshelfUi: {
       saved: { query: "", sort: "newest", view: "grid", selecting: false, selected: [] },
       favorites: { query: "", sort: "newest", view: "grid", selecting: false, selected: [] },
     },
-    bookshelfCloudEnabled: false, bookshelfLoaded: false, bookshelfLoading: false,
+    bookshelfCloudEnabled: false, bookshelfLoaded: false, bookshelfLoading: false, bookshelfSyncPromise: null,
     bookshelfLastLoadedAt: 0, bookshelfError: "", bookshelfLimit: 100, bookshelfRevision: 0,
   };
 
@@ -209,6 +210,12 @@
     elements.startupMessage.hidden = !text;
   }
 
+  function cancelBookshelfSearch() {
+    if (!state.bookshelfAddMode) return;
+    state.bookshelfAddMode = false;
+    showStartupMessage("");
+  }
+
   function closeQuickMenu({ restoreFocus = false } = {}) {
     elements.quickNavToggle.setAttribute("aria-expanded", "false");
     elements.quickNavToggle.setAttribute("aria-label", "Open quick navigation");
@@ -248,7 +255,58 @@
     return button;
   }
 
+  function makeRefreshButton() {
+    const button = node("button", "page-refresh-button");
+    button.type = "button";
+    button.dataset.pageRefresh = "";
+    button.setAttribute("aria-label", "Refresh this page");
+    button.title = "Refresh this page";
+    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 1-2.35-5.66L20 8.7"/><path d="M20 4v4.7h-4.7"/></svg>';
+    return button;
+  }
+
+  async function refreshCurrentPage() {
+    if (!state.ready || state.pageRefreshInProgress) return;
+    state.pageRefreshInProgress = true;
+    document.querySelectorAll("[data-page-refresh]").forEach((button) => {
+      button.disabled = true;
+      button.classList.add("is-refreshing");
+      button.setAttribute("aria-busy", "true");
+    });
+    try {
+      if (elements.dialog.open && state.activeDetailContext) {
+        const context = state.activeDetailContext;
+        if (["recommendations", "related", "bookshelf"].includes(context.collection)) {
+          await fetchRecommendationBookDetails(context);
+        } else {
+          await fetchGoogleBookDetails(context);
+        }
+      } else if (state.currentPage === "bookshelf") {
+        await syncRemoteBookshelf({ force: true });
+      } else if (state.currentPage === "recommendations") {
+        window.AnnieRecommendations?.refresh(elements.recommendations);
+      } else {
+        const query = (state.query || elements.input.value).trim();
+        if (query.length >= 2) {
+          await search(query, state.query === query ? state.page : 1);
+        } else {
+          const cacheKey = `${HOME_TRENDING_CACHE_VERSION}:${state.featuredGenre}`;
+          delete state.featuredCache[cacheKey];
+          await loadTrending(state.featuredGenre);
+        }
+      }
+    } finally {
+      state.pageRefreshInProgress = false;
+      document.querySelectorAll("[data-page-refresh]").forEach((button) => {
+        button.disabled = false;
+        button.classList.remove("is-refreshing");
+        button.removeAttribute("aria-busy");
+      });
+    }
+  }
+
   function navigateToSearch() {
+    cancelBookshelfSearch();
     if (state.currentPage !== "home") showHomePage({ restoreScroll: false, searchFocused: true });
     else {
       state.searchFocused = true;
@@ -284,6 +342,7 @@
   }
 
   function showRecommendationsPage() {
+    cancelBookshelfSearch();
     if (state.currentPage === "home") state.homeScrollY = window.scrollY;
     if (state.currentPage !== "recommendations") state.previousPage = state.currentPage;
     state.currentPage = "recommendations";
@@ -297,6 +356,7 @@
     if (!recommendationsBack) {
       recommendationsBack = node("div", "recommendations-back-row");
       recommendationsBack.append(makePageBackButton("previous page"));
+      recommendationsBack.append(makeRefreshButton());
     }
     elements.recommendations.prepend(recommendationsBack);
     elements.bookshelf.hidden = true;
@@ -310,6 +370,7 @@
   }
 
   function showBookshelfPage() {
+    cancelBookshelfSearch();
     if (state.currentPage === "home") state.homeScrollY = window.scrollY;
     if (state.currentPage !== "bookshelf") state.previousPage = state.currentPage;
     state.currentPage = "bookshelf";
@@ -346,6 +407,26 @@
     }
   }
 
+  async function refreshBookshelfView(button) {
+    if (button?.disabled) return;
+    if (button) {
+      button.disabled = true;
+      button.classList.add("is-refreshing");
+      button.setAttribute("aria-busy", "true");
+    }
+    try {
+      if (state.bookshelfSyncPromise) await state.bookshelfSyncPromise;
+      loadBookshelfCache();
+      renderBookshelf();
+    } finally {
+      if (button?.isConnected) {
+        button.disabled = false;
+        button.classList.remove("is-refreshing");
+        button.removeAttribute("aria-busy");
+      }
+    }
+  }
+
   function setBookshelfCacheUser(userId) {
     const nextKey = `annie-bookshelf-v1:${userId || "guest"}`;
     if (nextKey === BOOKSHELF_STORAGE_KEY) return;
@@ -370,52 +451,60 @@
   }
 
   async function syncRemoteBookshelf({ force = false } = {}) {
-    if (!state.bookshelfCloudEnabled || state.bookshelfLoading) return;
-    if (!force && state.bookshelfLoaded && Date.now() - state.bookshelfLastLoadedAt < 30_000) return;
+    if (!state.bookshelfCloudEnabled) return false;
+    if (!force && state.bookshelfLoaded && Date.now() - state.bookshelfLastLoadedAt < 30_000) return true;
+    if (state.bookshelfSyncPromise) return state.bookshelfSyncPromise;
     state.bookshelfLoading = true;
     state.bookshelfError = "";
     const revision = state.bookshelfRevision;
     if (!state.bookshelfLoaded && state.currentPage === "bookshelf") renderBookshelf();
-    try {
-      const response = await api("bookshelf");
-      let remoteBookshelf = response.data?.bookshelf || { saved: [], favorites: [] };
-      const hasRemoteBooks = (remoteBookshelf.saved?.length || 0) + (remoteBookshelf.favorites?.length || 0) > 0;
-      const localEntries = [
-        ...state.bookshelf.saved.map((book) => ({ collection: "saved", book, addedAt: book.addedAt })),
-        ...state.bookshelf.favorites.map((book) => ({ collection: "favorites", book, addedAt: book.addedAt })),
-      ];
-      if (!hasRemoteBooks && localEntries.length) {
-        const imported = await api("bookshelf", {
-          method: "POST",
-          body: JSON.stringify({ action: "import_if_empty", entries: localEntries }),
-        });
-        if (!imported.data?.imported) {
-          remoteBookshelf = (await api("bookshelf")).data?.bookshelf || { saved: [], favorites: [] };
-        } else {
-          remoteBookshelf = {
-            saved: localEntries.filter((entry) => entry.collection === "saved").map((entry) => entry.book),
-            favorites: localEntries.filter((entry) => entry.collection === "favorites").map((entry) => entry.book),
-          };
+    const syncPromise = (async () => {
+      try {
+        const response = await api("bookshelf");
+        let remoteBookshelf = response.data?.bookshelf || { saved: [], favorites: [] };
+        const hasRemoteBooks = (remoteBookshelf.saved?.length || 0) + (remoteBookshelf.favorites?.length || 0) > 0;
+        const localEntries = [
+          ...state.bookshelf.saved.map((book) => ({ collection: "saved", book, addedAt: book.addedAt })),
+          ...state.bookshelf.favorites.map((book) => ({ collection: "favorites", book, addedAt: book.addedAt })),
+        ];
+        if (!hasRemoteBooks && localEntries.length) {
+          const imported = await api("bookshelf", {
+            method: "POST",
+            body: JSON.stringify({ action: "import_if_empty", entries: localEntries }),
+          });
+          if (!imported.data?.imported) {
+            remoteBookshelf = (await api("bookshelf")).data?.bookshelf || { saved: [], favorites: [] };
+          } else {
+            remoteBookshelf = {
+              saved: localEntries.filter((entry) => entry.collection === "saved").map((entry) => entry.book),
+              favorites: localEntries.filter((entry) => entry.collection === "favorites").map((entry) => entry.book),
+            };
+          }
         }
+        if (revision === state.bookshelfRevision) {
+          state.bookshelf.saved = Array.isArray(remoteBookshelf.saved) ? remoteBookshelf.saved : [];
+          state.bookshelf.favorites = Array.isArray(remoteBookshelf.favorites) ? remoteBookshelf.favorites : [];
+        }
+        state.bookshelfLimit = Number(response.data?.limit) || 100;
+        state.bookshelfLoaded = true;
+        state.bookshelfLastLoadedAt = Date.now();
+        persistBookshelfCache();
+        return true;
+      } catch (error) {
+        state.bookshelfError = error.message === "rate_limited"
+          ? "Please wait a moment before refreshing your bookshelf."
+          : error.message === "bookshelf_full"
+            ? `This device has more than ${state.bookshelfLimit} saved books. Remove some, then reopen My Bookshelf to sync them.`
+            : "Couldn’t sync your bookshelf. Showing the latest copy saved on this device.";
+        return false;
+      } finally {
+        state.bookshelfLoading = false;
+        state.bookshelfSyncPromise = null;
+        if (state.currentPage === "bookshelf") renderBookshelf();
       }
-      if (revision === state.bookshelfRevision) {
-        state.bookshelf.saved = Array.isArray(remoteBookshelf.saved) ? remoteBookshelf.saved : [];
-        state.bookshelf.favorites = Array.isArray(remoteBookshelf.favorites) ? remoteBookshelf.favorites : [];
-      }
-      state.bookshelfLimit = Number(response.data?.limit) || 100;
-      state.bookshelfLoaded = true;
-      state.bookshelfLastLoadedAt = Date.now();
-      persistBookshelfCache();
-    } catch (error) {
-      state.bookshelfError = error.message === "rate_limited"
-        ? "Please wait a moment before refreshing your bookshelf."
-        : error.message === "bookshelf_full"
-          ? `This device has more than ${state.bookshelfLimit} saved books. Remove some, then reopen My Bookshelf to sync them.`
-          : "Couldn’t sync your bookshelf. Showing the latest copy saved on this device.";
-    } finally {
-      state.bookshelfLoading = false;
-      if (state.currentPage === "bookshelf") renderBookshelf();
-    }
+    })();
+    state.bookshelfSyncPromise = syncPromise;
+    return syncPromise;
   }
 
   async function sendBookshelfMutation(payload) {
@@ -499,17 +588,21 @@
 
   async function addToCollection(collection, book) {
     const cached = shelfBook(book);
+    if (state.bookshelfCloudEnabled && (!state.bookshelfLoaded || state.bookshelfSyncPromise)) {
+      const synced = await syncRemoteBookshelf();
+      if (!synced || !state.bookshelfLoaded) {
+        const message = "Couldn’t sync your bookshelf yet. Please check your connection and try again.";
+        if (typeof webApp?.showAlert === "function") webApp.showAlert(message);
+        else window.alert(message);
+        return;
+      }
+    }
     const collectionName = collection === "favorites" ? "your favourites" : "your bookshelf";
     const alreadyAdded = shelfContains(collection, cached.id);
     const otherCollection = collection === "favorites" ? "saved" : "favorites";
     const moving = !alreadyAdded && shelfContains(otherCollection, cached.id);
     const otherName = otherCollection === "saved" ? "My Books" : "Favourites";
     const targetName = collection === "favorites" ? "Favourites" : "My Books";
-    if (!alreadyAdded && state.bookshelfCloudEnabled && !state.bookshelfLoaded) {
-      if (typeof webApp?.showAlert === "function") webApp.showAlert("Your bookshelf is still syncing. Please wait before adding or moving a book.");
-      else window.alert("Your bookshelf is still syncing. Please wait before adding or moving a book.");
-      return;
-    }
     if (!alreadyAdded && !moving && state.bookshelf.saved.length + state.bookshelf.favorites.length >= state.bookshelfLimit) {
       const message = `Your bookshelf has reached its ${state.bookshelfLimit}-book limit. Remove a book before adding another.`;
       if (typeof webApp?.showAlert === "function") webApp.showAlert(message);
@@ -571,12 +664,33 @@
     const headingGroup = node("div", "library-title-group");
     headingGroup.append(makePageBackButton("previous page"), headingCopy);
     header.append(headingGroup);
+    const headerActions = node("div", "library-header-actions");
     const addButton = node("button", "bookshelf-add-button library-add-button");
     addButton.type = "button";
     addButton.setAttribute("aria-label", "Search and add a book");
     addButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Add books</span>';
     addButton.addEventListener("click", beginBookshelfSearch);
-    header.append(addButton);
+    headerActions.append(addButton);
+    const refreshButton = node("button", "page-refresh-button bookshelf-refresh-button");
+    refreshButton.type = "button";
+    refreshButton.setAttribute("aria-label", "Refresh bookshelf view");
+    refreshButton.title = "Refresh bookshelf view";
+    refreshButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 1-2.35-5.66L20 8.7"/><path d="M20 4v4.7h-4.7"/></svg>';
+    refreshButton.addEventListener("click", () => void refreshBookshelfView(refreshButton));
+    headerActions.append(refreshButton);
+    const syncButton = node("button", "library-sync-button");
+    syncButton.type = "button";
+    syncButton.setAttribute("aria-label", state.bookshelfLoading ? "Syncing Bookshelf" : "Sync Bookshelf");
+    syncButton.title = state.bookshelfLoading ? "Syncing Bookshelf" : "Sync Bookshelf";
+    syncButton.disabled = !state.bookshelfCloudEnabled || state.bookshelfLoading;
+    syncButton.setAttribute("aria-busy", String(state.bookshelfLoading));
+    syncButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.6 9a7 7 0 0 1 11.8-2L20 12M4 12l2.6 5a7 7 0 0 0 11.8-2"/></svg><span>Sync</span>';
+    syncButton.addEventListener("click", () => {
+      syncButton.disabled = true;
+      void syncRemoteBookshelf({ force: true });
+    });
+    headerActions.append(syncButton);
+    header.append(headerActions);
     root.append(header);
 
     const tabs = node("div", "bookshelf-tabs");
@@ -1617,6 +1731,7 @@
       state.bookshelfLimit = Number(response.bookshelf_limit) || 100;
       setBookshelfCacheUser(response.user.id);
       state.ready = true;
+      if (state.bookshelfCloudEnabled) void syncRemoteBookshelf();
       showStartupMessage("");
       elements.greeting.textContent = response.user.first_name
         ? `Hi, ${response.user.first_name}`
@@ -1663,6 +1778,7 @@
     const tab = event.target.closest("[data-app-tab]");
     if (!tab) return;
     if (tab.dataset.appTab === "discover") {
+      cancelBookshelfSearch();
       if (state.query || elements.input.value) {
         elements.input.value = "";
         resetResultsForInput("");
@@ -1676,6 +1792,9 @@
     } else if (tab.dataset.appTab === "bookshelf") {
       showBookshelfPage();
     }
+  });
+  document.addEventListener("click", (event) => {
+    if (event.target.closest("[data-page-refresh]")) void refreshCurrentPage();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !elements.quickMenuItems.hidden) {
