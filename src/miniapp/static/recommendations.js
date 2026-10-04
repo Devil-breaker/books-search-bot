@@ -213,6 +213,7 @@
           method: "POST",
           body: JSON.stringify({
             ...requestPreferences,
+            fallback_only: true,
             exclude_books: shownBooks.map((book) => ({ title: book.title, author: book.author })),
           }),
         });

@@ -51,6 +51,7 @@
     detailsController: null, detailsRequestId: 0, translationController: null,
     translationRequestId: 0, relatedController: null, relatedRequestId: 0,
     currentDetailBook: null, activeRelatedBooks: [], relatedLoading: false,
+    relatedFallbackLoaded: false,
     relatedMessage: "", detailLoadingMessage: "", visibleBooks: [], selectedIndex: null,
     debounceTimer: null, activeDetailContext: null, featuredQuery: "",
     featuredBooks: [], featuredGenre: "All", featuredRequestId: 0, featuredCache: {},
@@ -84,7 +85,7 @@
   let BOOKSHELF_STORAGE_KEY = `annie-bookshelf-v1:${webApp?.initDataUnsafe?.user?.id || "guest"}`;
   const HOME_SHELF_SIZE = 10;
   const HOME_TRENDING_CACHE_MS = 60 * 60 * 1000;
-  const HOME_TRENDING_CACHE_VERSION = "v4";
+  const HOME_TRENDING_CACHE_VERSION = "v5";
   const THEME_COLORS = { purple: "#111c1b", light: "#e4eee8", amoled: "#000000" };
 
   function applyTheme(theme, { persist = true } = {}) {
@@ -1223,6 +1224,68 @@
     container.append(item);
   }
 
+  function appendSeriesContext(container, book) {
+    const context = book.hardcover_series_context && typeof book.hardcover_series_context === "object"
+      ? book.hardcover_series_context : {};
+    const seriesName = String(context.name || book.hardcover_series_name || "").trim();
+    if (!seriesName) return;
+    const position = Number(book.hardcover_series_position || 0);
+    const books = Array.isArray(context.books) ? context.books : [];
+    const collections = Array.isArray(context.collections) ? context.collections : [];
+    const primaryCount = Number(books.length || context.primary_books_count || context.books_count || 0);
+    const section = node("section", "series-context");
+    const heading = node("div", "series-context-heading");
+    heading.append(node("h3", "series-context-title", "Series"));
+    const badges = node("div", "series-context-badges");
+    if (context.featured) badges.append(node("span", "series-context-badge is-featured", "Featured Series"));
+    if (primaryCount > 0) badges.append(node("span", "series-context-badge", `${primaryCount} primary books`));
+    heading.append(badges);
+    section.append(heading);
+    if (Number.isFinite(position) && position > 0) {
+      section.append(node("p", "series-context-position", `#${position} in ${seriesName}`));
+    }
+    const renderSeriesShelf = (items, label, className) => {
+      if (!items.length) return;
+      const shelfSection = node("div", "series-context-shelf-section");
+      if (label) shelfSection.append(node("h4", "series-context-shelf-title", label));
+      const shelf = node("div", `series-context-shelf ${className}`);
+      for (const member of items) {
+        if (!member || !member.title) continue;
+        const card = node("button", "series-context-book");
+        card.type = "button";
+        card.setAttribute("aria-label", `View details for ${member.title}`);
+        const coverUrl = safeHttpUrl(member.cover_url);
+        if (coverUrl) {
+          const cover = node("img", "series-context-cover");
+          cover.src = coverUrl;
+          cover.alt = `${member.title} cover`;
+          cover.loading = "lazy";
+          card.append(cover);
+        } else {
+          card.append(node("span", "series-context-cover-placeholder", "▤"));
+        }
+        const bookPosition = Number(member.position);
+        if (Number.isFinite(bookPosition) && bookPosition > 0) {
+          card.append(node("span", "series-context-book-position", `#${bookPosition}`));
+        }
+        card.append(node("span", "series-context-book-title", member.title));
+        if (member.author && member.author !== "Unknown author") {
+          card.append(node("span", "series-context-book-author", member.author));
+        }
+        card.addEventListener("click", () => openDetails(member, {
+          collection: "related",
+          book: { ...member, source: "hardcover" },
+        }));
+        shelf.append(card);
+      }
+      if (shelf.childElementCount) shelfSection.append(shelf);
+      section.append(shelfSection);
+    };
+    renderSeriesShelf(books.slice(0, 20), "", "");
+    renderSeriesShelf(collections.slice(0, 8), "Collections", "is-collections");
+    container.append(section);
+  }
+
   function formatLanguage(value) {
     const language = String(value || "").trim();
     if (!language) return "";
@@ -1232,6 +1295,53 @@
     } catch (_) {
       return language;
     }
+  }
+
+  function appendHardcoverTagGroups(container, book) {
+    const groups = [
+      ["Moods", book.hardcover_moods],
+      ["Content warnings", book.hardcover_content_warnings],
+    ].filter(([, values]) => Array.isArray(values) && values.length);
+    if (!groups.length) return;
+    const section = node("section", "hardcover-tag-groups");
+    for (const [label, values] of groups) {
+      const group = node("div", "hardcover-tag-group");
+      const heading = node("div", "hardcover-tag-heading");
+      heading.append(node("h3", "hardcover-tag-title", label));
+      const isWarnings = label === "Content warnings";
+      const isMoods = label === "Moods";
+      let tags = null;
+      if (isMoods) {
+        const toggle = node("button", "genre-toggle hardcover-moods-toggle", book.show_hardcover_moods ? "Show less" : "Show all");
+        toggle.type = "button";
+        toggle.setAttribute("aria-expanded", book.show_hardcover_moods ? "true" : "false");
+        toggle.addEventListener("click", () => {
+          book.show_hardcover_moods = !book.show_hardcover_moods;
+          tags.classList.toggle("is-expanded", book.show_hardcover_moods);
+          toggle.textContent = book.show_hardcover_moods ? "Show less" : "Show all";
+          toggle.setAttribute("aria-expanded", book.show_hardcover_moods ? "true" : "false");
+        });
+        heading.append(toggle);
+      } else if (isWarnings) {
+        const toggle = node("button", "hardcover-warning-toggle", book.show_hardcover_warnings ? "Hide" : "Show");
+        toggle.type = "button";
+        toggle.setAttribute("aria-expanded", book.show_hardcover_warnings ? "true" : "false");
+        toggle.addEventListener("click", () => {
+          book.show_hardcover_warnings = !book.show_hardcover_warnings;
+          tags.hidden = !book.show_hardcover_warnings;
+          toggle.textContent = book.show_hardcover_warnings ? "Hide" : "Show";
+          toggle.setAttribute("aria-expanded", book.show_hardcover_warnings ? "true" : "false");
+        });
+        heading.append(toggle);
+      }
+      group.append(heading);
+      tags = node("div", `hardcover-tags${isMoods ? " moods-collapsed" : ""}${isWarnings ? " warning-tags" : ""}${isMoods && book.show_hardcover_moods ? " is-expanded" : ""}`);
+      tags.hidden = isWarnings && !book.show_hardcover_warnings;
+      for (const value of values.slice(0, 30)) tags.append(node("span", "hardcover-tag", String(value)));
+      group.append(tags);
+      section.append(group);
+    }
+    container.append(section);
   }
 
   function renderBookDetails(book, loadingMessage = "", context = state.activeDetailContext) {
@@ -1275,14 +1385,22 @@
     if (loadingMessage) hero.append(renderBookLoader(loadingMessage, "detail-loader"));
     elements.detail.append(hero);
 
+    console.info("[miniapp-series] detail render", {
+      title: book.title || "",
+      hardcoverId: book.hardcover_id || 0,
+      seriesName: book.hardcover_series_name || "",
+      seriesPosition: book.hardcover_series_position || 0,
+    });
     const metadata = node("div", "metadata");
-    addMetadata(metadata, "Genres", Array.isArray(book.categories) ? book.categories.join(", ") : "", { collapsible: true });
+    addMetadata(metadata, "Genres", Array.isArray(book.hardcover_genres) ? book.hardcover_genres.join(", ") : "", { collapsible: true });
     addMetadata(metadata, "Published", book.published_date);
     addMetadata(metadata, "Pages", book.page_count);
+    addMetadata(metadata, "Readers", Number(book.hardcover_reader_count) > 0 ? Number(book.hardcover_reader_count).toLocaleString() : "");
     addMetadata(metadata, "Language", book.language);
     addMetadata(metadata, "ISBN", book.isbn);
     addMetadata(metadata, "Source", formatMetadataSource(book.metadata_source || book.source));
     if (metadata.childElementCount) elements.detail.append(metadata);
+    appendHardcoverTagGroups(elements.detail, book);
 
     const needsTranslation = book.description_needs_translation || book.title_needs_translation;
     if (book.description) {
@@ -1327,6 +1445,7 @@
       translationActions.append(button, translationStatus);
       elements.detail.append(translationActions);
     }
+    appendSeriesContext(elements.detail, book);
     const relatedBooks = state.activeDetailContext === context && state.activeRelatedBooks.length
       ? state.activeRelatedBooks
       : (Array.isArray(book.related_books) ? book.related_books : []);
@@ -1350,6 +1469,16 @@
           shelf.append(relatedCard);
         }
         relatedSection.append(addDesktopScrollControls(shelf, "More Like This"));
+        if (!state.relatedFallbackLoaded) {
+          const moreRelated = node("button", "recommendation-load-more related-more-button", "Find more suggestions");
+          moreRelated.type = "button";
+          moreRelated.addEventListener("click", () => {
+            moreRelated.disabled = true;
+            moreRelated.textContent = "Looking for more…";
+            void fetchRelatedBooks(context, book, true);
+          });
+          relatedSection.append(moreRelated);
+        }
       } else {
         relatedSection.append(state.relatedLoading
           ? renderBookLoader("Finding books like this", "related-loader")
@@ -1415,12 +1544,16 @@
     state.relatedController = null;
     state.currentDetailBook = book;
     state.activeRelatedBooks = [];
+    state.relatedFallbackLoaded = false;
     state.relatedLoading = Boolean(context);
     state.relatedMessage = "";
     state.detailLoadingMessage = ["recommendations", "related"].includes(context?.collection)
       ? "Loading complete book details…"
       : context?.collection === "bookshelf" && !book.details_checked && (!book.description || !book.isbn)
         ? "Loading complete book details…" : "";
+    if (!state.detailLoadingMessage && context && Number(book.hardcover_id) > 0) {
+      state.detailLoadingMessage = "Loading book details…";
+    }
     state.translationRequestId += 1;
     state.translationController?.abort();
     state.translationController = null;
@@ -1533,6 +1666,11 @@
         signal: controller.signal,
       });
       if (requestId !== state.detailsRequestId || state.activeDetailContext !== context || !elements.dialog.open) return;
+      console.info("[miniapp-series] details response received", {
+        title: response.data.book?.title || "",
+        seriesName: response.data.book?.hardcover_series_name || "",
+        seriesPosition: response.data.book?.hardcover_series_position || 0,
+      });
       if (context.collection === "featured" || context.collection === "more") {
         state.featuredBooks[context.absoluteIndex] = response.data.book;
       } else if (context.collection !== "related") state.visibleBooks[index] = response.data.book;
@@ -1573,9 +1711,9 @@
       if (requestId !== state.detailsRequestId || state.activeDetailContext !== context || !elements.dialog.open) return;
       const enriched = response.data.book || context.book;
       if (context.collection === "bookshelf") enriched.details_checked = true;
-      for (const field of ["cover_url", "rating", "rating_count", "description", "categories", "isbn", "page_count", "published_date", "language", "info_link"]) {
+      for (const field of ["cover_url", "rating", "rating_count", "description", "categories", "isbn", "page_count", "published_date", "language", "info_link", "hardcover_genres", "hardcover_moods", "hardcover_content_warnings", "hardcover_reader_count", "hardcover_series_name", "hardcover_series_position"]) {
         const value = enriched[field];
-        if ((value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) && context.book[field] !== undefined) {
+        if ((value === undefined || value === null || value === "" || value === 0 || (Array.isArray(value) && !value.length)) && context.book[field] !== undefined) {
           enriched[field] = context.book[field];
         }
       }
@@ -1595,7 +1733,20 @@
     }
   }
 
-  async function fetchRelatedBooks(context, selectedBook = state.currentDetailBook) {
+  function mergeRelatedBookLists(primary, additional) {
+    const books = [];
+    const seen = new Set();
+    for (const book of [...primary, ...additional]) {
+      const key = `${String(book?.title || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()}|${String(book?.author || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()}`;
+      if (!key || key === "|") continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      books.push(book);
+    }
+    return books;
+  }
+
+  async function fetchRelatedBooks(context, selectedBook = state.currentDetailBook, includeFallback = false) {
     const requestId = ++state.relatedRequestId;
     const controller = new AbortController();
     state.relatedController?.abort();
@@ -1610,12 +1761,18 @@
             author: selectedBook.author,
             categories: selectedBook.categories,
             isbn: selectedBook.isbn,
+            hardcover_id: selectedBook.hardcover_id,
           },
+          include_fallback: includeFallback,
         }),
         signal: controller.signal,
       });
       if (requestId !== state.relatedRequestId || state.activeDetailContext !== context || !elements.dialog.open) return;
-      state.activeRelatedBooks = Array.isArray(response.data.books) ? response.data.books : [];
+      const fetchedBooks = Array.isArray(response.data.books) ? response.data.books : [];
+      state.activeRelatedBooks = includeFallback
+        ? mergeRelatedBookLists(state.activeRelatedBooks, fetchedBooks)
+        : fetchedBooks;
+      if (includeFallback) state.relatedFallbackLoaded = true;
       state.relatedLoading = false;
       state.relatedMessage = "";
       if (state.currentDetailBook) {
@@ -1869,6 +2026,7 @@
     state.relatedMessage = "";
     state.currentDetailBook = null;
     state.activeRelatedBooks = [];
+    state.relatedFallbackLoaded = false;
     state.activeDetailContext = null;
   });
   elements.dialog.addEventListener("click", (event) => {

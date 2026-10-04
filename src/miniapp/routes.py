@@ -333,6 +333,10 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
             current_app.logger.exception("Mini App book details lookup failed")
             return jsonify({"success": False, "error": "details_failed"}), 502
         if result is None:
+            current_app.logger.warning(
+                "[miniapp-details] search_expired user=%s query=%r page=%s index=%s service_id=%s",
+                user["id"], query.strip(), page, index, id(service),
+            )
             return jsonify({"success": False, "error": "search_expired"}), 404
         return jsonify({"success": True, "data": result})
 
@@ -436,6 +440,7 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
         author = raw_book.get("author", "")
         categories = raw_book.get("categories", [])
         isbn = raw_book.get("isbn", "")
+        hardcover_id = raw_book.get("hardcover_id", 0)
         if not isinstance(title, str) or not title.strip() or len(title.strip()) > 250:
             return jsonify({"success": False, "error": "invalid_book"}), 400
         if not isinstance(author, str) or len(author) > 250:
@@ -455,13 +460,21 @@ def create_miniapp_blueprint(runtime: dict) -> Blueprint:
         categories = cleaned_categories
         if not isinstance(isbn, str):
             isbn = ""
-        selected = {"title": title.strip(), "author": author.strip(), "categories": categories, "isbn": isbn[:30]}
+        try:
+            hardcover_id = int(hardcover_id)
+        except (TypeError, ValueError, OverflowError):
+            hardcover_id = 0
+        if hardcover_id < 0:
+            hardcover_id = 0
+        include_fallback = payload.get("include_fallback") is True
+        selected = {"title": title.strip(), "author": author.strip(), "categories": categories,
+                    "isbn": isbn[:30], "hardcover_id": hardcover_id}
 
         service = get_service()
         if service is None:
             return jsonify({"success": False, "error": "service_unavailable"}), 503
         try:
-            result = asyncio.run(service.related_books_for_book(selected))
+            result = asyncio.run(service.related_books_for_book(selected, include_fallback=include_fallback))
         except Exception:
             current_app.logger.exception("Mini App related-book lookup failed")
             return jsonify({"success": False, "error": "related_failed"}), 502

@@ -45,6 +45,29 @@ MOOD_GUIDES = {
     "Mysterious": ("mystery detective fiction", ("mystery", "detective fiction", "crime")),
 }
 
+HARDCOVER_MOOD_TAGS = {
+    "Joyful": ("Lighthearted", "Hopeful"),
+    "Playful": ("Funny", "Lighthearted"),
+    "Hopeful": ("Hopeful", "Uplifting"),
+    "Cozy": ("Cozy",),
+    "Curious": ("Curious", "Mysterious"),
+    "Adventurous": ("Adventurous", "Fast-paced"),
+    "Thoughtful": ("Reflective",),
+    "Spiritual": ("Reflective", "Hopeful"),
+    "A little thrill": ("Dark", "Fast-paced", "Mysterious"),
+    "Ready to cry": ("Emotional", "Sad"),
+    "Calm": ("Lighthearted", "Reflective"),
+    "Inspired": ("Hopeful", "Uplifting"),
+    "Nostalgic": ("Nostalgic", "Reflective"),
+    "Romantic": ("Romantic", "Hopeful"),
+    "Courageous": ("Hopeful", "Emotional"),
+    "Reflective": ("Reflective",),
+    "Surprised": ("Mysterious", "Fast-paced"),
+    "Escapist": ("Adventurous", "Fast-paced"),
+    "Motivated": ("Hopeful", "Inspirational"),
+    "Mysterious": ("Mysterious", "Dark"),
+}
+
 GENRE_ALIASES = {
     "sci fi": ("science fiction", "sci fi", "science fiction fantasy"),
     "classics": ("classic", "classics", "classic literature"),
@@ -147,6 +170,12 @@ class BookRecommendationEngine:
                         "title": title.strip()[:250],
                         "author": author.strip()[:250] if isinstance(author, str) else "",
                     })
+        fallback_only = isinstance(raw_preferences, dict) and raw_preferences.get("fallback_only") is True
+        if not fallback_only:
+            hardcover_books = await self._fetch_hardcover_similar(preferences, excluded_books)
+            if hardcover_books:
+                logger.info("[miniapp] Hardcover primary recommendations results=%d", len(hardcover_books))
+                return {"books": hardcover_books, "cached": False, "sources_used": ["hardcover"]}
         # Big Book API's terms require prior written permission for caching its
         # user-requested results, so bypass the aggregate response cache while
         # that provider is enabled.
@@ -183,6 +212,119 @@ class BookRecommendationEngine:
         )
         sources_used = sorted({str(book.get("_provider") or "") for book in candidates if book.get("_provider")})
         return {"books": ranked, "cached": False, "sources_used": sources_used}
+
+    async def _fetch_hardcover_similar(self, preferences: dict, excluded_books: list[dict]) -> list[dict]:
+        """Return Hardcover's pre-ranked similar lists before invoking fallback providers."""
+        from src.aggregator import MultiSourceBookAggregator
+
+        seed_values = list(dict.fromkeys(preferences["liked"] + preferences["read"]))[:3]
+        async def similar_for_seed(seed: str) -> list[dict]:
+            try:
+                matches = await asyncio.to_thread(MultiSourceBookAggregator.search_hardcover, seed, 10)
+                if not matches:
+                    return []
+                seed_key = _canonical_title(seed)
+                exact = next((book for book in matches if
+                              _canonical_title(book.get("title")) == seed_key), None)
+                selected = exact or matches[0]
+                hardcover_id = selected.get("hardcover_id")
+                if not str(hardcover_id or "").isdigit() or int(hardcover_id) <= 0:
+                    return []
+                similar = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover_similar, int(hardcover_id), RESULT_LIMIT,
+                )
+                return similar if isinstance(similar, list) else []
+            except Exception as exc:
+                logger.info("[miniapp] Hardcover similar lookup failed error=%s", type(exc).__name__)
+                return []
+
+        batches = await asyncio.gather(*(similar_for_seed(seed) for seed in seed_values)) if seed_values else []
+        seed_titles = {_canonical_title(seed) for seed in seed_values}
+        candidates = []
+        seen = set()
+        for batch in batches:
+            for book in batch:
+                if not isinstance(book, dict):
+                    continue
+                title = str(book.get("title") or "").strip()
+                author = str(book.get("author") or "").strip()
+                key = (_canonical_title(title), _normalize(author))
+                if not title or not author or key[0] in seed_titles or key in seen:
+                    continue
+                book_categories = self._categories(book)
+                if preferences["genres"] and not any(
+                    self._tag_matches(category, selected_genre)
+                    for category in book_categories for selected_genre in preferences["genres"]
+                ):
+                    continue
+                book_moods = book.get("moods") or []
+                if isinstance(book_moods, str):
+                    book_moods = [book_moods]
+                expected_moods = [tag for mood in preferences["moods"]
+                                  for tag in HARDCOVER_MOOD_TAGS.get(mood, (mood,))]
+                if expected_moods and not any(
+                    self._tag_matches(tag, expected)
+                    for tag in book_moods if isinstance(tag, str) for expected in expected_moods
+                ):
+                    continue
+                if any(_canonical_title(title) == _canonical_title(item.get("title"))
+                       and (not item.get("author") or _normalize(author) == _normalize(item.get("author")))
+                       for item in excluded_books):
+                    continue
+                seen.add(key)
+                book["_provider"] = "hardcover"
+                book["source"] = "hardcover"
+                book["recommendation_reason"] = "Similar to your book picks"
+                candidates.append(book)
+                if len(candidates) >= RESULT_LIMIT:
+                    return candidates
+        if candidates:
+            return candidates
+
+        # With only genres or moods, use Hardcover's own catalog search as the
+        # primary shelf. The existing multi-provider ranker remains available
+        # when Hardcover has no usable matches or when the user asks for more.
+        genre_values = []
+        for genre in preferences["genres"]:
+            genre_values.extend(GENRE_ALIASES.get(_normalize(genre), (genre,)))
+        genre_values = list(dict.fromkeys(genre_values))[:5]
+        mood_values = list(dict.fromkeys(
+            tag for mood in preferences["moods"] for tag in HARDCOVER_MOOD_TAGS.get(mood, (mood,))
+        ))[:6]
+        if not genre_values and not mood_values:
+            return []
+
+        if genre_values and mood_values:
+            tag_pairs = [(genre, mood) for genre in genre_values for mood in mood_values][:6]
+        elif genre_values:
+            tag_pairs = [(genre, "") for genre in genre_values[:6]]
+        else:
+            tag_pairs = [("", mood) for mood in mood_values[:6]]
+
+        async def search_tags(genre: str, mood: str) -> list[dict]:
+            try:
+                batch = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover_by_tags, genre, mood, 30,
+                )
+            except Exception as exc:
+                logger.info("[miniapp] Hardcover tag recommendation failed error=%s", type(exc).__name__)
+                return []
+            output = []
+            for item in batch if isinstance(batch, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                candidate = dict(item)
+                candidate.update(
+                    _provider="hardcover",
+                    _match_kind="genre" if genre else "mood",
+                    _match_label=genre or mood,
+                )
+                output.append(candidate)
+            return output
+
+        term_batches = await asyncio.gather(*(search_tags(*pair) for pair in tag_pairs))
+        hardcover_candidates = [book for batch in term_batches for book in batch]
+        return self._rank(hardcover_candidates, preferences, excluded_books=excluded_books)
 
     async def _fetch_candidates(self, preferences: dict) -> list[dict]:
         from src.aggregator import MultiSourceBookAggregator
@@ -717,6 +859,7 @@ class BookRecommendationEngine:
         result = []
         for book in selected[:RESULT_LIMIT]:
             public = {
+                "hardcover_id": int(book.get("hardcover_id") or 0) if str(book.get("hardcover_id") or "").isdigit() else 0,
                 "title": str(book.get("title") or ""),
                 "author": str(book.get("author") or ""),
                 "cover_url": str(book.get("cover_url") or ""),

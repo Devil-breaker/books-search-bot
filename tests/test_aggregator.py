@@ -67,6 +67,33 @@ class TestAggregatorNetworkPaths(unittest.TestCase):
 
     @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-token"})
     @patch("src.aggregator.get_http_session")
+    def test_hardcover_details_extract_reader_series_and_tag_metadata(self, mock_session):
+        details = MagicMock(status_code=200)
+        details.json.return_value = {"data": {"books": [{
+            "id": 123, "users_read_count": 4567,
+            "cached_tags": {
+                "Genre": ["Fantasy", {"name": "Adventure"}, "fantasy"],
+                "Mood": ["Hopeful"],
+                "ContentWarning": ["Violence"],
+            },
+        }]}}
+        series = MagicMock(status_code=200)
+        series.json.return_value = {"data": {"books": [{
+            "book_series": [{"position": 1.5, "series": {"name": "Example Series"}}],
+        }]}}
+        mock_session.return_value.post.side_effect = [details, series]
+
+        metadata = MultiSourceBookAggregator.get_hardcover_detail_metadata(123)
+
+        self.assertEqual(metadata["hardcover_genres"], ["Fantasy", "Adventure"])
+        self.assertEqual(metadata["hardcover_moods"], ["Hopeful"])
+        self.assertEqual(metadata["hardcover_content_warnings"], ["Violence"])
+        self.assertEqual(metadata["hardcover_reader_count"], 4567)
+        self.assertEqual(metadata["hardcover_series_name"], "Example Series")
+        self.assertEqual(metadata["hardcover_series_position"], 1.5)
+
+    @patch.dict(os.environ, {"HARDCOVER_API_KEY": "test-token"})
+    @patch("src.aggregator.get_http_session")
     def test_hardcover_trending_uses_rolling_window_and_preserves_rank(self, mock_session):
         trending = MagicMock(status_code=200)
         trending.json.return_value = {"data": {"books_trending": {"ids": [2, 1]}}}

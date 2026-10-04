@@ -21,8 +21,9 @@ class MiniAppSearchService:
     TRENDING_CACHE_TTL_SECONDS = 3600
     TRENDING_LIMIT = 20
     TRENDING_TARGET_SIZE = 10
-    TRENDING_CACHE_VERSION = "v4"
+    TRENDING_CACHE_VERSION = "v5"
     RELATED_LIMIT = 10
+    RELATED_MORE_LIMIT = 20
     TRENDING_GENRES = ("All", "Fantasy", "Romance", "Mystery", "Thriller", "Sci-Fi", "Horror", "Classics", "Biography")
     TRENDING_SEARCH_TERMS = {
         "All": ("*",),
@@ -78,7 +79,9 @@ class MiniAppSearchService:
         if genre not in self.TRENDING_GENRES:
             raise ValueError("invalid_genre")
 
-        cache_key = f"topbooks:{self.TRENDING_CACHE_VERSION}:{genre}"
+        # Details requests normalize search-cache keys with casefold(), so
+        # publish the trending key in that same canonical form.
+        cache_key = f"topbooks:{self.TRENDING_CACHE_VERSION}:{genre}".casefold()
         now = time.time()
         with self._cache_lock:
             cached = self._trending_cache.get(cache_key)
@@ -146,6 +149,13 @@ class MiniAppSearchService:
         elif books:
             self._set_cached(cache_key, books)
 
+        with self._cache_lock:
+            detail_cache_entry = self._cache.get(cache_key)
+            detail_cache_count = len(detail_cache_entry[1]) if detail_cache_entry else 0
+        logger.info(
+            "[miniapp-details] trending_cache_seed service_id=%s key=%r cached_books=%s",
+            id(self), cache_key, detail_cache_count,
+        )
         return {
             "genre": genre,
             "query": cache_key,
@@ -228,14 +238,31 @@ class MiniAppSearchService:
     async def book_details(self, query: str, page: int, index: int) -> dict | None:
         """Add Google Books metadata only after a user selects a suggestion."""
         cache_key = query.casefold().strip()
+        with self._cache_lock:
+            cache_entry = self._cache.get(cache_key)
+            cache_age = round(time.time() - cache_entry[0], 3) if cache_entry else None
+            cache_entries = len(self._cache)
         books = self._get_cached(cache_key)
         if books is None:
+            logger.warning(
+                "[miniapp-details] cache_miss service_id=%s key=%r prior_age_seconds=%s cache_entries=%s",
+                id(self), cache_key[:100], cache_age, cache_entries,
+            )
             return None
         book_index = (page - 1) * self.PAGE_SIZE + index
         if not 0 <= index < self.PAGE_SIZE or book_index >= len(books):
+            logger.warning(
+                "[miniapp-details] invalid_cached_selection service_id=%s key=%r page=%s index=%s computed_index=%s cached_books=%s",
+                id(self), cache_key[:100], page, index, book_index, len(books),
+            )
             return None
 
         book = books[book_index]
+        logger.info(
+            "[miniapp-details] cache_hit service_id=%s key=%r age_seconds=%s page=%s index=%s cached_books=%s title=%r hardcover_id=%s",
+            id(self), cache_key[:100], cache_age, page, index, len(books),
+            book.get("title", ""), book.get("hardcover_id", 0),
+        )
         enriched = book.get("source") == "google_books"
         if not enriched:
             from src.aggregator import MultiSourceBookAggregator
@@ -272,6 +299,9 @@ class MiniAppSearchService:
                 enriched = True
                 self._set_cached(cache_key, books)
 
+        await self._add_hardcover_detail_metadata(book)
+        self._set_cached(cache_key, books)
+
         description = str(book.get("description") or "")
         public_book = self._public_book(book)
         public_book["description_needs_translation"] = bool(
@@ -300,6 +330,7 @@ class MiniAppSearchService:
         except (TypeError, ValueError):
             page_count = 0
         book = {
+            "hardcover_id": int(raw_book.get("hardcover_id") or 0) if str(raw_book.get("hardcover_id") or "").isdigit() else 0,
             "title": title,
             "author": author or "Unknown author",
             "cover_url": str(raw_book.get("cover_url") or "")[:2000],
@@ -313,6 +344,13 @@ class MiniAppSearchService:
             "language": str(raw_book.get("language") or "")[:40],
             "info_link": str(raw_book.get("info_link") or "")[:2000],
             "source": str(raw_book.get("source") or "")[:80],
+            "hardcover_genres": self._clean_categories(raw_book.get("hardcover_genres"))[:30],
+            "hardcover_moods": self._clean_categories(raw_book.get("hardcover_moods") or raw_book.get("moods"))[:30],
+            "hardcover_content_warnings": self._clean_categories(raw_book.get("hardcover_content_warnings"))[:30],
+            "hardcover_reader_count": raw_book.get("hardcover_reader_count") or raw_book.get("users_read_count") or 0,
+            "hardcover_series_name": str(raw_book.get("hardcover_series_name") or "")[:250],
+            "hardcover_series_position": raw_book.get("hardcover_series_position") or 0,
+            "hardcover_series_context": raw_book.get("hardcover_series_context") if isinstance(raw_book.get("hardcover_series_context"), dict) else {},
         }
         enriched = False
         google_already_supplied = book["source"].casefold().replace(" ", "_") == "google_books"
@@ -342,6 +380,8 @@ class MiniAppSearchService:
                     enriched = True
             except Exception:
                 logger.exception("[miniapp] recommendation Google Books detail lookup failed")
+
+        await self._add_hardcover_detail_metadata(book)
 
         description = str(book.get("description") or "")
         public_book = self._public_book(book)
@@ -373,6 +413,59 @@ class MiniAppSearchService:
             "translated": description_translated,
             "any_translated": title_translated or description_translated,
         }
+
+    @staticmethod
+    async def _add_hardcover_detail_metadata(book: dict) -> None:
+        """Attach Hardcover-only fields when an exact catalog match is available."""
+        try:
+            from src.aggregator import MultiSourceBookAggregator
+
+            hardcover_id = book.get("hardcover_id")
+            had_hardcover_id = str(hardcover_id or "").isdigit() and int(hardcover_id) > 0
+            if not str(hardcover_id or "").isdigit() or int(hardcover_id) <= 0:
+                logger.info(
+                    "[miniapp-series] resolving Hardcover id for title=%r author=%r",
+                    book.get("title", ""), book.get("author", ""),
+                )
+                candidates = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover,
+                    f'{book.get("title", "")} {book.get("author", "")}'.strip(), 10,
+                )
+                exact = MultiSourceBookAggregator._find_matching_book_strict(
+                    book.get("title", ""), book.get("author", ""), candidates or []
+                )
+                hardcover_id = (exact or {}).get("hardcover_id")
+            if not str(hardcover_id or "").isdigit() or int(hardcover_id) <= 0:
+                logger.warning(
+                    "[miniapp-series] no exact Hardcover match for title=%r author=%r candidates=%s",
+                    book.get("title", ""), book.get("author", ""), len(candidates or []) if not had_hardcover_id else 0,
+                )
+                return
+            logger.info(
+                "[miniapp-series] fetching detail metadata title=%r hardcover_id=%s id_source=%s",
+                book.get("title", ""), int(hardcover_id), "book" if had_hardcover_id else "exact-title-author-match",
+            )
+            metadata = await asyncio.to_thread(
+                MultiSourceBookAggregator.get_hardcover_detail_metadata,
+                int(hardcover_id),
+            )
+            if metadata:
+                for field, value in metadata.items():
+                    if value not in (None, "", [], 0) or field not in book:
+                        book[field] = value
+                logger.info(
+                    "[miniapp-series] enriched title=%r hardcover_id=%s series=%r position=%s",
+                    book.get("title", ""), int(hardcover_id),
+                    book.get("hardcover_series_name") or None,
+                    book.get("hardcover_series_position") or 0,
+                )
+            else:
+                logger.warning(
+                    "[miniapp-series] Hardcover returned no detail metadata title=%r hardcover_id=%s",
+                    book.get("title", ""), int(hardcover_id),
+                )
+        except Exception:
+            logger.exception("[miniapp] Hardcover detail metadata lookup failed")
 
     async def translate_description(self, query: str, page: int, index: int) -> dict | None:
         """Translate one selected description only after an explicit user action."""
@@ -443,15 +536,42 @@ class MiniAppSearchService:
         provider_books = await self.related_books_for_book(selected)
         return self._merge_related_books(related, provider_books)[: self.RELATED_LIMIT]
 
-    async def related_books_for_book(self, selected: dict) -> list[dict]:
+    async def related_books_for_book(self, selected: dict, *, include_fallback: bool = False) -> list[dict]:
         """Fetch related books from selected-book metadata, independent of search cache."""
         if not isinstance(selected, dict) or not str(selected.get("title") or "").strip():
             return []
-        selected_key = "genre-v2|" + "|".join((
+        selected_key = "genre-v3|" + "|".join((
             str(selected.get("isbn") or ""),
+            str(selected.get("hardcover_id") or ""),
             re.sub(r"[^a-z0-9]+", " ", str(selected.get("title") or "").casefold()).strip(),
             re.sub(r"[^a-z0-9]+", " ", str(selected.get("author") or "").casefold()).strip(),
         ))
+        hardcover_books = []
+        try:
+            from src.aggregator import MultiSourceBookAggregator
+
+            hardcover_id = selected.get("hardcover_id")
+            if not str(hardcover_id or "").isdigit() or int(hardcover_id) <= 0:
+                lookup = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover,
+                    str(selected.get("title") or "")[:180], 10,
+                )
+                if lookup:
+                    match = MultiSourceBookAggregator._find_matching_book_strict(
+                        selected.get("title", ""), selected.get("author", ""), lookup,
+                    )
+                    if match:
+                        hardcover_id = match.get("hardcover_id")
+            if str(hardcover_id or "").isdigit() and int(hardcover_id) > 0:
+                hardcover_books = await asyncio.to_thread(
+                    MultiSourceBookAggregator.search_hardcover_similar, int(hardcover_id), self.RELATED_LIMIT,
+                )
+        except Exception:
+            logger.exception("[miniapp] Hardcover similar-book lookup failed")
+        hardcover_books = self._merge_related_books([], hardcover_books or [])[: self.RELATED_LIMIT]
+        if hardcover_books and not include_fallback:
+            return hardcover_books
+
         now = time.time()
         with self._cache_lock:
             cached = self._related_cache.get(selected_key)
@@ -570,7 +690,8 @@ class MiniAppSearchService:
                 logger.exception("[miniapp] related-book fallback failed")
                 provider_books = []
 
-        return self._merge_related_books([], provider_books or [])[: self.RELATED_LIMIT]
+        result_limit = self.RELATED_MORE_LIMIT if include_fallback else self.RELATED_LIMIT
+        return self._merge_related_books(hardcover_books, provider_books or [])[:result_limit]
 
     @staticmethod
     def _merge_related_books(*groups: list[dict]) -> list[dict]:
@@ -732,6 +853,7 @@ class MiniAppSearchService:
                     if hardcover_index is not None:
                         used_hardcover.add(hardcover_index)
                     self.result_processor._merge_duplicate_book_data(item, hardcover_match)
+                    item["hardcover_id"] = hardcover_match.get("hardcover_id", 0)
                     try:
                         hardcover_rating = float(hardcover_match.get("rating") or 0)
                         hardcover_rating_count = int(hardcover_match.get("rating_count") or 0)
@@ -880,7 +1002,71 @@ class MiniAppSearchService:
         except (TypeError, ValueError):
             rating_count = 0
         unique_categories = MiniAppSearchService._clean_categories(book.get("categories"))
+        is_hardcover_record = str(book.get("source") or "").casefold().replace(" ", "_") == "hardcover"
+        hardcover_genres = book.get("hardcover_genres") or book.get("genres")
+        if not hardcover_genres and is_hardcover_record:
+            hardcover_genres = unique_categories
+        try:
+            hardcover_readers = int(book.get("hardcover_reader_count") or book.get("users_read_count") or 0)
+        except (TypeError, ValueError, OverflowError):
+            hardcover_readers = 0
+        raw_series_context = book.get("hardcover_series_context")
+        series_context = {}
+        if isinstance(raw_series_context, dict):
+            def clean_series_members(values, limit):
+                members = []
+                if not isinstance(values, list):
+                    return members
+                for member in values[:limit]:
+                    if not isinstance(member, dict) or not str(member.get("title") or "").strip():
+                        continue
+                    try:
+                        position = max(0, float(member.get("position") or 0))
+                    except (TypeError, ValueError, OverflowError):
+                        position = 0
+                    try:
+                        member_id = max(0, int(member.get("hardcover_id") or member.get("id") or 0))
+                    except (TypeError, ValueError, OverflowError):
+                        member_id = 0
+                    cover = str(member.get("cover_url") or "")[:2000]
+                    if cover and not cover.startswith(("https://", "http://")):
+                        cover = ""
+                    members.append({
+                        "hardcover_id": member_id,
+                        "title": str(member.get("title") or "")[:250],
+                        "author": str(member.get("author") or "Unknown author")[:250],
+                        "position": int(position) if position.is_integer() else position,
+                        "cover_url": cover,
+                    })
+                return members
+
+            series_name = str(raw_series_context.get("name") or book.get("hardcover_series_name") or "")[:250]
+            if series_name:
+                try:
+                    series_id = max(0, int(raw_series_context.get("id") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    series_id = 0
+                try:
+                    books_count = max(0, int(raw_series_context.get("books_count") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    books_count = 0
+                try:
+                    primary_count = max(0, int(raw_series_context.get("primary_books_count") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    primary_count = 0
+                series_context = {
+                    "id": series_id,
+                    "name": series_name,
+                    "description": str(raw_series_context.get("description") or "")[:2000],
+                    "books_count": books_count,
+                    "primary_books_count": primary_count,
+                    "is_completed": bool(raw_series_context.get("is_completed")),
+                    "featured": bool(raw_series_context.get("featured")),
+                    "books": clean_series_members(raw_series_context.get("books"), 40),
+                    "collections": clean_series_members(raw_series_context.get("collections"), 12),
+                }
         return {
+            "hardcover_id": int(book.get("hardcover_id") or 0) if str(book.get("hardcover_id") or "").isdigit() else 0,
             "title": str(book.get("title") or ""),
             "author": str(book.get("author") or ""),
             "cover_url": str(book.get("cover_url") or ""),
@@ -895,6 +1081,13 @@ class MiniAppSearchService:
             "info_link": str(book.get("info_link") or ""),
             "source": str(book.get("source") or ""),
             "metadata_source": str(book.get("metadata_source") or ""),
+            "hardcover_genres": MiniAppSearchService._clean_categories(hardcover_genres)[:30],
+            "hardcover_moods": MiniAppSearchService._clean_categories(book.get("hardcover_moods") or book.get("moods"))[:30],
+            "hardcover_content_warnings": MiniAppSearchService._clean_categories(book.get("hardcover_content_warnings"))[:30],
+            "hardcover_reader_count": max(0, hardcover_readers),
+            "hardcover_series_name": str(book.get("hardcover_series_name") or "")[:250],
+            "hardcover_series_position": max(0, float(book.get("hardcover_series_position") or 0)),
+            "hardcover_series_context": series_context,
         }
 
     def _get_cached(self, key: str) -> list[dict] | None:

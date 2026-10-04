@@ -415,8 +415,28 @@ class MultiSourceBookAggregator:
                 # Get description
                 description = doc.get("description", "")
 
-                # Get categories/genres
+                # Preserve Hardcover's own tags separately from categories
+                # combined from multiple providers later in the pipeline.
                 genres = doc.get("genres", [])
+                if not genres:
+                    genres = MultiSourceBookAggregator._extract_hardcover_tags(
+                        doc.get("cached_tags"), "Genre"
+                    )
+                moods = MultiSourceBookAggregator._extract_hardcover_tags(
+                    doc.get("cached_tags"), "Mood"
+                )
+                if not moods:
+                    moods = MultiSourceBookAggregator._extract_hardcover_tags(
+                        {"Mood": doc.get("moods")}, "Mood"
+                    )
+                content_warnings = MultiSourceBookAggregator._extract_hardcover_tags(
+                    doc.get("cached_tags"), "ContentWarning"
+                )
+                if not content_warnings:
+                    content_warnings = MultiSourceBookAggregator._extract_hardcover_tags(
+                        {"ContentWarning": doc.get("content_warnings") or doc.get("content_warnings_names")},
+                        "ContentWarning",
+                    )
 
                 # Get published date (Hardcover uses release_date)
                 published_date = doc.get("release_date", "") or doc.get("releaseDate", "") or doc.get("publishedDate", "")
@@ -429,6 +449,7 @@ class MultiSourceBookAggregator:
                 cover_url = image_data.get("url", "")
 
                 book = {
+                    "hardcover_id": int(doc.get("id")) if str(doc.get("id") or "").isdigit() else 0,
                     "title": title,
                     "author": author,
                     "rating": rating,
@@ -440,6 +461,9 @@ class MultiSourceBookAggregator:
                     "published_date": published_date,
                     "categories": genres,
                     "genres": genres,  # Keep both for compatibility
+                    "hardcover_genres": genres,
+                    "hardcover_moods": moods,
+                    "hardcover_content_warnings": content_warnings,
                     "cover_url": cover_url,
                     "isbn": isbn,
                     "source": "hardcover",
@@ -452,6 +476,546 @@ class MultiSourceBookAggregator:
 
         except Exception as e:
             logger.debug(f"Hardcover.app search failed: {e}")
+            return []
+
+    @staticmethod
+    def _extract_hardcover_tags(raw_tags, category: str) -> list[str]:
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except (TypeError, ValueError):
+                return []
+        if not isinstance(raw_tags, dict):
+            return []
+        normalized = re.sub(r"[^a-z]", "", category.casefold())
+        values = next((value for key, value in raw_tags.items()
+                       if re.sub(r"[^a-z]", "", str(key).casefold()) == normalized), None)
+        if values is None:
+            values = raw_tags.get("tags")
+            if isinstance(values, dict):
+                values = values.get(category)
+            elif isinstance(values, list):
+                values = [item for item in values if isinstance(item, dict)
+                          and re.sub(r"[^a-z]", "", str(item.get("category") or "").casefold()) == normalized]
+        if not isinstance(values, list):
+            return []
+        result, seen = [], set()
+        for item in values:
+            value = item.get("tag") or item.get("name") or "" if isinstance(item, dict) else item
+            value = " ".join(str(value or "").split())
+            if value and value.casefold() not in seen:
+                result.append(value)
+                seen.add(value.casefold())
+        return result
+
+    @staticmethod
+    def search_hardcover_similar(book_id: int, limit: int = 20) -> list[dict]:
+        """Fetch Hardcover's cached, ranked similar-book list for a catalog book."""
+        api_key = os.getenv("HARDCOVER_API_KEY", "").strip()
+        try:
+            book_id = int(book_id)
+            limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if not api_key or book_id <= 0:
+            return []
+
+        endpoint = "https://api.hardcover.app/v1/graphql"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        session = get_http_session()
+        try:
+            similar_query = """
+            query SimilarBookIds($id: Int!) {
+              books(where: {id: {_eq: $id}}, limit: 1) {
+                id
+                cached_similar_book_ids
+              }
+            }
+            """
+            response = session.post(endpoint, headers=headers,
+                                    json={"query": similar_query, "variables": {"id": book_id}}, timeout=10)
+            if response.status_code != 200:
+                logger.debug("Hardcover similar-id request failed status=%s", response.status_code)
+                return []
+            payload = response.json()
+            rows = (payload.get("data") or {}).get("books") or []
+            if payload.get("errors") or not rows:
+                return []
+            ids = rows[0].get("cached_similar_book_ids") or []
+            if isinstance(ids, str):
+                try:
+                    ids = json.loads(ids)
+                except (TypeError, ValueError):
+                    ids = []
+            if not isinstance(ids, list):
+                return []
+            ordered_ids = []
+            seen = set()
+            for value in ids:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if value > 0 and value != book_id and value not in seen:
+                    seen.add(value)
+                    ordered_ids.append(value)
+                if len(ordered_ids) >= limit:
+                    break
+            if not ordered_ids:
+                return []
+
+            hydrate_query = """
+            query HydrateSimilarBooks($ids: [Int!]) {
+              books(where: {id: {_in: $ids}}) {
+                id title rating ratings_count description pages release_date cached_tags
+                image { url }
+                contributions(limit: 1) { author { name } }
+                default_cover_edition { release_date pages isbn_10 isbn_13 image { url } }
+              }
+            }
+            """
+            hydrated = session.post(endpoint, headers=headers,
+                                    json={"query": hydrate_query, "variables": {"ids": ordered_ids}}, timeout=12)
+            if hydrated.status_code != 200:
+                logger.debug("Hardcover similar-book hydration failed status=%s", hydrated.status_code)
+                return []
+            hydrated_payload = hydrated.json()
+            if hydrated_payload.get("errors"):
+                return []
+            records = (hydrated_payload.get("data") or {}).get("books") or []
+            by_id = {int(item["id"]): item for item in records if isinstance(item, dict) and str(item.get("id") or "").isdigit()}
+            results = []
+
+            def extract_tags(raw, category):
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except (TypeError, ValueError):
+                        return []
+                if not isinstance(raw, dict):
+                    return []
+                values = raw.get(category)
+                if values is None:
+                    values = raw.get("tags")
+                    if isinstance(values, dict):
+                        values = values.get(category)
+                    elif isinstance(values, list):
+                        values = [tag for tag in values if isinstance(tag, dict)
+                                  and str(tag.get("category") or "").casefold() == category.casefold()]
+                if not isinstance(values, list):
+                    return []
+                tags = []
+                for value in values:
+                    value = value.get("tag") or value.get("name") or "" if isinstance(value, dict) else value
+                    value = str(value or "").strip()
+                    if value and value not in tags:
+                        tags.append(value)
+                return tags
+
+            for similar_id in ordered_ids:
+                doc = by_id.get(similar_id)
+                if not doc:
+                    continue
+                edition = doc.get("default_cover_edition") or {}
+                image = doc.get("image") or edition.get("image") or {}
+                contributions = doc.get("contributions") or []
+                author = ""
+                for contribution in contributions:
+                    author_data = contribution.get("author") or {}
+                    if author_data.get("name"):
+                        author = str(author_data["name"])
+                        break
+                results.append({
+                    "hardcover_id": similar_id,
+                    "title": str(doc.get("title") or "").strip(),
+                    "author": author or "Unknown author",
+                    "rating": doc.get("rating") or 0,
+                    "rating_count": doc.get("ratings_count") or 0,
+                    "description": str(doc.get("description") or ""),
+                    "page_count": doc.get("pages") or edition.get("pages") or 0,
+                    "published_date": str(doc.get("release_date") or edition.get("release_date") or ""),
+                    "categories": extract_tags(doc.get("cached_tags"), "Genre"),
+                    "genres": extract_tags(doc.get("cached_tags"), "Genre"),
+                    "moods": extract_tags(doc.get("cached_tags"), "Mood"),
+                    "cover_url": str(image.get("url") or ""),
+                    "isbn": str(edition.get("isbn_13") or edition.get("isbn_10") or ""),
+                    "source": "hardcover",
+                })
+            return results
+        except Exception as exc:
+            logger.debug("Hardcover similar-books lookup failed: %s", type(exc).__name__)
+            return []
+
+    @staticmethod
+    def get_hardcover_detail_metadata(book_id: int) -> dict:
+        """Fetch Hardcover-only discovery metadata for one known catalog book."""
+        api_key = os.getenv("HARDCOVER_API_KEY", "").strip()
+        try:
+            book_id = int(book_id)
+        except (TypeError, ValueError, OverflowError):
+            logger.info("[hardcover-details] skipped invalid book id=%r", book_id)
+            return {}
+        if not api_key:
+            logger.warning("[hardcover-details] skipped book_id=%s: HARDCOVER_API_KEY is missing", book_id)
+            return {}
+        if book_id <= 0:
+            logger.info("[hardcover-details] skipped non-positive book_id=%s", book_id)
+            return {}
+
+        query = """
+        query HardcoverBookDetails($id: Int!) {
+          books(where: {id: {_eq: $id}}, limit: 1) {
+            id users_read_count cached_tags
+            default_cover_edition { language { code2 } }
+          }
+        }
+        """
+        try:
+            response = get_http_session().post(
+                "https://api.hardcover.app/v1/graphql",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"query": query, "variables": {"id": book_id}},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                logger.warning("[hardcover-details] book_id=%s metadata HTTP status=%s", book_id, response.status_code)
+                return {}
+            payload = response.json()
+            if payload.get("errors"):
+                logger.warning("[hardcover-details] book_id=%s metadata GraphQL errors=%s", book_id, payload["errors"])
+            rows = (payload.get("data") or {}).get("books") or []
+            if not rows:
+                logger.info("[hardcover-details] book_id=%s returned no book rows", book_id)
+                return {}
+            row = rows[0]
+            if int(row.get("id") or 0) != book_id:
+                logger.warning("[hardcover-details] requested book_id=%s but response returned id=%s", book_id, row.get("id"))
+                return {}
+
+            series_name = ""
+            series_position = 0.0
+            series_context = {}
+            series_query = """
+            query HardcoverBookSeries($id: Int!) {
+              books(where: {id: {_eq: $id}}, limit: 1) {
+                book_series(limit: 5) {
+                  position compilation featured
+                  series {
+                    id name description books_count primary_books_count is_completed
+                    book_series(limit: 40, order_by: {position: asc}) {
+                      position compilation featured
+                      book {
+                        id canonical_id title compilation image { url } cached_image
+                        default_cover_edition { image { url } language { code2 } }
+                        contributions(limit: 1) { author { name } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+            try:
+                series_response = get_http_session().post(
+                    "https://api.hardcover.app/v1/graphql",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"query": series_query, "variables": {"id": book_id}},
+                    timeout=8,
+                )
+                if series_response.status_code == 200:
+                    series_data = series_response.json()
+                    if series_data.get("errors"):
+                        logger.warning("[hardcover-details] book_id=%s series GraphQL errors=%s", book_id, series_data["errors"])
+                    series_books = (series_data.get("data") or {}).get("books") or []
+                    series_rows = series_books[0].get("book_series") or [] if series_books else []
+                    series_rows = sorted(
+                        (entry for entry in series_rows if isinstance(entry, dict)),
+                        key=lambda entry: bool(entry.get("featured")),
+                        reverse=True,
+                    )
+                    for entry in series_rows:
+                        if not isinstance(entry, dict):
+                            continue
+                        series = entry.get("series") or {}
+                        if series.get("name"):
+                            series_name = str(series["name"]).strip()
+                            try:
+                                series_position = max(0, float(entry.get("position") or 0))
+                            except (TypeError, ValueError, OverflowError):
+                                series_position = 0.0
+                            primary_books = []
+                            collections = []
+                            preferred_language = str(
+                                ((row.get("default_cover_edition") or {}).get("language") or {}).get("code2") or ""
+                            ).casefold()
+                            for member in series.get("book_series") or []:
+                                if not isinstance(member, dict):
+                                    continue
+                                member_book = member.get("book") or {}
+                                member_title = str(member_book.get("title") or "").strip()
+                                if not member_title:
+                                    continue
+                                member_edition = member_book.get("default_cover_edition") or {}
+                                cached_image = member_book.get("cached_image") or {}
+                                if isinstance(cached_image, str):
+                                    try:
+                                        cached_image = json.loads(cached_image)
+                                    except (TypeError, ValueError):
+                                        cached_image = {}
+                                member_image = (
+                                    member_book.get("image") or member_edition.get("image")
+                                    or (cached_image if isinstance(cached_image, dict) else {})
+                                )
+                                member_author = ""
+                                for contribution in member_book.get("contributions") or []:
+                                    author = (contribution or {}).get("author") or {}
+                                    if author.get("name"):
+                                        member_author = str(author["name"]).strip()
+                                        break
+                                try:
+                                    member_position = max(0, float(member.get("position") or 0))
+                                except (TypeError, ValueError, OverflowError):
+                                    member_position = 0.0
+                                try:
+                                    canonical_id = max(0, int(member_book.get("canonical_id") or 0))
+                                except (TypeError, ValueError, OverflowError):
+                                    canonical_id = 0
+                                item = {
+                                    "hardcover_id": int(member_book.get("id") or 0),
+                                    "title": member_title[:250],
+                                    "author": member_author[:250] or "Unknown author",
+                                    "position": int(member_position) if member_position.is_integer() else member_position,
+                                    "cover_url": str(member_image.get("url") or "")[:2000],
+                                    "_canonical_id": canonical_id,
+                                    "_language": str(((member_edition.get("language") or {}).get("code2") or "")).casefold(),
+                                }
+                                is_collection = bool(member.get("compilation") or member_book.get("compilation"))
+                                # Hardcover can include placeholder series records that are not
+                                # shown on its public series page. Keep only real, covered works
+                                # in the primary strip so phantom positions do not inflate it.
+                                if is_collection:
+                                    collections.append(item)
+                                elif item["cover_url"].startswith(("https://", "http://")):
+                                    primary_books.append(item)
+                            try:
+                                primary_count = max(0, int(series.get("primary_books_count") or 0))
+                            except (TypeError, ValueError, OverflowError):
+                                primary_count = 0
+                            try:
+                                books_count = max(0, int(series.get("books_count") or 0))
+                            except (TypeError, ValueError, OverflowError):
+                                books_count = 0
+
+                            # Hardcover's series relation can contain alternate-language and
+                            # duplicate records sharing a volume position. Keep one best record
+                            # per position (prefer the selected edition's language and a cover),
+                            # then enforce the catalog's primary-book count.
+                            primary_books.sort(key=lambda item: (
+                                bool(item.get("cover_url")),
+                                bool(preferred_language and item.get("_language") == preferred_language),
+                                bool(item.get("author") and item.get("author") != "Unknown author"),
+                                -float(item.get("position") or 0),
+                            ), reverse=True)
+                            unique_primary = []
+                            seen_positions = set()
+                            seen_canonical = set()
+                            seen_titles = set()
+                            for item in primary_books:
+                                position = float(item.get("position") or 0)
+                                position_key = round(position, 4) if position > 0 else None
+                                canonical_id = item.get("_canonical_id") or 0
+                                title_key = re.sub(r"[^\w]+", " ", item.get("title", "").casefold()).strip()
+                                if position_key is not None and position_key in seen_positions:
+                                    continue
+                                if canonical_id and canonical_id in seen_canonical:
+                                    continue
+                                if title_key and title_key in seen_titles:
+                                    continue
+                                if position_key is not None:
+                                    seen_positions.add(position_key)
+                                if canonical_id:
+                                    seen_canonical.add(canonical_id)
+                                if title_key:
+                                    seen_titles.add(title_key)
+                                unique_primary.append({key: value for key, value in item.items() if not key.startswith("_")})
+                            unique_primary.sort(key=lambda item: float(item.get("position") or 0))
+                            primary_books = unique_primary[:primary_count] if primary_count else unique_primary[:40]
+
+                            unique_collections = []
+                            seen_collection_ids = set()
+                            seen_collection_titles = set()
+                            for item in collections:
+                                canonical_id = item.get("_canonical_id") or item.get("hardcover_id") or 0
+                                title_key = re.sub(r"[^\w]+", " ", item.get("title", "").casefold()).strip()
+                                if (canonical_id and canonical_id in seen_collection_ids) or (title_key and title_key in seen_collection_titles):
+                                    continue
+                                if canonical_id:
+                                    seen_collection_ids.add(canonical_id)
+                                if title_key:
+                                    seen_collection_titles.add(title_key)
+                                unique_collections.append({key: value for key, value in item.items() if not key.startswith("_")})
+                            collections = unique_collections
+                            series_context = {
+                                "id": int(series.get("id") or 0),
+                                "name": series_name,
+                                "description": str(series.get("description") or "")[:2000],
+                                "books_count": books_count,
+                                "primary_books_count": len(primary_books) if primary_books else primary_count,
+                                "is_completed": bool(series.get("is_completed")),
+                                "featured": bool(entry.get("featured")),
+                                "books": primary_books,
+                                "collections": collections[:12],
+                            }
+                            break
+                    if not series_name:
+                        logger.info("[hardcover-details] book_id=%s returned no series association", book_id)
+                else:
+                    logger.warning("[hardcover-details] book_id=%s series HTTP status=%s", book_id, series_response.status_code)
+            except Exception as exc:
+                logger.exception("[hardcover-details] book_id=%s series request raised %s", book_id, type(exc).__name__)
+            try:
+                readers = max(0, int(row.get("users_read_count") or 0))
+            except (TypeError, ValueError, OverflowError):
+                readers = 0
+            metadata = {
+                "hardcover_genres": MultiSourceBookAggregator._extract_hardcover_tags(row.get("cached_tags"), "Genre"),
+                "hardcover_moods": MultiSourceBookAggregator._extract_hardcover_tags(row.get("cached_tags"), "Mood"),
+                "hardcover_content_warnings": MultiSourceBookAggregator._extract_hardcover_tags(row.get("cached_tags"), "ContentWarning"),
+                "hardcover_reader_count": readers,
+                "hardcover_series_name": series_name,
+                "hardcover_series_position": int(series_position) if series_position.is_integer() else series_position,
+                "hardcover_series_context": series_context,
+            }
+            logger.info(
+                "[hardcover-details] book_id=%s result series=%r position=%s series_books=%s primary_count=%s collections=%s readers=%s genres=%s moods=%s warnings=%s",
+                book_id, series_name or None, metadata["hardcover_series_position"],
+                len(series_context.get("books") or []), series_context.get("primary_books_count", 0),
+                len(series_context.get("collections") or []), readers,
+                len(metadata["hardcover_genres"]), len(metadata["hardcover_moods"]),
+                len(metadata["hardcover_content_warnings"]),
+            )
+            return metadata
+        except Exception as exc:
+            logger.exception("[hardcover-details] book_id=%s metadata request raised %s", book_id, type(exc).__name__)
+            return {}
+
+    @staticmethod
+    def search_hardcover_by_tags(genre: str = "", mood: str = "", limit: int = 30) -> list[dict]:
+        """Search Hardcover books by cached community genre/mood tags."""
+        api_key = os.getenv("HARDCOVER_API_KEY", "").strip()
+        genre, mood = str(genre or "").strip(), str(mood or "").strip()
+        if not api_key or not (genre or mood):
+            return []
+        try:
+            limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError, OverflowError):
+            return []
+
+        # Hardcover has exposed cached_tags in both category-map and tagged
+        # object forms. OR the shapes while ANDing the requested dimensions.
+        filters = []
+        for category, value in (("Genre", genre), ("Mood", mood)):
+            if value:
+                filters.append((category, value))
+        variables = {"limit": limit}
+        variable_defs = ["$limit: Int!"]
+        structural_conditions = []
+        for index, (category, value) in enumerate(filters):
+            map_var = f"$tag_map_{index}"
+            object_map_var = f"$tag_object_map_{index}"
+            list_var = f"$tag_list_{index}"
+            variable_defs.extend((f"{map_var}: jsonb!", f"{object_map_var}: jsonb!", f"{list_var}: jsonb!"))
+            variables[f"tag_map_{index}"] = {category: [value]}
+            variables[f"tag_object_map_{index}"] = {category: [{"tag": value}]}
+            variables[f"tag_list_{index}"] = {"tags": [{"category": category, "tag": value}]}
+            structural_conditions.append(
+                "_or: ["
+                f"{{cached_tags: {{_contains: {map_var}}}}}, "
+                f"{{cached_tags: {{_contains: {object_map_var}}}}}, "
+                f"{{cached_tags: {{_contains: {list_var}}}}}"
+                "]"
+            )
+        where = "_and: [" + ", ".join("{" + item + "}" for item in structural_conditions) + "]"
+        query = f"""
+        query HardcoverBooksByTags({", ".join(variable_defs)}) {{
+          books(where: {{{where}}}, order_by: {{users_read_count: desc}}, limit: $limit) {{
+            id title rating ratings_count users_read_count description cached_tags
+            pages release_date image {{ url }}
+            contributions(limit: 3) {{ author {{ name }} }}
+            default_cover_edition {{ pages release_date isbn_10 isbn_13 image {{ url }} }}
+          }}
+        }}
+        """
+        try:
+            response = get_http_session().post(
+                "https://api.hardcover.app/v1/graphql",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"query": query, "variables": variables}, timeout=12,
+            )
+            if response.status_code != 200:
+                logger.debug("Hardcover tag recommendation failed status=%s", response.status_code)
+                return []
+            payload = response.json()
+            if payload.get("errors"):
+                logger.debug("Hardcover tag recommendation GraphQL error: %s", payload["errors"])
+                return []
+            rows = (payload.get("data") or {}).get("books") or []
+            results = []
+
+            def extract_tags(raw, category):
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except (TypeError, ValueError):
+                        return []
+                if not isinstance(raw, dict):
+                    return []
+                values = raw.get(category)
+                if values is None:
+                    values = raw.get("tags")
+                    if isinstance(values, dict):
+                        values = values.get(category)
+                    elif isinstance(values, list):
+                        values = [item for item in values if isinstance(item, dict)
+                                  and str(item.get("category") or "").casefold() == category.casefold()]
+                if not isinstance(values, list):
+                    return []
+                extracted = []
+                for item in values:
+                    value = item.get("tag") or item.get("name") or "" if isinstance(item, dict) else item
+                    value = str(value or "").strip()
+                    if value and value not in extracted:
+                        extracted.append(value)
+                return extracted
+
+            for row in rows:
+                if not isinstance(row, dict) or not str(row.get("title") or "").strip():
+                    continue
+                edition = row.get("default_cover_edition") or {}
+                contributions = row.get("contributions") or []
+                authors = [str(item["author"]["name"]) for item in contributions
+                           if isinstance(item, dict) and isinstance(item.get("author"), dict)
+                           and item["author"].get("name")]
+                image = edition.get("image") or row.get("image") or {}
+                results.append({
+                    "hardcover_id": int(row.get("id") or 0),
+                    "title": str(row.get("title") or "").strip(),
+                    "author": ", ".join(authors) or "Unknown author",
+                    "rating": row.get("rating") or 0,
+                    "rating_count": row.get("ratings_count") or 0,
+                    "users_read_count": row.get("users_read_count") or 0,
+                    "description": str(row.get("description") or ""),
+                    "categories": extract_tags(row.get("cached_tags"), "Genre"),
+                    "moods": extract_tags(row.get("cached_tags"), "Mood"),
+                    "cover_url": str(image.get("url") or ""),
+                    "isbn": str(edition.get("isbn_13") or edition.get("isbn_10") or ""),
+                    "page_count": edition.get("pages") or row.get("pages") or 0,
+                    "published_date": str(edition.get("release_date") or row.get("release_date") or ""),
+                    "source": "hardcover",
+                })
+            return results
+        except Exception as exc:
+            logger.debug("Hardcover tag recommendation failed: %s", type(exc).__name__)
             return []
 
     @staticmethod

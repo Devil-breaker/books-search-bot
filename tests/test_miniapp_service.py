@@ -249,6 +249,65 @@ class MiniAppRecommendationDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["book"]["title"], "Complete Book")
         self.assertFalse(result["metadata_enriched"])
 
+    async def test_recommendation_details_include_hardcover_only_metadata(self):
+        raw_book = {
+            "title": "A Hardcover Book", "author": "An Author", "hardcover_id": 123,
+            "source": "hardcover", "description": "Description", "categories": ["Other genre"],
+        }
+        hardcover_fields = {
+            "hardcover_genres": ["Fantasy"], "hardcover_moods": ["Mysterious"],
+            "hardcover_content_warnings": ["Violence"], "hardcover_reader_count": 12345,
+            "hardcover_series_name": "The Example Series", "hardcover_series_position": 2,
+        }
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.search_google_books",
+            return_value=[],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.get_hardcover_detail_metadata",
+            return_value=hardcover_fields,
+        ) as metadata:
+            result = await self.service.recommendation_book_details(raw_book)
+
+        metadata.assert_called_once_with(123)
+        self.assertEqual(result["book"]["hardcover_genres"], ["Fantasy"])
+        self.assertEqual(result["book"]["hardcover_reader_count"], 12345)
+        self.assertEqual(result["book"]["hardcover_series_name"], "The Example Series")
+
+    async def test_hardcover_metadata_is_skipped_when_title_author_do_not_match(self):
+        raw_book = {
+            "title": "A Book from Another Provider", "author": "Original Author",
+            "source": "google_books", "description": "Description",
+        }
+        with patch(
+            "src.aggregator.MultiSourceBookAggregator.search_hardcover",
+            return_value=[{"title": "Different Book", "author": "Different Author", "hardcover_id": 123}],
+        ), patch(
+            "src.aggregator.MultiSourceBookAggregator.get_hardcover_detail_metadata",
+        ) as metadata:
+            result = await self.service.recommendation_book_details(raw_book)
+
+        metadata.assert_not_called()
+        self.assertEqual(result["book"]["hardcover_genres"], [])
+        self.assertEqual(result["book"]["hardcover_moods"], [])
+
+    def test_hardcover_result_keeps_its_genre_card_when_detail_fetch_is_empty(self):
+        result = MiniAppSearchService._public_book({
+            "title": "Hardcover result", "author": "Author", "source": "hardcover",
+            "categories": ["Fantasy"], "users_read_count": 1200,
+        })
+
+        self.assertEqual(result["hardcover_genres"], ["Fantasy"])
+        self.assertEqual(result["hardcover_reader_count"], 1200)
+
+    def test_other_provider_genres_are_not_mislabeled_as_hardcover_genres(self):
+        result = MiniAppSearchService._public_book({
+            "title": "Other-provider result", "author": "Author", "source": "google_books",
+            "categories": ["Fantasy"],
+        })
+
+        self.assertEqual(result["categories"], ["Fantasy"])
+        self.assertEqual(result["hardcover_genres"], [])
+
     async def test_detail_metadata_deduplicates_genres_case_insensitively(self):
         raw_book = {
             "title": "Genre Duplicates",
