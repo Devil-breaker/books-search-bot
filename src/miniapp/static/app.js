@@ -1231,7 +1231,24 @@
     if (!seriesName) return;
     const position = Number(book.hardcover_series_position || 0);
     const books = Array.isArray(context.books) ? context.books : [];
-    const collections = Array.isArray(context.collections) ? context.collections : [];
+    const rawCollections = Array.isArray(context.collections) ? context.collections : [];
+    const collectionKeys = new Set();
+    const collections = rawCollections.filter((member) => {
+      if (!member || !String(member.title || "").trim()) return false;
+      const coverUrl = safeHttpUrl(member.cover_url);
+      if (!coverUrl) return false;
+      const titleKey = String(member.title).normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      const authorKey = String(member.author || "").normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      const coverKey = coverUrl.split(/[?#]/, 1)[0].replace(/\/$/, "").toLocaleLowerCase();
+      const keys = [
+        member.canonical_id ? `id:${member.canonical_id}` : "",
+        titleKey ? `title:${titleKey}|author:${authorKey}` : "",
+        coverKey ? `cover:${coverKey}` : "",
+      ].filter(Boolean);
+      if (keys.some((key) => collectionKeys.has(key))) return false;
+      keys.forEach((key) => collectionKeys.add(key));
+      return true;
+    });
     const primaryCount = Number(books.length || context.primary_books_count || context.books_count || 0);
     const section = node("section", "series-context");
     const heading = node("div", "series-context-heading");

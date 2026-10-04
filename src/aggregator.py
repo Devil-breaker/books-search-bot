@@ -702,7 +702,11 @@ class MultiSourceBookAggregator:
                   position compilation featured
                   series {
                     id name description books_count primary_books_count is_completed
-                    book_series(limit: 40, order_by: {position: asc}) {
+                    book_series(
+                      limit: 100,
+                      order_by: {position: asc},
+                      where: {featured: {_eq: true}}
+                    ) {
                       position compilation featured
                       book {
                         id canonical_id title compilation image { url } cached_image
@@ -782,6 +786,7 @@ class MultiSourceBookAggregator:
                                     canonical_id = 0
                                 item = {
                                     "hardcover_id": int(member_book.get("id") or 0),
+                                    "canonical_id": canonical_id,
                                     "title": member_title[:250],
                                     "author": member_author[:250] or "Unknown author",
                                     "position": int(member_position) if member_position.is_integer() else member_position,
@@ -790,12 +795,19 @@ class MultiSourceBookAggregator:
                                     "_language": str(((member_edition.get("language") or {}).get("code2") or "")).casefold(),
                                 }
                                 is_collection = bool(member.get("compilation") or member_book.get("compilation"))
+                                # The series relation may contain translations,
+                                # adaptations, and auxiliary entries. Hardcover's
+                                # featured flag is its curated primary-work signal;
+                                # only those records belong in either visible shelf.
+                                if not member.get("featured"):
+                                    continue
                                 # Hardcover can include placeholder series records that are not
                                 # shown on its public series page. Keep only real, covered works
                                 # in the primary strip so phantom positions do not inflate it.
-                                if is_collection:
+                                if is_collection and item["cover_url"].startswith(("https://", "http://")):
                                     collections.append(item)
-                                elif item["cover_url"].startswith(("https://", "http://")):
+                                elif (not member_book.get("compilation")
+                                      and item["cover_url"].startswith(("https://", "http://"))):
                                     primary_books.append(item)
                             try:
                                 primary_count = max(0, int(series.get("primary_books_count") or 0))
@@ -844,15 +856,26 @@ class MultiSourceBookAggregator:
                             unique_collections = []
                             seen_collection_ids = set()
                             seen_collection_titles = set()
+                            seen_collection_covers = set()
+                            collections.sort(key=lambda item: (
+                                bool(item.get("cover_url")),
+                                bool(preferred_language and item.get("_language") == preferred_language),
+                                bool(item.get("author") and item.get("author") != "Unknown author"),
+                            ), reverse=True)
                             for item in collections:
-                                canonical_id = item.get("_canonical_id") or item.get("hardcover_id") or 0
+                                canonical_id = item.get("_canonical_id") or 0
                                 title_key = re.sub(r"[^\w]+", " ", item.get("title", "").casefold()).strip()
-                                if (canonical_id and canonical_id in seen_collection_ids) or (title_key and title_key in seen_collection_titles):
+                                cover_key = re.split(r"[?#]", item.get("cover_url", ""), maxsplit=1)[0].rstrip("/").casefold()
+                                if ((canonical_id and canonical_id in seen_collection_ids)
+                                        or (title_key and title_key in seen_collection_titles)
+                                        or (cover_key and cover_key in seen_collection_covers)):
                                     continue
                                 if canonical_id:
                                     seen_collection_ids.add(canonical_id)
                                 if title_key:
                                     seen_collection_titles.add(title_key)
+                                if cover_key:
+                                    seen_collection_covers.add(cover_key)
                                 unique_collections.append({key: value for key, value in item.items() if not key.startswith("_")})
                             collections = unique_collections
                             series_context = {
