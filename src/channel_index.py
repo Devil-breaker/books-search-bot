@@ -410,7 +410,12 @@ class ChannelIndexRuntime:
         heading = base_html.rstrip()
         if not additions:
             return heading or " "
-        separator = "\n\n" if heading else ""
+        # A blank line after a heading gives the first generated entry room.
+        # If the placeholder already contains a separated list/body, append to
+        # that content directly instead of making the new entry look like a
+        # separate section.
+        has_existing_body = bool(re.search(r"\n[ \t]*\n(?=\S)", heading))
+        separator = ("\n" if has_existing_body else "\n\n") if heading else ""
         formatted_additions = "\n".join(additions)
         return f"{heading}{separator}{formatted_additions}"
 
