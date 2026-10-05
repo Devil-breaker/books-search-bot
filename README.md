@@ -68,9 +68,14 @@ Results and metadata vary by catalog. Some titles may have more complete details
 | `/recom` | Open the recommendations screen directly |
 | `/bookshelf` | Open My Bookshelf directly |
 | `/favorites` | Open the Favourites tab directly |
+| `/connect <channel_id>` | Connect a channel from a private chat (channel owner/admin only) |
+| `/connections` | List connected channel names you administer |
+| `/disconnect <channel_id>` | Disconnect a channel from a private chat (channel owner/admin only) |
+| `/misc` | Open the separate channel tools menu |
+| `/index [on\|off\|yes\|no\|1m\|5m\|10m]` | Configure automatic channel index updates |
 | `/ping` | Check whether the bot is responding |
 
-The bot publishes these commands to Telegram on startup, so no `/setcommands` setup is needed. You can still override the command menu in [@BotFather](https://t.me/BotFather). Enable Inline Mode in BotFather to use inline search. The published commands are:
+The bot publishes these commands to Telegram on startup, so no `/setcommands` setup is needed. Channel connection and index tools are available from the separate `/misc` menu and are managed in private chat. Only channel owners and administrators may manage a connected channel. Enable Inline Mode in BotFather to use inline search.
 
 ```text
 start - Show welcome message
@@ -80,8 +85,19 @@ portal - Open the Annie Search Mini App
 recom - Open recommendations directly
 bookshelf - Open My Bookshelf
 favorites - Open Favourites
+connect - Connect a channel (private chat)
+connections - List connected channels
+disconnect - Disconnect a channel (private chat)
 ping - Check whether the bot is responding
+misc - Open channel tools
+index - Configure automatic channel index updates
 ```
+
+Channel connections and index settings are stored in MongoDB, so these tools require `MONGODB_URI`. `/connections` displays only channel names to users who administer those channels.
+
+### Automatic channel index updates
+
+Run Annie in long-polling mode with `API_ID`, `API_HASH`, and `MONGODB_URI` configured. Use `/misc` → **Channel index**, choose one connected channel, and forward its existing text-based index posts to Annie. Choose an entry source—text, hashtags, links, images, files, or a custom text prefix—then choose a 1, 5, or 10 minute delay and turn updates on. The entry is a link to the original channel post; image and file choices use a caption or filename as its label and do not copy media into the index. Annie updates an entry when its post is edited, moves it if its list marker changes, and removes it if the post is deleted while the listener is running. Webhook/serverless deployments do not run the persistent MTProto listener.
 
 The bot owner can also use `/authorize <telegram_user_id>`, `/unauthorize <telegram_user_id>`, and `/admins` to manage users who are exempt from search cooldowns and temporary blocks. These commands appear in the owner’s command menu and are enforced as owner-only by the bot. The allowlist is stored in the separate `bot_admins` collection in MongoDB, so `MONGODB_URI` must be configured; it is loaded into memory at startup and changes made by the owner update the cache immediately. The bot checks this in-memory list during normal operation, with a brief refresh only when a restriction check needs to confirm an exemption.
 

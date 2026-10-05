@@ -13,6 +13,8 @@ import requests
 import unicodedata
 from html import unescape as html_unescape
 from src.admins import MongoBotAdminRepository
+from src.channel_connections import MongoChannelConnectionRepository
+from src.channel_index import ChannelIndexRuntime, MongoChannelIndexRepository
 from src.miniapp.auth import issue_inline_token
 from io import BytesIO
 from PIL import Image
@@ -33,7 +35,7 @@ from telegram import (
     InputMediaPhoto,
     ReplyParameters,
 )
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 
@@ -62,7 +64,8 @@ class GoodreadsBot:
             .pool_timeout(30.0)
             .get_updates_connect_timeout(30.0)
             .get_updates_read_timeout(40.0)
-            .post_init(self._configure_telegram_commands)
+            .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
             .build()
         )
         # search_cache: {user_id: (books_list, timestamp)}
@@ -109,6 +112,10 @@ class GoodreadsBot:
         self._bot_admin_cache_expires_at = 0.0
         self._bot_admin_cache_lock = asyncio.Lock()
         self._bot_admin_repository: MongoBotAdminRepository | None = None
+        self._channel_connection_repository: MongoChannelConnectionRepository | None = None
+        self._channel_index_repository: MongoChannelIndexRepository | None = None
+        self._channel_index_runtime: ChannelIndexRuntime | None = None
+        self._index_pending_input: dict[int, dict] = {}
         # Cache group-admin checks briefly so restriction checks do not add a
         # Telegram API call to every search/cancel interaction.
         self._group_admin_status_cache: dict[tuple[int, int], tuple[float, bool]] = {}
@@ -196,6 +203,15 @@ class GoodreadsBot:
             database_name = os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db"
             self._bot_admin_repository = MongoBotAdminRepository(uri, database_name)
         return self._bot_admin_repository
+
+    def _get_channel_connection_repository(self) -> MongoChannelConnectionRepository | None:
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            return None
+        if getattr(self, "_channel_connection_repository", None) is None:
+            database_name = os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db"
+            self._channel_connection_repository = MongoChannelConnectionRepository(uri, database_name)
+        return self._channel_connection_repository
 
     async def _load_bot_admin_ids(self, force: bool = False) -> bool:
         """Load the small allowlist once; writes update the in-memory copy."""
@@ -1349,6 +1365,7 @@ class GoodreadsBot:
 
     def setup_handlers(self):
         """Register all command and callback handlers."""
+        self.app.add_error_handler(self._handle_application_error)
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CommandHandler("portal", self.portal_command))
@@ -1358,10 +1375,118 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("authorize", self.authorize_command))
         self.app.add_handler(CommandHandler("unauthorize", self.unauthorize_command))
         self.app.add_handler(CommandHandler("admins", self.admins_command))
+        self.app.add_handler(CommandHandler("connect", self.connect_command))
+        self.app.add_handler(CommandHandler("connections", self.connections_command))
+        self.app.add_handler(CommandHandler("disconnect", self.disconnect_command))
+        self.app.add_handler(CommandHandler("misc", self.misc_command))
+        self.app.add_handler(CommandHandler("index", self.index_command))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("ping", self.ping_command))
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(InlineQueryHandler(self.inline_search))
+        self.app.add_handler(MessageHandler(filters.FORWARDED, self._index_forwarded_message))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._index_text_input))
+
+    async def _handle_application_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        error = context.error
+        if error is None:
+            return
+        logger.error(
+            "[telegram] unhandled update error update_type=%s error_type=%s",
+            type(update).__name__, type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+    async def _post_init(self, application: Application) -> None:
+        await self._configure_telegram_commands(application)
+        if self.webhook_mode:
+            return
+        repository = self._get_channel_index_repository()
+        if repository is None:
+            return
+        try:
+            enabled = await asyncio.to_thread(repository.list_enabled)
+            if not enabled:
+                logger.info("[channel-index] no active indexes; MTProto listener not started")
+                return
+            await self._start_channel_index_listener(application.bot)
+        except Exception as exc:
+            runtime = getattr(self, "_channel_index_runtime", None)
+            if runtime is not None:
+                try:
+                    await runtime.close()
+                except Exception:
+                    pass
+                self._channel_index_runtime = None
+            logger.warning(
+                "[channel-index] listener unavailable; bot polling continues error=%s",
+                type(exc).__name__,
+            )
+
+    async def _start_channel_index_listener(self, bot: Any | None = None) -> bool:
+        if self.webhook_mode:
+            return False
+        if self._channel_index_runtime is not None:
+            return True
+        api_id = os.getenv("API_ID", "").strip()
+        api_hash = os.getenv("API_HASH", "").strip()
+        repository = self._get_channel_index_repository()
+        if repository is None or not api_id or not api_hash:
+            return False
+        runtime = ChannelIndexRuntime(
+            bot or self.app.bot, repository, int(api_id), api_hash, self.token
+        )
+        try:
+            await runtime.start()
+        except Exception:
+            try:
+                await runtime.close()
+            except Exception:
+                pass
+            raise
+        self._channel_index_runtime = runtime
+        logger.info("[channel-index] MTProto update listener started")
+        return True
+
+    async def _ensure_channel_index_listener(self) -> bool:
+        try:
+            return await self._start_channel_index_listener()
+        except Exception as exc:
+            logger.warning(
+                "[channel-index] could not start listener; bot polling continues error=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    async def _stop_channel_index_listener_if_idle(self) -> None:
+        runtime = self._channel_index_runtime
+        repository = self._get_channel_index_repository()
+        if runtime is None or repository is None:
+            return
+        try:
+            enabled = await asyncio.to_thread(repository.list_enabled)
+        except Exception as exc:
+            logger.warning("[channel-index] could not check active indexes error=%s", type(exc).__name__)
+            return
+        if not enabled:
+            await runtime.close()
+            self._channel_index_runtime = None
+            logger.info("[channel-index] no active indexes; MTProto listener stopped")
+
+    async def _post_shutdown(self, application: Application) -> None:
+        runtime = getattr(self, "_channel_index_runtime", None)
+        if runtime is not None:
+            await runtime.close()
+            self._channel_index_runtime = None
+
+    def _get_channel_index_repository(self) -> MongoChannelIndexRepository | None:
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            return None
+        if getattr(self, "_channel_index_repository", None) is None:
+            database_name = os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db"
+            self._channel_index_repository = MongoChannelIndexRepository(uri, database_name)
+        return self._channel_index_repository
 
     async def _configure_telegram_commands(self, application: Application | None = None):
         """Publish command suggestions through Telegram so BotFather setup is unnecessary."""
@@ -1377,23 +1502,29 @@ class GoodreadsBot:
             BotCommand("search", "Search books by title or author"),
             BotCommand("ping", "Check bot status and uptime"),
         ]
-        scopes = (
-            None,
-            BotCommandScopeAllPrivateChats(),
-            BotCommandScopeAllGroupChats(),
-        )
-        for scope in scopes:
+        private_commands = commands + [
+            BotCommand("connect", "Connect a channel (private chat)"),
+            BotCommand("connections", "List connected channels"),
+            BotCommand("disconnect", "Disconnect a channel"),
+            BotCommand("misc", "Channel tools and settings"),
+            BotCommand("index", "Manage channel indexes"),
+        ]
+        for scope, scoped_commands in (
+            (None, commands),
+            (BotCommandScopeAllPrivateChats(), private_commands),
+            (BotCommandScopeAllGroupChats(), commands),
+        ):
             try:
                 if scope is None:
-                    await bot.set_my_commands(commands)
+                    await bot.set_my_commands(scoped_commands)
                 else:
-                    await bot.set_my_commands(commands, scope=scope)
+                    await bot.set_my_commands(scoped_commands, scope=scope)
             except Exception as exc:
                 # Command menu setup is helpful but should never prevent startup.
                 logger.warning("Could not publish Telegram command menu: %s", type(exc).__name__)
         owner_id = getattr(self, "_owner_user_id", None)
         if owner_id is not None:
-            owner_commands = commands + [
+            owner_commands = private_commands + [
                 BotCommand("authorize", "Authorize a user ID"),
                 BotCommand("unauthorize", "Revoke an authorized user"),
                 BotCommand("admins", "List authorized users"),
@@ -1546,6 +1677,7 @@ class GoodreadsBot:
         )
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("❔ Help", callback_data="start_help"),
+             InlineKeyboardButton("⚙ Misc", callback_data="start_misc"),
              InlineKeyboardButton("✦ Features List", callback_data="start_features")],
             [portal_button],
             [recommendations_button],
@@ -1570,6 +1702,21 @@ class GoodreadsBot:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("← Back to start", callback_data="start_back")
         ]])
+
+    @staticmethod
+    def _help_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("← Back to start", callback_data="start_back")],
+        ])
+
+    @staticmethod
+    def _misc_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📇 Channel index", callback_data="misc_index")],
+            [InlineKeyboardButton("🔗 My connections", callback_data="misc_list_connections")],
+            [InlineKeyboardButton("How to connect a channel", callback_data="misc_connections")],
+            [InlineKeyboardButton("← Back to start", callback_data="start_back")],
+        ])
 
     @staticmethod
     def _help_text() -> str:
@@ -1598,11 +1745,792 @@ Save books to My Books, move the ones you love to Favourites with the Like butto
 <code>/bookshelf</code> · Open My Bookshelf
 <code>/favorites</code> · Open Favourites
 <code>/help</code> · Show this guide
-<code>/ping</code> · Check bot status"""
+<code>/ping</code> · Check bot status
+
+"""
+
+    @staticmethod
+    def _misc_text() -> str:
+        return """<b>⚙ Misc</b>
+
+Channel tools for channel owners and administrators. Connect Annie as a channel administrator, then use the index manager to keep older index posts updated when new channel posts arrive.
+
+<code>/connect &lt;channel_id&gt;</code> · Connect a channel
+<code>/connections</code> · List connected channel names
+<code>/disconnect &lt;channel_id&gt;</code> · Disconnect a channel
+<code>/index</code> · Configure an index
+
+Channel management commands work in Annie’s private chat. Only that channel’s owner or an administrator can manage its connection or index."""
+
+    @staticmethod
+    def _connections_help_text() -> str:
+        return """<b>🔗 Channel connections</b>
+
+Use these commands in a private chat with Annie. Add Annie as an administrator in the channel first. Only that channel’s owner or an administrator can connect or disconnect it.
+
+<code>/connect &lt;channel_id&gt;</code> · Connect a channel
+<code>/connections</code> · List connected channel names
+<code>/disconnect &lt;channel_id&gt;</code> · Disconnect a channel
+
+Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
+
+    async def misc_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await update.effective_message.reply_text("Open /misc in a private chat with Annie.")
+            return
+        if context.args:
+            await update.effective_message.reply_text("Usage: /misc")
+            return
+        await update.effective_message.reply_text(
+            self._misc_text(), parse_mode=ParseMode.HTML, reply_markup=self._misc_keyboard()
+        )
+
+    async def index_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await update.effective_message.reply_text("Use /index in a private chat with Annie.")
+            return
+        if len(context.args) > 1:
+            await update.effective_message.reply_text(
+                "Usage: /index [on|off|yes|no|1m|5m|10m]"
+            )
+            return
+        action, value = "open", ""
+        if context.args:
+            option = context.args[0].casefold()
+            if option in {"on", "yes", "off", "no"}:
+                action, value = "toggle", "1" if option in {"on", "yes"} else "0"
+            elif option in {"1m", "5m", "10m"}:
+                action, value = "delay", option[:-1]
+            else:
+                await update.effective_message.reply_text(
+                    "Usage: /index [on|off|yes|no|1m|5m|10m]"
+                )
+                return
+        await self._show_index_channel_picker(update, context, action, value)
+
+    async def _show_index_channel_picker(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        action: str = "open", value: str = "",
+    ) -> None:
+        repository = self._get_channel_connection_repository()
+        if repository is None:
+            text, markup = "Channel connections need cloud storage. Configure MONGODB_URI first.", self._misc_keyboard()
+            await self._send_or_edit(update, text, markup)
+            return
+        try:
+            channels = await asyncio.to_thread(repository.list_channels)
+        except Exception as exc:
+            logger.warning("[channel-index] could not list channels error=%s", type(exc).__name__)
+            await self._send_or_edit(update, "I couldn’t load connected channels. Please try again.", self._misc_keyboard())
+            return
+        eligible = []
+        for channel in channels:
+            try:
+                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
+            except Exception:
+                continue
+            if getattr(member, "status", "") in ("administrator", "creator"):
+                eligible.append(channel)
+        if not eligible:
+            await self._send_or_edit(
+                update,
+                "You don’t have a connected channel to manage yet. Connect one with <code>/connect &lt;channel_id&gt;</code>.",
+                self._misc_keyboard(),
+            )
+            return
+        if len(eligible) == 1:
+            await self._select_index_channel(
+                update, context, int(eligible[0]["id"]), action, value
+            )
+            return
+        rows = [[InlineKeyboardButton(
+            str(channel["name"])[:60],
+            callback_data=f"index_choose:{int(channel['id'])}:{action}:{value or '-'}",
+        )] for channel in eligible]
+        rows.append([InlineKeyboardButton("← Back to Misc", callback_data="misc_home")])
+        prompt = "Choose one channel to manage at a time:"
+        if action == "toggle":
+            prompt = f"Turn automatic index updates {'on' if value == '1' else 'off'} for which channel?"
+        elif action == "delay":
+            prompt = f"Set the index update delay to {value} minute(s) for which channel?"
+        await self._send_or_edit(update, prompt, InlineKeyboardMarkup(rows))
+
+    async def _select_index_channel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, action: str = "open", value: str = "",
+    ) -> None:
+        raw_channel = str(int(channel_id))
+        channel = await self._private_channel_target(update, context, raw_channel)
+        if channel is None:
+            return
+        if action == "open":
+            await self._show_index_settings(update, context, channel_id)
+            return
+
+        repository = self._get_channel_index_repository()
+        if repository is None:
+            await self._send_or_edit(update, "Channel indexes need MongoDB storage.", self._misc_keyboard())
+            return
+        current = await asyncio.to_thread(repository.get, channel_id) or {}
+        if action == "toggle":
+            desired = value == "1"
+            if desired and not current.get("targets"):
+                await self._send_or_edit(
+                    update,
+                    "Register at least one existing index post before turning updates on.",
+                    self._index_settings_keyboard(channel_id, current),
+                )
+                return
+            if desired and not await self._ensure_channel_index_listener():
+                await self._send_or_edit(
+                    update,
+                    "Automatic index updates need API_ID and API_HASH, and must run in polling mode. Annie could not start the listener, so updates remain off.",
+                    self._index_settings_keyboard(channel_id, current),
+                )
+                return
+            await asyncio.to_thread(repository.update, channel_id, {"enabled": desired})
+            if not desired and self._channel_index_runtime is not None:
+                await self._channel_index_runtime.cancel_channel(channel_id)
+                await self._stop_channel_index_listener_if_idle()
+            await self._send_or_edit(
+                update,
+                f"Automatic index updates are <b>{'on' if desired else 'off'}</b> for <b>{html_escape(channel.title or 'this channel')}</b>.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Open index settings", callback_data=f"index_choose:{channel_id}:open:-")],
+                    [InlineKeyboardButton("← Misc", callback_data="misc_home")],
+                ]),
+            )
+            return
+        elif action == "delay":
+            await asyncio.to_thread(repository.update, channel_id, {"delay_minutes": int(value)})
+            delay_unit = "minute" if int(value) == 1 else "minutes"
+            await self._send_or_edit(
+                update,
+                f"Delay set to <b>{int(value)} {delay_unit}</b> for <b>{html_escape(channel.title or 'this channel')}</b>. Annie will update the index {int(value)} {delay_unit} after a new post.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Open index settings", callback_data=f"index_choose:{channel_id}:open:-")],
+                    [InlineKeyboardButton("← Misc", callback_data="misc_home")],
+                ]),
+            )
+            return
+        await self._show_index_settings(update, context, channel_id)
+
+    @staticmethod
+    async def _send_or_edit(
+        update: Update, text: str, markup: InlineKeyboardMarkup | None = None
+    ) -> None:
+        query = update.callback_query
+        if query is not None:
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    raise
+        else:
+            await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    @staticmethod
+    def _index_settings_keyboard(channel_id: int, config: dict | None) -> InlineKeyboardMarkup:
+        config = config or {}
+        enabled = bool(config.get("enabled"))
+        delay = int(config.get("delay_minutes") or 5)
+        rows = [[InlineKeyboardButton(
+            "Turn updates off" if enabled else "Turn updates on",
+            callback_data=f"index_toggle:{channel_id}:{0 if enabled else 1}",
+        )]]
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✓ ' if delay == minutes else ''}{minutes} min",
+                callback_data=f"index_delay:{channel_id}:{minutes}",
+            ) for minutes in (1, 5, 10)
+        ])
+        rows.append([
+            InlineKeyboardButton("Entry format", callback_data=f"index_format:{channel_id}"),
+            InlineKeyboardButton("Index lists", callback_data=f"index_lists:{channel_id}"),
+        ])
+        rows.extend([
+            [InlineKeyboardButton("← Choose channel", callback_data="misc_index"),
+             InlineKeyboardButton("← Misc", callback_data="misc_home")],
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _index_format_keyboard(channel_id: int, config: dict | None) -> InlineKeyboardMarkup:
+        config = config or {}
+        mode = str(config.get("entry_mode") or ("prefix" if config.get("title_mode") == "prefix" else "text"))
+        prefix = str(config.get("entry_prefix") or config.get("title_prefix") or "")
+        bullet = str(config.get("entry_bullet") or "🔹")
+        sort_order = str(config.get("sort_order") or "added")
+        source_options = [
+            ("Text line", "text"), ("One #hashtag", "hashtags"),
+            ("🔗 First link", "links"), ("🖼 Image caption", "image"),
+            ("📎 File name", "file"), ("Custom prefix", "prefix"),
+        ]
+        rows = [
+            [InlineKeyboardButton(
+                f"{'✓ ' if mode == option else ''}{label}",
+                callback_data=f"index_entry_source:{channel_id}:{option}",
+            ) for label, option in source_options[offset:offset + 2]]
+            for offset in range(0, len(source_options), 2)
+        ]
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✓ ' if sort_order == 'alphabetical' else ''}A–Z",
+                callback_data=f"index_sort:{channel_id}:alphabetical",
+            ),
+            InlineKeyboardButton(
+                f"{'✓ ' if sort_order == 'added' else ''}Order added",
+                callback_data=f"index_sort:{channel_id}:added",
+            ),
+        ])
+        if mode == "prefix":
+            rows.append([InlineKeyboardButton(
+                f"Set prefix{': ' + prefix if prefix else ''}",
+                callback_data=f"index_prefix:{channel_id}",
+            )])
+        rows.append([InlineKeyboardButton(
+            f"Set default bullet: {bullet}", callback_data=f"index_bullet:{channel_id}"
+        )])
+        rows.append([InlineKeyboardButton("← Index settings", callback_data=f"index_choose:{channel_id}:open:-")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _index_lists_keyboard(channel_id: int, config: dict | None) -> InlineKeyboardMarkup:
+        targets = list((config or {}).get("targets") or [])
+        rows = []
+        if targets:
+            rows.extend([
+                [InlineKeyboardButton("Set list markers", callback_data=f"index_categories:{channel_id}"),
+                 InlineKeyboardButton("Set placeholder bullet", callback_data=f"index_bullet_target:{channel_id}")],
+                [InlineKeyboardButton("Import older posts", callback_data=f"index_backfill:{channel_id}")],
+                [InlineKeyboardButton("Replace placeholders", callback_data=f"index_targets:{channel_id}:replace"),
+                 InlineKeyboardButton("Add placeholder", callback_data=f"index_targets:{channel_id}:add")],
+                [InlineKeyboardButton(f"Clear placeholders ({len(targets)})", callback_data=f"index_clear:{channel_id}")],
+            ])
+        else:
+            rows.append([InlineKeyboardButton("Register index placeholders", callback_data=f"index_targets:{channel_id}:replace")])
+        rows.append([InlineKeyboardButton("← Index settings", callback_data=f"index_choose:{channel_id}:open:-")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _show_index_settings(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        channel = await self._private_channel_target(update, context, str(channel_id))
+        if channel is None:
+            return
+        repository = self._get_channel_index_repository()
+        if repository is None:
+            await self._send_or_edit(update, "Channel indexes need MongoDB storage. Configure MONGODB_URI first.", self._misc_keyboard())
+            return
+        config = await asyncio.to_thread(repository.get, channel_id)
+        config = config or {}
+        enabled = bool(config.get("enabled"))
+        mode = str(config.get("entry_mode") or ("prefix" if config.get("title_mode") == "prefix" else "text"))
+        sort_order = str(config.get("sort_order") or "added")
+        bullet = str(config.get("entry_bullet") or "🔹")
+        prefix = str(config.get("entry_prefix") or config.get("title_prefix") or "")
+        source_label = {
+            "text": "Text", "hashtags": "Hashtags", "links": "Links",
+            "image": "Image", "file": "File", "prefix": "Custom prefix",
+        }.get(mode, "Text")
+        if mode == "prefix" and prefix:
+            source_label = f"{source_label} ({prefix})"
+        targets = len(config.get("targets") or [])
+        text = (
+            "<b>📇 Index settings</b>\n"
+            f"Channel: <b>{html_escape(channel.title or 'Channel')}</b>\n\n"
+            f"Status: <b>{'On' if enabled else 'Off'}</b> · Delay: <b>{int(config.get('delay_minutes') or 5)} min</b>\n"
+            f"Entry: <b>{html_escape(source_label)}</b> · Order: <b>{'A–Z' if sort_order == 'alphabetical' else 'Added'}</b>\n"
+            f"Default bullet: <b>{html_escape(bullet)}</b> · Placeholders: <b>{targets}</b>\n\n"
+            "• <b>Turn updates on/off</b> to control automatic entries.\n"
+            "• <b>Delay</b> sets how long Annie waits after a post.\n"
+            "• <b>Entry format</b> sets the label, order, and default bullet.\n"
+            "• <b>Index lists</b> sets markers and manages placeholders or older posts."
+        )
+        await self._send_or_edit(update, text, self._index_settings_keyboard(channel_id, config))
+
+    async def _show_index_format(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        channel = await self._private_channel_target(update, context, str(channel_id))
+        if channel is None:
+            return
+        repository = self._get_channel_index_repository()
+        config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+        config = config or {}
+        mode = str(config.get("entry_mode") or "text")
+        source_labels = {
+            "text": "Text line", "hashtags": "One hashtag", "links": "First link",
+            "image": "Image caption", "file": "File name", "prefix": "Custom prefix",
+        }
+        source = source_labels.get(mode, "Text line")
+        if mode == "prefix":
+            prefix = str(config.get("entry_prefix") or config.get("title_prefix") or "")
+            source = f"Custom prefix: {prefix}" if prefix else "Custom prefix (not set)"
+        bullet = str(config.get("entry_bullet") or "🔹")
+        order = "A–Z" if config.get("sort_order") == "alphabetical" else "Order added"
+        text = (
+            f"<b>Entry format · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            f"Source: <b>{html_escape(source)}</b>\n"
+            f"Order: <b>{order}</b> · Default bullet: <b>{html_escape(bullet)}</b>\n\n"
+            "• <b>Text line:</b> first non-empty line. <b>Hashtag/link:</b> first match.\n"
+            "• <b>Image caption:</b> first caption line; add one for a clear label.\n"
+            "• <b>File name:</b> file name, or caption if unnamed.\n"
+            "• <b>Custom prefix:</b> text after your chosen prefix.\n"
+            "• <b>A–Z / Order added</b> sorts entries in each list.\n"
+            "• <b>Default bullet</b> is used unless a placeholder has its own.\n"
+            "Each label links to its original post."
+        )
+        await self._send_or_edit(update, text, self._index_format_keyboard(channel_id, config))
+
+    async def _show_index_lists(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        channel = await self._private_channel_target(update, context, str(channel_id))
+        if channel is None:
+            return
+        repository = self._get_channel_index_repository()
+        config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+        config = config or {}
+        targets = list(config.get("targets") or [])
+        if targets:
+            description = (
+                "• <b>List markers</b> route posts by matching text or hashtags.\n"
+                "• <b>Placeholder bullet</b> changes the bullet for one list.\n"
+                "• <b>Import older posts</b> by forwarding them to Annie.\n"
+                "• <b>Add</b> keeps current placeholders; <b>Replace</b> switches to the forwarded ones.\n"
+                "• <b>Clear</b> stops updating them; it does not delete the messages."
+            )
+        else:
+            description = "• <b>Register placeholders</b> to choose the existing text messages Annie should update."
+        text = (
+            f"<b>Index lists · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            f"Registered placeholders: <b>{len(targets)}</b>\n"
+            f"{description}"
+        )
+        await self._send_or_edit(update, text, self._index_lists_keyboard(channel_id, config))
+
+    async def _index_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            return
+        user_id = update.effective_user.id
+        state = self._index_pending_input.get(user_id)
+        if not state or state.get("expires_at", 0) < time.time():
+            self._index_pending_input.pop(user_id, None)
+            return
+        input_kind = state.get("kind")
+        if input_kind == "bullet":
+            bullet = (update.effective_message.text or "").strip()
+            if not bullet or len(bullet) > 12 or "\n" in bullet or "\r" in bullet:
+                await update.effective_message.reply_text(
+                    "Send one emoji or symbol, up to 12 characters, such as • or 📚."
+                )
+                return
+            channel = await self._private_channel_target(update, context, str(state["channel_id"]))
+            if channel is None:
+                self._index_pending_input.pop(user_id, None)
+                return
+            repository = self._get_channel_index_repository()
+            if repository:
+                target_id = state.get("target_id")
+                if target_id is None:
+                    await asyncio.to_thread(
+                        repository.update, state["channel_id"], {"entry_bullet": bullet}
+                    )
+                else:
+                    config = await asyncio.to_thread(repository.get, int(state["channel_id"])) or {}
+                    targets = list(config.get("targets") or [])
+                    matched = False
+                    for target in targets:
+                        if int(target.get("message_id", -1)) == int(target_id):
+                            target["entry_bullet"] = bullet
+                            matched = True
+                            break
+                    if not matched:
+                        await update.effective_message.reply_text(
+                            "That placeholder is no longer registered. Please select it again."
+                        )
+                        self._index_pending_input.pop(user_id, None)
+                        return
+                    await asyncio.to_thread(
+                        repository.update, int(state["channel_id"]), {"targets": targets}
+                    )
+                await self._refresh_index_posts(context.bot, state["channel_id"])
+            self._index_pending_input.pop(user_id, None)
+            if state.get("target_id") is not None:
+                await self._show_index_lists(update, context, state["channel_id"])
+            else:
+                await self._show_index_format(update, context, state["channel_id"])
+            return
+        if input_kind == "category":
+            marker = (update.effective_message.text or "").strip()
+            if not marker or len(marker) > 60 or "\n" in marker or "\r" in marker:
+                await update.effective_message.reply_text(
+                    "Send one short marker found in posts for this list, such as #Manga."
+                )
+                return
+            channel = await self._private_channel_target(update, context, str(state["channel_id"]))
+            if channel is None:
+                self._index_pending_input.pop(user_id, None)
+                return
+            repository = self._get_channel_index_repository()
+            if repository:
+                config = await asyncio.to_thread(repository.get, int(state["channel_id"])) or {}
+                targets = list(config.get("targets") or [])
+                target_id = int(state["target_id"])
+                for target in targets:
+                    if int(target.get("message_id", -1)) == target_id:
+                        target["category_marker"] = marker
+                        break
+                await asyncio.to_thread(repository.update, int(state["channel_id"]), {"targets": targets})
+            self._index_pending_input.pop(user_id, None)
+            await self._show_index_lists(update, context, state["channel_id"])
+            return
+        if input_kind != "prefix":
+            return
+        prefix = (update.effective_message.text or "").strip()
+        if not prefix or len(prefix) > 40 or "\n" in prefix:
+            await update.effective_message.reply_text("Send one title prefix of 1–40 characters, such as Title:")
+            return
+        channel = await self._private_channel_target(update, context, str(state["channel_id"]))
+        if channel is None:
+            self._index_pending_input.pop(user_id, None)
+            return
+        repository = self._get_channel_index_repository()
+        if repository:
+            await asyncio.to_thread(repository.update, state["channel_id"], {"entry_mode": "prefix", "entry_prefix": prefix})
+        self._index_pending_input.pop(user_id, None)
+        await self._show_index_format(update, context, state["channel_id"])
+
+    async def _show_index_categories(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        if await self._private_channel_target(update, context, str(channel_id)) is None:
+            return
+        repository = self._get_channel_index_repository()
+        config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+        targets = list((config or {}).get("targets") or [])
+        rows = []
+        for index, target in enumerate(targets, start=1):
+            target_id = int(target["message_id"])
+            marker = str(target.get("category_marker") or "").strip()
+            base_text = re.sub(r"<[^>]*>", "", str(target.get("base_html") or ""))
+            base_text = re.sub(r"\s+", " ", html_unescape(base_text)).strip()
+            label = f"{index}. {base_text[:22] or 'Index post'}"
+            rows.append([InlineKeyboardButton(
+                f"{label} · {marker[:24] if marker else 'All posts'}",
+                callback_data=f"index_category_set:{channel_id}:{target_id}",
+            )])
+            if marker:
+                rows.append([InlineKeyboardButton(
+                    f"Clear marker for list {index}",
+                    callback_data=f"index_category_clear:{channel_id}:{target_id}",
+                )])
+        rows.append([InlineKeyboardButton("← Index lists", callback_data=f"index_lists:{channel_id}")])
+        await self._send_or_edit(
+            update,
+            "<b>Choose a list and send its marker</b>\n\n"
+            "• Use text or a hashtag that appears in matching posts.\n"
+            "• Markers are yours to choose. Leave a list unmarked for posts without a marker.",
+            InlineKeyboardMarkup(rows),
+        )
+
+    async def _refresh_index_posts(self, bot: Any, channel_id: int) -> None:
+        repository = self._get_channel_index_repository()
+        if repository is None:
+            return
+        config = await asyncio.to_thread(repository.get, int(channel_id)) or {}
+        entries = list(config.get("entries") or [])
+        for target in config.get("targets") or []:
+            target_id = int(target["message_id"])
+            target_entries = [
+                entry for entry in entries
+                if int(entry.get("target_message_id", -1)) == target_id
+            ]
+            text = ChannelIndexRuntime._render_target(
+                str(target.get("base_html") or ""), target_entries,
+                str(config.get("sort_order") or "added"),
+                str(target.get("entry_bullet") or config.get("entry_bullet") or "🔹"),
+            )
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(channel_id), message_id=target_id, text=text,
+                    parse_mode="HTML", disable_web_page_preview=True,
+                )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    logger.warning(
+                        "[channel-index] could not refresh index post channel_id=%s index_post_id=%s error=%s",
+                        channel_id, target_id, type(exc).__name__,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[channel-index] could not refresh index post channel_id=%s index_post_id=%s error=%s",
+                    channel_id, target_id, type(exc).__name__,
+                )
+
+    async def _index_forwarded_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        user_id = update.effective_user.id
+        state = self._index_pending_input.get(user_id)
+        if not state or state.get("kind") not in {"targets", "backfill", "bullet_target"} or state.get("expires_at", 0) < time.time():
+            return
+        message = update.effective_message
+        channel = await self._private_channel_target(update, context, str(state["channel_id"]))
+        if channel is None:
+            self._index_pending_input.pop(user_id, None)
+            return
+        origin = getattr(message, "forward_origin", None)
+        if getattr(origin, "type", None) != "channel":
+            await message.reply_text("Please forward an index post from the channel you selected.")
+            return
+        channel_id = int(state["channel_id"])
+        if int(origin.chat.id) != channel_id:
+            await message.reply_text("That post is from a different channel. Forward a post from the selected channel.")
+            return
+        if state.get("kind") == "bullet_target":
+            repository = self._get_channel_index_repository()
+            config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+            target_id = int(origin.message_id)
+            if not any(int(target.get("message_id", -1)) == target_id
+                       for target in (config or {}).get("targets") or []):
+                await message.reply_text("That post isn’t a registered Index placeholder. Forward one of your registered placeholders.")
+                return
+            state.update({"kind": "bullet", "target_id": target_id,
+                          "expires_at": time.time() + 600})
+            await message.reply_text(
+                "Send one emoji or symbol for this placeholder only, such as • or 📚."
+            )
+            return
+        if state.get("kind") == "backfill":
+            runtime = self._channel_index_runtime
+            if runtime is None:
+                await message.reply_text("The index listener is not running. Turn updates off and on, then try again.")
+                return
+            result = await runtime.import_forwarded_post(
+                channel_id, int(origin.message_id), message
+            )
+            responses = {
+                "added": "Added to the Index. Forward another older post, or tap Done.",
+                "queued": "Saved; waiting for a free index placeholder. Forward another, or tap Done.",
+                "duplicate": "That post is already indexed or queued. Forward another, or tap Done.",
+                "no_title": "Couldn’t find an entry label in that post. Check the entry source setting, then forward another.",
+                "unmatched": "No list marker matched that post. Forward another, or tap Done.",
+                "ambiguous": "That post matches more than one list marker, so Annie skipped it. Forward another, or tap Done.",
+                "unavailable": "Turn Index updates on and register a placeholder first.",
+            }
+            await message.reply_text(
+                responses.get(result, "Could not import that post. Forward another or tap Done."),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "Done", callback_data=f"index_import_done:{channel_id}"
+                )]]),
+            )
+            return
+        base_html = getattr(message, "text_html", None) or getattr(message, "caption_html", None)
+        if not base_html:
+            await message.reply_text("That index post has no text or caption I can update. Forward a text-based index post instead.")
+            return
+        target = {"message_id": int(origin.message_id), "base_html": base_html}
+        if len(base_html.encode("utf-16-le")) // 2 > 4096:
+            await message.reply_text("That index is too long to edit as one Telegram message.")
+            return
+        targets = state.setdefault("targets", [])
+        if len(targets) >= 12 and all(int(item["message_id"]) != target["message_id"] for item in targets):
+            await message.reply_text("A maximum of 12 index posts can be registered.")
+            return
+        if all(int(item["message_id"]) != target["message_id"] for item in targets):
+            targets.append(target)
+        await message.reply_text(
+            f"Registered {len(targets)} index post(s). Forward more, or tap Done.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "Done", callback_data=f"index_targets_done:{channel_id}"
+            )]]),
+        )
+
+    async def _connected_channel_names(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> str:
+        repository = self._get_channel_connection_repository()
+        if repository is None:
+            return "Channel connections need cloud storage. Configure MONGODB_URI, then try again."
+        try:
+            channels = await asyncio.to_thread(repository.list_channels)
+        except Exception as exc:
+            logger.warning("Could not list channel connections error=%s", type(exc).__name__)
+            return "I couldn’t load connected channels. Please try again."
+        names = []
+        for channel in channels:
+            try:
+                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
+            except Exception:
+                continue
+            if getattr(member, "status", "") in ("administrator", "creator"):
+                names.append(html_escape(str(channel["name"])))
+        return "\n".join(names) if names else "You have no connected channels."
+
+    async def _private_channel_target(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, raw_id: str
+    ):
+        """Resolve a channel ID and verify the caller is one of its admins."""
+        chat = update.effective_chat
+        if chat is None or chat.type != "private":
+            await update.effective_message.reply_text(
+                "Use this command in a private chat with Annie."
+            )
+            return None
+        try:
+            channel_id = int(raw_id)
+        except (TypeError, ValueError):
+            await update.effective_message.reply_text(
+                "That doesn’t look like a channel ID. Use the numeric ID, for example <code>-1001234567890</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return None
+        if channel_id >= 0:
+            await update.effective_message.reply_text(
+                "Channel IDs are negative numbers. Send the full ID, including its minus sign."
+            )
+            return None
+        try:
+            channel = await context.bot.get_chat(channel_id)
+            if getattr(channel, "type", None) != "channel":
+                await update.effective_message.reply_text(
+                    "That ID belongs to a chat, not a Telegram channel."
+                )
+                return None
+            member = await context.bot.get_chat_member(channel_id, update.effective_user.id)
+        except BadRequest as exc:
+            logger.info(
+                "Channel connection lookup failed channel_id=%s error=%s",
+                channel_id, type(exc).__name__,
+            )
+            await update.effective_message.reply_text(
+                "I couldn’t access that channel. Check the ID and add Annie as a channel administrator first."
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Could not verify channel admin channel_id=%s error=%s",
+                channel_id, type(exc).__name__,
+            )
+            await update.effective_message.reply_text(
+                "I couldn’t verify your channel access just now. Please try again."
+            )
+            return None
+        if getattr(member, "status", "") not in ("administrator", "creator"):
+            await update.effective_message.reply_text(
+                "Only that channel’s owner or an administrator can manage its connection."
+            )
+            return None
+        return channel
+
+    async def connect_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Connect a channel after verifying the caller and bot permissions."""
+        message = update.effective_message
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await message.reply_text("Use /connect in a private chat with Annie.")
+            return
+        if len(context.args) != 1:
+            await message.reply_text("Usage: /connect <channel_id>")
+            return
+        channel = await self._private_channel_target(update, context, context.args[0])
+        if channel is None:
+            return
+        try:
+            bot_member = await context.bot.get_chat_member(channel.id, context.bot.id)
+        except Exception as exc:
+            logger.warning(
+                "Could not verify bot channel admin channel_id=%s error=%s",
+                channel.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t verify my channel access. Please try again.")
+            return
+        if getattr(bot_member, "status", "") not in ("administrator", "creator"):
+            await message.reply_text(
+                "Add Annie as an administrator in that channel before connecting it."
+            )
+            return
+        repository = self._get_channel_connection_repository()
+        if repository is None:
+            await message.reply_text(
+                "Channel connections need cloud storage. Configure MONGODB_URI, then try again."
+            )
+            return
+        try:
+            created = await asyncio.to_thread(
+                repository.connect, channel.id, channel.title or "Telegram channel",
+                update.effective_user.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not save channel connection channel_id=%s error=%s",
+                channel.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t save that channel connection. Please try again.")
+            return
+        await message.reply_text(
+            f"Connected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
+            if created else
+            f"<b>{html_escape(channel.title or 'Telegram channel')}</b> is already connected.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def connections_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """List connected channels by name only; private chat only."""
+        message = update.effective_message
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await message.reply_text("Use /connections in a private chat with Annie.")
+            return
+        if context.args:
+            await message.reply_text("Usage: /connections")
+            return
+        await message.reply_text(
+            await self._connected_channel_names(update, context),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def disconnect_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Disconnect a channel after confirming the caller is its admin."""
+        message = update.effective_message
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await message.reply_text("Use /disconnect in a private chat with Annie.")
+            return
+        if len(context.args) != 1:
+            await message.reply_text("Usage: /disconnect <channel_id>")
+            return
+        channel = await self._private_channel_target(update, context, context.args[0])
+        if channel is None:
+            return
+        repository = self._get_channel_connection_repository()
+        if repository is None:
+            await message.reply_text(
+                "Channel connections need cloud storage. Configure MONGODB_URI, then try again."
+            )
+            return
+        try:
+            removed = await asyncio.to_thread(repository.disconnect, channel.id)
+        except Exception as exc:
+            logger.warning(
+                "Could not remove channel connection channel_id=%s error=%s",
+                channel.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t disconnect that channel. Please try again.")
+            return
+        if removed and self._channel_index_runtime is not None:
+            await self._channel_index_runtime.cancel_channel(channel.id)
+            await self._stop_channel_index_listener_if_idle()
+        await message.reply_text(
+            f"Disconnected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
+            if removed else "That channel wasn’t connected.",
+            parse_mode=ParseMode.HTML,
+        )
 
     @staticmethod
     def _features_text() -> str:
-        return """<b>✦ What Annie can do</b>
+        return """<b>✦ What Annie can do?</b>
 
 📖 <b>Find books</b>
 Search by title or author in a chat or inline.
@@ -1614,7 +2542,7 @@ See available covers, descriptions, genres, publication information, and ratings
 Download a book cover from its details.
 
 🧭 <b>Discover in the portal</b>
-Browse trending picks, genre shelves, search, and <i>More Like This</i>.
+Browse trending picks, genre shelves, search, and similar books.
 
 ✨ <b>Find your next read</b>
 Get recommendations from books you’ve read or liked, genres, and moods.
@@ -1835,7 +2763,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
         await update.message.reply_text(
             self._help_text(),
             parse_mode=ParseMode.HTML,
-            reply_markup=self._back_to_start_markup(),
+            reply_markup=self._help_keyboard(),
         )
 
     async def ping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3508,7 +4436,405 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 await query.message.reply_text(
                     self._help_text(),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=self._back_to_start_markup(),
+                    reply_markup=self._help_keyboard(),
+                )
+                return
+            if callback_data in {"start_misc", "help_misc"}:
+                await query.answer()
+                await query.edit_message_text(
+                    self._misc_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._misc_keyboard(),
+                )
+                return
+            if callback_data == "misc_home":
+                await query.answer()
+                await query.edit_message_text(
+                    self._misc_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._misc_keyboard(),
+                )
+                return
+            if callback_data == "misc_connections":
+                await query.answer()
+                await query.edit_message_text(
+                    self._connections_help_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("← Back to Misc", callback_data="misc_home")
+                    ]]),
+                )
+                return
+            if callback_data == "misc_list_connections":
+                if update.effective_chat is None or update.effective_chat.type != "private":
+                    await query.answer("Open Misc in a private chat with Annie.", show_alert=True)
+                    return
+                await query.answer()
+                await query.edit_message_text(
+                    await self._connected_channel_names(update, context),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._misc_keyboard(),
+                )
+                return
+            if callback_data == "misc_index":
+                await query.answer()
+                await self._show_index_channel_picker(update, context)
+                return
+            if callback_data.startswith("index_choose:"):
+                await query.answer()
+                _, raw_channel, action, value = callback_data.split(":", 3)
+                await self._select_index_channel(
+                    update, context, int(raw_channel), action, value
+                )
+                return
+            if callback_data.startswith("index_format:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                await self._show_index_format(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_lists:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                await self._show_index_lists(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_toggle:"):
+                await query.answer()
+                _, raw_channel, raw_enabled = callback_data.split(":", 2)
+                channel = await self._private_channel_target(update, context, raw_channel)
+                if channel is None:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository is None:
+                    await self._send_or_edit(update, "Channel indexes need MongoDB storage.", self._misc_keyboard())
+                    return
+                channel_id, enabled = int(raw_channel), raw_enabled == "1"
+                current = await asyncio.to_thread(repository.get, channel_id) or {}
+                if enabled and not current.get("targets"):
+                    await self._send_or_edit(update, "Register an existing index post before turning updates on.", self._index_settings_keyboard(channel_id, current))
+                    return
+                if enabled and not await self._ensure_channel_index_listener():
+                    await self._send_or_edit(update, "Automatic updates need API_ID and API_HASH and must run in polling mode. Annie could not start the index listener, so updates remain off.", self._index_settings_keyboard(channel_id, current))
+                    return
+                await asyncio.to_thread(repository.update, channel_id, {"enabled": enabled})
+                if not enabled and self._channel_index_runtime is not None:
+                    await self._channel_index_runtime.cancel_channel(channel_id)
+                    await self._stop_channel_index_listener_if_idle()
+                await self._show_index_settings(update, context, channel_id)
+                return
+            if callback_data.startswith("index_delay:"):
+                await query.answer()
+                _, raw_channel, raw_delay = callback_data.split(":", 2)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository:
+                    await asyncio.to_thread(repository.update, int(raw_channel), {"delay_minutes": int(raw_delay)})
+                await self._show_index_settings(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_sort:"):
+                await query.answer()
+                _, raw_channel, sort_order = callback_data.split(":", 2)
+                channel_id = int(raw_channel)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                if sort_order not in {"alphabetical", "added"}:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository is not None:
+                    await asyncio.to_thread(repository.update, channel_id, {"sort_order": sort_order})
+                    config = await asyncio.to_thread(repository.get, channel_id) or {}
+                    entries = list(config.get("entries") or [])
+                    for target in config.get("targets") or []:
+                        target_id = int(target["message_id"])
+                        target_entries = [
+                            entry for entry in entries
+                            if int(entry.get("target_message_id", -1)) == target_id
+                        ]
+                        text = ChannelIndexRuntime._render_target(
+                            str(target.get("base_html") or ""), target_entries, sort_order,
+                            str(target.get("entry_bullet") or config.get("entry_bullet") or "🔹"),
+                        )
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=channel_id, message_id=target_id,
+                                text=text, parse_mode="HTML", disable_web_page_preview=True,
+                            )
+                        except BadRequest as exc:
+                            if "message is not modified" not in str(exc).casefold():
+                                logger.warning(
+                                    "[channel-index] could not apply entry order channel_id=%s index_post_id=%s error=%s",
+                                    channel_id, target_id, type(exc).__name__,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "[channel-index] could not apply entry order channel_id=%s index_post_id=%s error=%s",
+                                channel_id, target_id, type(exc).__name__,
+                            )
+                await self._show_index_format(update, context, channel_id)
+                return
+            if callback_data.startswith("index_bullet:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                channel_id = int(raw_channel)
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "bullet", "channel_id": channel_id,
+                    "expires_at": time.time() + 600, "return_to": "format",
+                }
+                await query.edit_message_text(
+                    "Send one emoji or symbol for each entry, such as • or 📚. This replaces the current bullet.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Cancel", callback_data=f"index_bullet_cancel:{channel_id}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_bullet_target:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                channel_id = int(raw_channel)
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "bullet_target", "channel_id": channel_id,
+                    "expires_at": time.time() + 600, "return_to": "lists",
+                }
+                await query.edit_message_text(
+                    "Forward the registered placeholder you want to customize. Annie will then ask for its bullet.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Cancel", callback_data=f"index_bullet_cancel:{channel_id}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_bullet_cancel:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                state = self._index_pending_input.pop(update.effective_user.id, None) or {}
+                if state.get("return_to") == "lists":
+                    await self._show_index_lists(update, context, int(raw_channel))
+                else:
+                    await self._show_index_format(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_entry_source:"):
+                await query.answer()
+                _, raw_channel, mode = callback_data.split(":", 2)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                if mode not in {"text", "hashtags", "links", "image", "file", "prefix"}:
+                    return
+                repository = self._get_channel_index_repository()
+                current = await asyncio.to_thread(repository.get, int(raw_channel)) if repository else {}
+                current = current or {}
+                prefix = str(current.get("entry_prefix") or current.get("title_prefix") or "")
+                if mode == "prefix" and not prefix:
+                    self._index_pending_input[update.effective_user.id] = {
+                        "kind": "prefix", "channel_id": int(raw_channel),
+                        "expires_at": time.time() + 600,
+                    }
+                    await query.edit_message_text(
+                        "Custom prefix finds a text/caption line that begins with your marker, then uses the text after it. Send the marker now, for example <code>Title:</code>.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                if repository:
+                    await asyncio.to_thread(repository.update, int(raw_channel), {"entry_mode": mode})
+                await self._show_index_format(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_mode:"):
+                await query.answer()
+                _, raw_channel, mode = callback_data.split(":", 2)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                current = await asyncio.to_thread(repository.get, int(raw_channel)) if repository else {}
+                current = current or {}
+                if mode == "prefix" and not (current.get("entry_prefix") or current.get("title_prefix")):
+                    self._index_pending_input[update.effective_user.id] = {
+                        "kind": "prefix", "channel_id": int(raw_channel),
+                        "expires_at": time.time() + 600,
+                    }
+                    await query.edit_message_text(
+                        "Custom prefix finds a text/caption line that begins with your marker, then uses the text after it. Send the marker now, for example <code>Title:</code>.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                if repository:
+                    await asyncio.to_thread(repository.update, int(raw_channel), {"entry_mode": "prefix" if mode == "prefix" else "text"})
+                await self._show_index_format(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_prefix:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "prefix", "channel_id": int(raw_channel),
+                    "expires_at": time.time() + 600, "return_to": "format",
+                }
+                await query.edit_message_text(
+                    "Send a text/caption prefix, such as <code>Title:</code>. Annie uses the text after it as the entry label.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if callback_data.startswith("index_targets:"):
+                await query.answer()
+                _, raw_channel, mode = callback_data.split(":", 2)
+                channel = await self._private_channel_target(update, context, raw_channel)
+                if channel is None:
+                    return
+                try:
+                    bot_member = await context.bot.get_chat_member(channel.id, context.bot.id)
+                except Exception:
+                    bot_member = None
+                bot_status = getattr(bot_member, "status", "")
+                can_edit = bot_status == "creator" or bool(getattr(bot_member, "can_edit_messages", False))
+                if bot_status not in ("administrator", "creator") or not can_edit:
+                    await self._send_or_edit(update, "Annie needs channel admin permission to edit index posts.", self._misc_keyboard())
+                    return
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "targets", "mode": mode, "channel_id": channel.id,
+                    "targets": [], "expires_at": time.time() + 600,
+                }
+                await query.edit_message_text(
+                    "Forward the existing index post(s) from this channel to Annie, one at a time. When finished, tap Done under the latest reply. You can register up to 12 posts.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Cancel", callback_data=f"index_cancel:{channel.id}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_cancel:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                self._index_pending_input.pop(update.effective_user.id, None)
+                await self._show_index_lists(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_targets_done:"):
+                _, raw_channel = callback_data.split(":", 1)
+                channel_id = int(raw_channel)
+                state = self._index_pending_input.get(update.effective_user.id) or {}
+                if state.get("kind") != "targets" or int(state.get("channel_id", 0)) != channel_id:
+                    await query.answer("That setup step expired. Run /index again.", show_alert=True)
+                    return
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                targets = state.get("targets") or []
+                repository = self._get_channel_index_repository()
+                if not targets or repository is None:
+                    await query.answer("Forward at least one index post first.", show_alert=True)
+                    return
+                if state.get("mode") == "add":
+                    current = await asyncio.to_thread(repository.get, channel_id) or {}
+                    if len(current.get("targets") or []) + len(targets) > 12:
+                        await query.answer("A maximum of 12 index posts can be registered.", show_alert=True)
+                        return
+                await asyncio.to_thread(repository.set_targets, channel_id, targets, state.get("mode") == "add")
+                if self._channel_index_runtime is not None:
+                    await self._channel_index_runtime.resume_pending(channel_id)
+                self._index_pending_input.pop(update.effective_user.id, None)
+                await query.answer()
+                await self._show_index_lists(update, context, channel_id)
+                return
+            if callback_data.startswith("index_categories:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                await self._show_index_categories(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_category_set:"):
+                await query.answer()
+                _, raw_channel, raw_target = callback_data.split(":", 2)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "category", "channel_id": int(raw_channel),
+                    "target_id": int(raw_target), "expires_at": time.time() + 600,
+                }
+                await query.edit_message_text(
+                    "Send a short marker that appears in posts for this list. It can be any text you choose, such as <code>#Manga</code> or <code>Anime:</code>. Annie will match it in post text or captions.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Cancel", callback_data=f"index_category_cancel:{raw_channel}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_category_cancel:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                self._index_pending_input.pop(update.effective_user.id, None)
+                await self._show_index_categories(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_category_clear:"):
+                await query.answer()
+                _, raw_channel, raw_target = callback_data.split(":", 2)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository:
+                    config = await asyncio.to_thread(repository.get, int(raw_channel)) or {}
+                    targets = list(config.get("targets") or [])
+                    for target in targets:
+                        if int(target.get("message_id", -1)) == int(raw_target):
+                            target.pop("category_marker", None)
+                    await asyncio.to_thread(repository.update, int(raw_channel), {"targets": targets})
+                await self._show_index_categories(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_import_done:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                channel_id = int(raw_channel)
+                state = self._index_pending_input.get(update.effective_user.id) or {}
+                if state.get("kind") == "backfill" and int(state.get("channel_id", 0)) == channel_id:
+                    self._index_pending_input.pop(update.effective_user.id, None)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                await self._show_index_lists(update, context, channel_id)
+                return
+            if callback_data.startswith("index_backfill:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                channel_id = int(raw_channel)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+                if not config or not config.get("enabled"):
+                    await self._send_or_edit(
+                        update, "Turn Index updates on first.",
+                        self._index_lists_keyboard(channel_id, config),
+                    )
+                    return
+                if self._channel_index_runtime is None:
+                    await self._send_or_edit(update, "The Index listener is not running. Turn updates off and on, then try again.", self._index_lists_keyboard(channel_id, config))
+                    return
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "backfill", "channel_id": channel_id,
+                    "expires_at": time.time() + 3600,
+                }
+                await query.edit_message_text(
+                    "Forward older posts from this channel to Annie here. She’ll add matching posts to the right Index list and skip duplicates. Tap Done when finished.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Done", callback_data=f"index_import_done:{channel_id}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_clear:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository:
+                    await asyncio.to_thread(repository.update, int(raw_channel), {"targets": [], "entries": [], "enabled": False})
+                if self._channel_index_runtime is not None:
+                    await self._channel_index_runtime.cancel_channel(int(raw_channel))
+                    await self._stop_channel_index_listener_if_idle()
+                await self._show_index_lists(update, context, int(raw_channel))
+                return
+            if callback_data == "help_main":
+                await query.answer()
+                await query.edit_message_text(
+                    self._help_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._help_keyboard(),
                 )
                 return
             if callback_data == "start_features":

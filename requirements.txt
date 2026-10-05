@@ -8,3 +8,4 @@ flask>=3.0.0
 pymongo>=4.7,<5
 dnspython>=2.7,<3
 Pillow>=10.0.0
+Telethon>=1.45,<2

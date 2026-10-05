@@ -41,7 +41,7 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
-    def test_start_menu_has_help_portal_recommendations_bookshelf_and_favorites(self):
+    def test_start_menu_has_help_misc_features_portal_recommendations_bookshelf_and_favorites(self):
         update = MagicMock()
         update.effective_chat.type = "private"
         context = MagicMock()
@@ -51,16 +51,17 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         buttons = [button for row in markup.inline_keyboard for button in row]
 
         self.assertEqual(buttons[0].callback_data, "start_help")
-        self.assertEqual(buttons[1].callback_data, "start_features")
-        self.assertEqual(buttons[2].text, "🔎 Annie Search Portal")
-        self.assertEqual(buttons[2].web_app.url, "https://books.example/miniapp/")
-        self.assertEqual(buttons[3].text, "✨ Annie Recommendations")
-        self.assertEqual(buttons[3].web_app.url, "https://books.example/miniapp/?page=recommendations")
-        self.assertEqual(buttons[4].text, "📚 My Bookshelf")
-        self.assertEqual(buttons[4].web_app.url, "https://books.example/miniapp/?page=bookshelf")
-        self.assertEqual(buttons[5].text, "♥ Favourites")
-        self.assertEqual(buttons[5].web_app.url, "https://books.example/miniapp/?page=favorites")
-        self.assertNotEqual(buttons[2].text.split()[0], buttons[4].text.split()[0])
+        self.assertEqual(buttons[1].callback_data, "start_misc")
+        self.assertEqual(buttons[2].callback_data, "start_features")
+        self.assertEqual(buttons[3].text, "🔎 Annie Search Portal")
+        self.assertEqual(buttons[3].web_app.url, "https://books.example/miniapp/")
+        self.assertEqual(buttons[4].text, "✨ Annie Recommendations")
+        self.assertEqual(buttons[4].web_app.url, "https://books.example/miniapp/?page=recommendations")
+        self.assertEqual(buttons[5].text, "📚 My Bookshelf")
+        self.assertEqual(buttons[5].web_app.url, "https://books.example/miniapp/?page=bookshelf")
+        self.assertEqual(buttons[6].text, "♥ Favourites")
+        self.assertEqual(buttons[6].web_app.url, "https://books.example/miniapp/?page=favorites")
+        self.assertNotEqual(buttons[3].text.split()[0], buttons[5].text.split()[0])
 
     def test_features_list_describes_bookshelf(self):
         text = GoodreadsBot._features_text()
@@ -226,7 +227,7 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
 
         markup = GoodreadsBot._start_keyboard(object.__new__(GoodreadsBot), update, context)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        page_buttons = buttons[2:]
+        page_buttons = buttons[3:]
 
         self.assertEqual(
             [button.url for button in page_buttons],
