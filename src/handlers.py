@@ -1681,7 +1681,7 @@ class GoodreadsBot:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("❔ Help", callback_data="start_help"),
              InlineKeyboardButton("⚙ Misc", callback_data="start_misc"),
-             InlineKeyboardButton("✦ Features List", callback_data="start_features")],
+             InlineKeyboardButton("✦ Features", callback_data="start_features")],
             [portal_button],
             [recommendations_button],
             [bookshelf_button, favorites_button],
