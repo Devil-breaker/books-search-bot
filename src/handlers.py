@@ -1502,6 +1502,7 @@ class GoodreadsBot:
             BotCommand("search", "Search books by title or author"),
             BotCommand("ping", "Check bot status and uptime"),
         ]
+        commands.sort(key=lambda command: command.command)
         private_commands = commands + [
             BotCommand("connect", "Connect a channel (private chat)"),
             BotCommand("connections", "List connected channels"),
@@ -1509,6 +1510,7 @@ class GoodreadsBot:
             BotCommand("misc", "Channel tools and settings"),
             BotCommand("index", "Manage channel indexes"),
         ]
+        private_commands.sort(key=lambda command: command.command)
         for scope, scoped_commands in (
             (None, commands),
             (BotCommandScopeAllPrivateChats(), private_commands),
@@ -1529,6 +1531,7 @@ class GoodreadsBot:
                 BotCommand("unauthorize", "Revoke an authorized user"),
                 BotCommand("admins", "List authorized users"),
             ]
+            owner_commands.sort(key=lambda command: command.command)
             try:
                 await bot.set_my_commands(
                     owner_commands, scope=BotCommandScopeChat(chat_id=owner_id)

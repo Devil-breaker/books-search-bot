@@ -129,8 +129,15 @@ class TestOwnerAdminCommands(unittest.IsolatedAsyncioTestCase):
         owner_commands = bot.app.bot.set_my_commands.await_args_list[-1].args[0]
         owner_scope = bot.app.bot.set_my_commands.await_args_list[-1].kwargs["scope"]
         self.assertEqual(owner_scope.chat_id, 1)
+        owner_command_names = [command.command for command in owner_commands]
+        group_command_names = [
+            command.command
+            for command in bot.app.bot.set_my_commands.await_args_list[2].args[0]
+        ]
+        self.assertEqual(owner_command_names, sorted(owner_command_names))
+        self.assertTrue({"connect", "connections", "disconnect", "index", "misc"}.isdisjoint(group_command_names))
         self.assertTrue({"authorize", "unauthorize", "admins"}.issubset(
-            {command.command for command in owner_commands}
+            set(owner_command_names)
         ))
 
     async def test_authorized_user_bypasses_existing_cooldown_and_block(self):

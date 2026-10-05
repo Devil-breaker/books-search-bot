@@ -250,6 +250,19 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.app.bot.set_my_commands.await_count, 3)
         commands = bot.app.bot.set_my_commands.await_args_list[0].args[0]
         command_names = [command.command for command in commands]
+        private_names = [
+            command.command
+            for command in bot.app.bot.set_my_commands.await_args_list[1].args[0]
+        ]
+        group_names = [
+            command.command
+            for command in bot.app.bot.set_my_commands.await_args_list[2].args[0]
+        ]
+        self.assertEqual(command_names, sorted(command_names))
+        self.assertEqual(private_names, sorted(private_names))
+        self.assertEqual(group_names, sorted(group_names))
+        self.assertTrue({"connect", "connections", "disconnect", "index", "misc"}.issubset(private_names))
+        self.assertTrue({"connect", "connections", "disconnect", "index", "misc"}.isdisjoint(group_names))
         self.assertIn("portal", command_names)
         self.assertIn("recom", command_names)
         self.assertNotIn("annie_app", command_names)
