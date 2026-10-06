@@ -31,13 +31,38 @@ class MongoChannelIndexRepository:
         return self.configs.find_one({"_id": int(channel_id)})
 
     def list_enabled(self) -> list[dict[str, Any]]:
-        return list(self.configs.find({"enabled": True}, {"_id": 1, "pending_posts": 1}))
+        return list(self.configs.find(
+            {"enabled": True},
+            {"_id": 1, "entries": 1, "pending_posts": 1, "targets": 1},
+        ))
 
     def update(self, channel_id: int, fields: dict[str, Any]) -> None:
         fields = dict(fields)
         fields["updated_at"] = datetime.now(timezone.utc)
         self.configs.update_one(
             {"_id": int(channel_id)}, {"$set": fields}, upsert=True
+        )
+
+    def add_excluded_sender(
+        self, channel_id: int, sender_id: int, label: str | None = None
+    ) -> bool:
+        update_fields: dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
+        if label:
+            update_fields[f"excluded_sender_labels.{int(sender_id)}"] = str(label)[:80]
+        result = self.configs.update_one(
+            {"_id": int(channel_id)},
+            {"$addToSet": {"excluded_sender_ids": int(sender_id)},
+             "$set": update_fields},
+            upsert=True,
+        )
+        return bool(result.modified_count or result.upserted_id is not None)
+
+    def remove_excluded_sender(self, channel_id: int, sender_id: int) -> None:
+        self.configs.update_one(
+            {"_id": int(channel_id)},
+            {"$pull": {"excluded_sender_ids": int(sender_id)},
+             "$unset": {f"excluded_sender_labels.{int(sender_id)}": ""},
+             "$set": {"updated_at": datetime.now(timezone.utc)}},
         )
 
     def set_targets(self, channel_id: int, targets: list[dict[str, Any]], append: bool) -> None:
@@ -97,6 +122,18 @@ class ChannelIndexRuntime:
 
     MAX_INDEX_TEXT = 4096
 
+    @staticmethod
+    def _excluded_sender_ids(config: dict[str, Any]) -> set[int]:
+        excluded: set[int] = set()
+        for value in config.get("excluded_sender_ids") or []:
+            try:
+                sender_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if sender_id > 0:
+                excluded.add(sender_id)
+        return excluded
+
     def __init__(self, bot: Any, repository: MongoChannelIndexRepository, api_id: int, api_hash: str, token: str) -> None:
         self.bot = bot
         self.repository = repository
@@ -124,11 +161,127 @@ class ChannelIndexRuntime:
         self.client.add_event_handler(self._on_edited_post, events.MessageEdited())
         self.client.add_event_handler(self._on_deleted_posts, events.MessageDeleted())
         for config in await asyncio.to_thread(self.repository.list_enabled):
+            if not await self._reconcile_saved_entries(config):
+                # Do not replay persisted work if Telegram could not verify it.
+                continue
             for pending in config.get("pending_posts") or []:
                 self._schedule(
                     int(config["_id"]), int(pending["message_id"]),
                     str(pending["title"]), pending.get("due_at"),
                 )
+
+    async def _messages_by_id(self, channel_id: int, message_ids: list[int]) -> dict[int, Any]:
+        """Fetch specific channel messages; unlike history, this is bot-supported."""
+        found: dict[int, Any] = {}
+        unique_ids = list(dict.fromkeys(int(value) for value in message_ids))
+        for start in range(0, len(unique_ids), 100):
+            batch = unique_ids[start:start + 100]
+            result = await self.client.get_messages(int(channel_id), ids=batch)
+            if result is None:
+                continue
+            messages = result if isinstance(result, (list, tuple)) else [result]
+            for message in messages:
+                message_id = getattr(message, "id", None)
+                if message_id is not None:
+                    found[int(message_id)] = message
+        return found
+
+    async def get_sender_details(
+        self, channel_id: int, message_id: int
+    ) -> tuple[int | None, str | None]:
+        result = await self.client.get_messages(int(channel_id), ids=int(message_id))
+        if isinstance(result, (list, tuple)):
+            result = result[0] if result else None
+        sender_id = getattr(result, "sender_id", None)
+        try:
+            sender_id = int(sender_id) if sender_id is not None else None
+        except (TypeError, ValueError):
+            sender_id = None
+        label = str(getattr(result, "post_author", None) or "").strip() or None
+        return sender_id, label
+
+    async def resolve_sender_username(self, username: str) -> tuple[int | None, str | None]:
+        from telethon.tl.types import User
+
+        entity = await self.client.get_entity(username)
+        if not isinstance(entity, User) or int(getattr(entity, "id", 0)) <= 0:
+            return None, None
+        sender_id = int(entity.id)
+        label = str(getattr(entity, "username", None) or username).strip()
+        return sender_id, f"@{label.lstrip('@')}"
+
+    @staticmethod
+    def _message_text_urls(message: Any) -> set[str]:
+        return {
+            str(url)
+            for entity in (getattr(message, "entities", None) or [])
+            if (url := getattr(entity, "url", None))
+        }
+
+    async def _reconcile_saved_entries(self, config: dict[str, Any]) -> bool:
+        """Drop deleted sources and entries removed from their index post while offline."""
+        from src.utils import logger
+        from telethon.tl.types import MessageEmpty
+
+        channel_id = int(config["_id"])
+        entries = list(config.get("entries") or [])
+        pending = list(config.get("pending_posts") or [])
+        targets = list(config.get("targets") or [])
+        message_ids = [int(entry.get("source_message_id", -1)) for entry in entries]
+        message_ids.extend(int(item.get("message_id", -1)) for item in pending)
+        message_ids.extend(int(target.get("message_id", -1)) for target in targets)
+        message_ids = [message_id for message_id in message_ids if message_id > 0]
+        if not message_ids:
+            return True
+        try:
+            messages = await self._messages_by_id(channel_id, message_ids)
+        except Exception as exc:
+            logger.warning(
+                "[channel-index] saved-entry check failed channel_id=%s error=%s; pending entries will not be replayed",
+                channel_id, type(exc).__name__,
+            )
+            return False
+
+        kept_entries = []
+        removed_entries = 0
+        for entry in entries:
+            source_id = int(entry.get("source_message_id", -1))
+            source = messages.get(source_id)
+            target = messages.get(int(entry.get("target_message_id", -1)))
+            if source is None or isinstance(source, MessageEmpty):
+                removed_entries += 1
+                continue
+            # If the placeholder still exists, its live link entities tell us
+            # whether an admin removed this entry manually while Annie was off.
+            if target is not None and not isinstance(target, MessageEmpty):
+                target_urls = self._message_text_urls(target)
+                entry_url = str(entry.get("url") or "")
+                if entry_url and entry_url not in target_urls:
+                    removed_entries += 1
+                    continue
+            kept_entries.append(entry)
+
+        kept_pending = []
+        removed_pending = 0
+        for item in pending:
+            source = messages.get(int(item.get("message_id", -1)))
+            if source is None or isinstance(source, MessageEmpty):
+                removed_pending += 1
+                continue
+            kept_pending.append(item)
+
+        fields: dict[str, Any] = {}
+        if removed_entries:
+            fields["entries"] = kept_entries
+        if removed_pending:
+            fields["pending_posts"] = kept_pending
+        if fields:
+            await asyncio.to_thread(self.repository.update, channel_id, fields)
+            logger.info(
+                "[channel-index] reconciled saved entries channel_id=%s removed_entries=%s removed_pending=%s",
+                channel_id, removed_entries, removed_pending,
+            )
+        return True
 
     async def close(self) -> None:
         tasks = list(self._pending.values())
@@ -192,6 +345,15 @@ class ChannelIndexRuntime:
         title = self._extract_entry(message, config)
         if not title:
             return "no_title"
+        excluded_sender_ids = self._excluded_sender_ids(config)
+        sender_id = None
+        if excluded_sender_ids:
+            try:
+                sender_id, _ = await self.get_sender_details(channel_id, source_message_id)
+            except Exception:
+                return "sender_check_failed"
+            if sender_id is not None and int(sender_id) in excluded_sender_ids:
+                return "excluded"
         targets = list(config.get("targets") or [])
         candidates, category_marker, categorized, ambiguous = self._targets_for_post(
             message, targets
@@ -206,6 +368,7 @@ class ChannelIndexRuntime:
             "due_at": datetime.now(timezone.utc),
             "category_marker": category_marker,
             "categorized": categorized,
+            "sender_id": int(sender_id) if sender_id is not None else None,
         }
         queued = await asyncio.to_thread(
             self.repository.schedule_post, int(channel_id), item
@@ -269,7 +432,22 @@ class ChannelIndexRuntime:
                for target in config.get("targets") or []):
             return
         sender_id = getattr(message, "sender_id", None)
+        from src.utils import logger
+        logger.info(
+            "[channel-index] received channel post channel_id=%s post_id=%s sender_id=%s post_author=%s",
+            channel_id, int(message.id), sender_id, getattr(message, "post_author", None),
+        )
         if sender_id == self.bot_user_id:
+            return
+        try:
+            is_excluded = sender_id is not None and int(sender_id) in self._excluded_sender_ids(config)
+        except (TypeError, ValueError):
+            is_excluded = False
+        if is_excluded:
+            logger.info(
+                "[channel-index] skipped excluded sender channel_id=%s post_id=%s sender_id=%s",
+                channel_id, int(message.id), sender_id,
+            )
             return
         title = self._extract_entry(message, config)
         if not title:
@@ -291,6 +469,7 @@ class ChannelIndexRuntime:
         pending = {
             "message_id": post_id, "title": title, "due_at": due_at,
             "category_marker": category_marker, "categorized": categorized,
+            "sender_id": int(sender_id) if sender_id is not None else None,
         }
         try:
             queued = await asyncio.to_thread(self.repository.schedule_post, channel_id, pending)
@@ -436,6 +615,34 @@ class ChannelIndexRuntime:
                     item for item in config.get("pending_posts") or []
                     if int(item.get("message_id", -1)) == post_id
                 )
+                excluded_sender_ids = self._excluded_sender_ids(config)
+                sender_id = pending_item.get("sender_id")
+                if sender_id is None and excluded_sender_ids:
+                    try:
+                        source = await self.client.get_messages(channel_id, ids=post_id)
+                        if isinstance(source, (list, tuple)):
+                            source = source[0] if source else None
+                        sender_id = getattr(source, "sender_id", None)
+                    except Exception as exc:
+                        from src.utils import logger
+                        logger.warning(
+                            "[channel-index] could not check excluded sender channel_id=%s post_id=%s error=%s",
+                            channel_id, post_id, type(exc).__name__,
+                        )
+                        await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+                        return
+                try:
+                    sender_is_excluded = sender_id is not None and int(sender_id) in excluded_sender_ids
+                except (TypeError, ValueError):
+                    sender_is_excluded = False
+                if sender_is_excluded:
+                    await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+                    from src.utils import logger
+                    logger.info(
+                        "[channel-index] skipped excluded sender channel_id=%s post_id=%s sender_id=%s",
+                        channel_id, post_id, sender_id,
+                    )
+                    return
                 if pending_item.get("categorized"):
                     marker = str(pending_item.get("category_marker") or "").strip()
                     targets = [
@@ -532,6 +739,25 @@ class ChannelIndexRuntime:
             async with self._lock:
                 config = await asyncio.to_thread(self.repository.get, channel_id)
                 if not config:
+                    return
+                if any(int(target.get("message_id", -1)) == post_id
+                       for target in config.get("targets") or []):
+                    target_urls = self._message_text_urls(message)
+                    entries = list(config.get("entries") or [])
+                    kept_entries = [
+                        entry for entry in entries
+                        if int(entry.get("target_message_id", -1)) != post_id
+                        or str(entry.get("url") or "") in target_urls
+                    ]
+                    removed_count = len(entries) - len(kept_entries)
+                    if removed_count:
+                        await asyncio.to_thread(
+                            self.repository.update, channel_id, {"entries": kept_entries}
+                        )
+                        logger.info(
+                            "[channel-index] removed manually deleted index links channel_id=%s index_post_id=%s entries=%s",
+                            channel_id, post_id, removed_count,
+                        )
                     return
                 title = self._extract_entry(message, config)
                 candidates, category_marker, categorized, ambiguous = self._targets_for_post(

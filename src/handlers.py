@@ -15,6 +15,7 @@ from html import unescape as html_unescape
 from src.admins import MongoBotAdminRepository
 from src.channel_connections import MongoChannelConnectionRepository
 from src.channel_index import ChannelIndexRuntime, MongoChannelIndexRepository
+from src.channel_management import ChannelManager
 from src.miniapp.auth import issue_inline_token
 from io import BytesIO
 from PIL import Image
@@ -134,6 +135,12 @@ class GoodreadsBot:
             logger.warning("BOT_OWNER_ID must be a numeric Telegram user ID; owner exemption is disabled")
         if not owner_id:
             logger.warning("BOT_OWNER_ID is not configured; no user is exempt from cancellation abuse limits")
+        self._channel_manager = ChannelManager(
+            self._owner_user_id,
+            self._get_channel_connection_repository,
+            self._open_channel_manager_index,
+        )
+        self._channel_manager_task: asyncio.Task | None = None
         self.setup_handlers()
 
     _CANCEL_ABUSE_THRESHOLD = 3
@@ -212,6 +219,12 @@ class GoodreadsBot:
             database_name = os.getenv("MONGODB_DB_NAME", "annie_db").strip() or "annie_db"
             self._channel_connection_repository = MongoChannelConnectionRepository(uri, database_name)
         return self._channel_connection_repository
+
+    async def _open_channel_manager_index(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        """Open the existing Index Manager for the channel selected in Channel Manager."""
+        await self._select_index_channel(update, context, int(channel_id))
 
     async def _load_bot_admin_ids(self, force: bool = False) -> bool:
         """Load the small allowlist once; writes update the in-memory copy."""
@@ -1380,12 +1393,25 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("disconnect", self.disconnect_command))
         self.app.add_handler(CommandHandler("misc", self.misc_command))
         self.app.add_handler(CommandHandler("index", self.index_command))
+        self.app.add_handler(CommandHandler("cancel", self._channel_manager.cancel_command))
+        self.app.add_handler(CommandHandler("channelmanager", self._channel_manager.open_command))
+        self.app.add_handler(CommandHandler("channelapprove", self._channel_manager.approve_channel_command))
+        self.app.add_handler(CommandHandler("channelrevoke", self._channel_manager.revoke_channel_command))
+        self.app.add_handler(CommandHandler("channelapprovals", self._channel_manager.list_approved_channels_command))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("ping", self.ping_command))
+        self.app.add_handler(CallbackQueryHandler(
+            self._channel_manager.handle_callback, pattern=r"^cm:"
+        ))
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(InlineQueryHandler(self.inline_search))
         self.app.add_handler(MessageHandler(filters.FORWARDED, self._index_forwarded_message))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._index_text_input))
+        self.app.add_handler(MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            self._channel_manager.handle_message,
+            block=True,
+        ), group=1)
 
     async def _handle_application_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         error = context.error
@@ -1399,6 +1425,10 @@ class GoodreadsBot:
 
     async def _post_init(self, application: Application) -> None:
         await self._configure_telegram_commands(application)
+        self._channel_manager_task = asyncio.create_task(
+            self._channel_manager.run_scheduler(application.bot),
+            name="channel-manager-scheduler",
+        )
         if self.webhook_mode:
             return
         repository = self._get_channel_index_repository()
@@ -1474,6 +1504,15 @@ class GoodreadsBot:
             logger.info("[channel-index] no active indexes; MTProto listener stopped")
 
     async def _post_shutdown(self, application: Application) -> None:
+        manager_task = getattr(self, "_channel_manager_task", None)
+        if manager_task is not None:
+            manager_task.cancel()
+            try:
+                await manager_task
+            except asyncio.CancelledError:
+                pass
+            self._channel_manager_task = None
+        await self._channel_manager.close()
         runtime = getattr(self, "_channel_index_runtime", None)
         if runtime is not None:
             await runtime.close()
@@ -1503,17 +1542,19 @@ class GoodreadsBot:
             BotCommand("ping", "Check bot status and uptime"),
         ]
         commands.sort(key=lambda command: command.command)
-        private_commands = commands + [
-            BotCommand("connect", "Connect a channel (private chat)"),
+        channel_commands = [
+            BotCommand("connect", "Connect a channel by ID or username"),
             BotCommand("connections", "List connected channels"),
-            BotCommand("disconnect", "Disconnect a channel"),
+            BotCommand("disconnect", "Choose a channel to disconnect"),
             BotCommand("misc", "Channel tools and settings"),
             BotCommand("index", "Manage channel indexes"),
+            BotCommand("channelmanager", "Open Channel Manager"),
+            BotCommand("cancel", "Cancel the current Channel Manager step"),
         ]
-        private_commands.sort(key=lambda command: command.command)
+        channel_commands.sort(key=lambda command: command.command)
         for scope, scoped_commands in (
             (None, commands),
-            (BotCommandScopeAllPrivateChats(), private_commands),
+            (BotCommandScopeAllPrivateChats(), commands),
             (BotCommandScopeAllGroupChats(), commands),
         ):
             try:
@@ -1526,10 +1567,13 @@ class GoodreadsBot:
                 logger.warning("Could not publish Telegram command menu: %s", type(exc).__name__)
         owner_id = getattr(self, "_owner_user_id", None)
         if owner_id is not None:
-            owner_commands = private_commands + [
+            owner_commands = commands + channel_commands + [
                 BotCommand("authorize", "Authorize a user ID"),
                 BotCommand("unauthorize", "Revoke an authorized user"),
                 BotCommand("admins", "List authorized users"),
+                BotCommand("channelapprove", "Approve a Channel Manager channel"),
+                BotCommand("channelrevoke", "Revoke Channel Manager access"),
+                BotCommand("channelapprovals", "List approved channels"),
             ]
             owner_commands.sort(key=lambda command: command.command)
             try:
@@ -1538,6 +1582,41 @@ class GoodreadsBot:
                 )
             except Exception as exc:
                 logger.warning("Could not publish owner command menu: %s", type(exc).__name__)
+
+    async def _refresh_user_command_scope(self, bot, user_id: int) -> None:
+        """Show Channel Manager commands only to the owner or connected channel admins."""
+        if self._owner_user_id is not None and int(user_id) == self._owner_user_id:
+            return  # The owner-specific command scope is installed at startup.
+        scope = BotCommandScopeChat(chat_id=int(user_id))
+        public_commands = [
+            BotCommand("start", "Welcome to Annie Search"),
+            BotCommand("help", "How to use Annie"),
+            BotCommand("portal", "Open Annie Search Portal"),
+            BotCommand("recom", "Open Annie Recommendations"),
+            BotCommand("bookshelf", "Open your Bookshelf"),
+            BotCommand("favorites", "Open your Favourites"),
+            BotCommand("search", "Search books by title or author"),
+            BotCommand("ping", "Check bot status and uptime"),
+        ]
+        channel_commands = [
+            BotCommand("connect", "Connect a channel by ID or username"),
+            BotCommand("connections", "List connected channels"),
+            BotCommand("disconnect", "Choose a channel to disconnect"),
+            BotCommand("misc", "Channel tools and settings"),
+            BotCommand("index", "Manage channel indexes"),
+            BotCommand("channelmanager", "Open Channel Manager"),
+            BotCommand("cancel", "Cancel the current Channel Manager step"),
+        ]
+        try:
+            if await self._channel_manager.has_connected_channel_access(user_id, bot):
+                await bot.set_my_commands(
+                    sorted(public_commands + channel_commands, key=lambda command: command.command),
+                    scope=scope,
+                )
+            else:
+                await bot.delete_my_commands(scope=scope)
+        except Exception as exc:
+            logger.warning("Could not refresh private command menu user_id=%s error=%s", user_id, type(exc).__name__)
 
     def process_update(self, raw_update: dict) -> bool:
         """Process a single update dict received from Telegram webhook.
@@ -1651,7 +1730,8 @@ class GoodreadsBot:
         return InlineKeyboardMarkup([[button]])
 
     def _start_keyboard(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        show_channel_manager: bool = False,
     ) -> InlineKeyboardMarkup:
         """Build the compact welcome menu, retaining a fallback if unconfigured."""
         portal = self._mini_app_markup(update, context, label="🔎 Annie Search Portal")
@@ -1678,14 +1758,18 @@ class GoodreadsBot:
             favorites.inline_keyboard[0][0] if favorites else
             InlineKeyboardButton("♥ Favourites", callback_data="start_favorites")
         )
-        return InlineKeyboardMarkup([
+        rows = [
             [InlineKeyboardButton("❔ Help", callback_data="start_help"),
-             InlineKeyboardButton("⚙ Misc", callback_data="start_misc"),
              InlineKeyboardButton("✦ Features", callback_data="start_features")],
             [portal_button],
             [recommendations_button],
             [bookshelf_button, favorites_button],
-        ])
+        ]
+        if show_channel_manager:
+            rows.append([InlineKeyboardButton(
+                "📢 Channel Manager", callback_data="cm:home"
+            )])
+        return InlineKeyboardMarkup(rows)
 
     @staticmethod
     def _start_text() -> str:
@@ -1715,7 +1799,6 @@ class GoodreadsBot:
     @staticmethod
     def _misc_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📇 Channel index", callback_data="misc_index")],
             [InlineKeyboardButton("🔗 My connections", callback_data="misc_list_connections")],
             [InlineKeyboardButton("How to connect a channel", callback_data="misc_connections")],
             [InlineKeyboardButton("← Back to start", callback_data="start_back")],
@@ -1758,9 +1841,9 @@ Save books to My Books, move the ones you love to Favourites with the Like butto
 
 Channel tools for channel owners and administrators. Connect Annie as a channel administrator, then use the index manager to keep older index posts updated when new channel posts arrive.
 
-<code>/connect &lt;channel_id&gt;</code> · Connect a channel
+<code>/connect &lt;channel_id or @username&gt;</code> · Connect a channel
 <code>/connections</code> · List connected channel names
-<code>/disconnect &lt;channel_id&gt;</code> · Disconnect a channel
+<code>/disconnect</code> · Choose a channel to disconnect
 <code>/index</code> · Configure an index
 
 Channel management commands work in Annie’s private chat. Only that channel’s owner or an administrator can manage its connection or index."""
@@ -1771,15 +1854,29 @@ Channel management commands work in Annie’s private chat. Only that channel’
 
 Use these commands in a private chat with Annie. Add Annie as an administrator in the channel first. Only that channel’s owner or an administrator can connect or disconnect it.
 
-<code>/connect &lt;channel_id&gt;</code> · Connect a channel
+<code>/connect &lt;channel_id or @username&gt;</code> · Connect a channel
 <code>/connections</code> · List connected channel names
-<code>/disconnect &lt;channel_id&gt;</code> · Disconnect a channel
+<code>/disconnect</code> · Choose a channel to disconnect
 
-Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
+Use a channel ID (usually starts with <code>-100</code>) or a public channel’s <code>@username</code>."""
+
+    async def _has_channel_tools_access(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ) -> bool:
+        if self._is_bot_owner(update):
+            return True
+        if not update.effective_user:
+            return False
+        return await self._channel_manager.has_connected_channel_access(
+            update.effective_user.id, context.bot
+        )
 
     async def misc_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat is None or update.effective_chat.type != "private":
             await update.effective_message.reply_text("Open /misc in a private chat with Annie.")
+            return
+        if not await self._has_channel_tools_access(update, context):
+            await update.effective_message.reply_text("Channel tools are only available to connected channel owners and admins.")
             return
         if context.args:
             await update.effective_message.reply_text("Usage: /misc")
@@ -1837,7 +1934,7 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         if not eligible:
             await self._send_or_edit(
                 update,
-                "You don’t have a connected channel to manage yet. Connect one with <code>/connect &lt;channel_id&gt;</code>.",
+                "You don’t have a connected channel to manage yet. Connect one with <code>/connect &lt;channel_id or @username&gt;</code>.",
                 self._misc_keyboard(),
             )
             return
@@ -1948,12 +2045,16 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             ) for minutes in (1, 5, 10)
         ])
         rows.append([
-            InlineKeyboardButton("Entry format", callback_data=f"index_format:{channel_id}"),
+            InlineKeyboardButton("Index Format", callback_data=f"index_format:{channel_id}"),
             InlineKeyboardButton("Index lists", callback_data=f"index_lists:{channel_id}"),
         ])
+        rows.append([InlineKeyboardButton(
+            f"Excluded senders ({len(config.get('excluded_sender_ids') or [])})",
+            callback_data=f"index_exclusions:{channel_id}",
+        )])
         rows.extend([
             [InlineKeyboardButton("← Choose channel", callback_data="misc_index"),
-             InlineKeyboardButton("← Misc", callback_data="misc_home")],
+             InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{channel_id}")],
         ])
         return InlineKeyboardMarkup(rows)
 
@@ -2039,16 +2140,18 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         if mode == "prefix" and prefix:
             source_label = f"{source_label} ({prefix})"
         targets = len(config.get("targets") or [])
+        excluded_senders = len(config.get("excluded_sender_ids") or [])
         text = (
-            "<b>📇 Index settings</b>\n"
-            f"Channel: <b>{html_escape(channel.title or 'Channel')}</b>\n\n"
+            f"<b>📇 Index · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            "Annie adds links to the index messages you register. She can fix links when posts change and remove them when posts are deleted.\n\n"
             f"Status: <b>{'On' if enabled else 'Off'}</b> · Delay: <b>{int(config.get('delay_minutes') or 5)} min</b>\n"
-            f"Entry: <b>{html_escape(source_label)}</b> · Order: <b>{'A–Z' if sort_order == 'alphabetical' else 'Added'}</b>\n"
-            f"Default bullet: <b>{html_escape(bullet)}</b> · Placeholders: <b>{targets}</b>\n\n"
-            "• <b>Turn updates on/off</b> to control automatic entries.\n"
-            "• <b>Delay</b> sets how long Annie waits after a post.\n"
-            "• <b>Entry format</b> sets the label, order, and default bullet.\n"
-            "• <b>Index lists</b> sets markers and manages placeholders or older posts."
+            f"Label: <b>{html_escape(source_label)}</b> · Order: <b>{'A–Z' if sort_order == 'alphabetical' else 'Added'}</b>\n"
+            f"Placeholders: <b>{targets}</b> · Excluded senders: <b>{excluded_senders}</b>\n\n"
+            "• <b>Turn updates on/off:</b> start or pause automatic index updates.\n"
+            "• <b>1 / 5 / 10 min:</b> choose how long Annie waits before adding a link.\n"
+            "• <b>Index Format:</b> choose the link label, bullet, and entry order.\n"
+            "• <b>Index lists:</b> register the index messages Annie can edit; set list markers or import older posts.\n"
+            "• <b>Excluded senders:</b> skip posts from selected users or bots."
         )
         await self._send_or_edit(update, text, self._index_settings_keyboard(channel_id, config))
 
@@ -2072,17 +2175,25 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             source = f"Custom prefix: {prefix}" if prefix else "Custom prefix (not set)"
         bullet = str(config.get("entry_bullet") or "🔹")
         order = "A–Z" if config.get("sort_order") == "alphabetical" else "Order added"
+        prefix_help = (
+            "• <b>Set prefix:</b> change the marker Annie looks for, such as <code>Title:</code>.\n"
+            if mode == "prefix" else ""
+        )
         text = (
-            f"<b>Entry format · {html_escape(channel.title or 'Channel')}</b>\n\n"
-            f"Source: <b>{html_escape(source)}</b>\n"
-            f"Order: <b>{order}</b> · Default bullet: <b>{html_escape(bullet)}</b>\n\n"
-            "• <b>Text line:</b> first non-empty line. <b>Hashtag/link:</b> first match.\n"
-            "• <b>Image caption:</b> first caption line; add one for a clear label.\n"
-            "• <b>File name:</b> file name, or caption if unnamed.\n"
-            "• <b>Custom prefix:</b> text after your chosen prefix.\n"
-            "• <b>A–Z / Order added</b> sorts entries in each list.\n"
-            "• <b>Default bullet</b> is used unless a placeholder has its own.\n"
-            "Each label links to its original post."
+            f"<b>Index Format · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            "Choose what Annie writes as each clickable index entry.\n\n"
+            f"Current label: <b>{html_escape(source)}</b> · Order: <b>{order}</b>\n"
+            f"Default bullet: <b>{html_escape(bullet)}</b>\n\n"
+            "• <b>Text line:</b> use the first non-empty text line.\n"
+            "• <b>One #hashtag:</b> use the first hashtag.\n"
+            "• <b>First link:</b> use the first URL’s site and path as the label.\n"
+            "• <b>Image caption:</b> use its first caption line; without one, the label is “Image.”\n"
+            "• <b>File name:</b> use the file name, or its caption if unnamed.\n"
+            "• <b>Custom prefix:</b> use the text after your marker, such as <code>Title:</code>.\n"
+            f"{prefix_help}"
+            "• <b>A–Z / Order added:</b> sort links by name or by arrival time.\n"
+            "• <b>Set default bullet:</b> change the symbol before each link. A placeholder can have its own bullet.\n"
+            "Each entry opens the original post."
         )
         await self._send_or_edit(update, text, self._index_format_keyboard(channel_id, config))
 
@@ -2098,23 +2209,68 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         targets = list(config.get("targets") or [])
         if targets:
             description = (
-                "• <b>List markers</b> route posts by matching text or hashtags.\n"
-                "• <b>Placeholder bullet</b> changes the bullet for one list.\n"
-                "• <b>Import older posts</b> by forwarding them to Annie.\n"
-                "• <b>Add</b> keeps current placeholders; <b>Replace</b> switches to the forwarded ones.\n"
-                "• <b>Clear</b> stops updating them; it does not delete the messages."
+                "• <b>Set list markers:</b> match text or a hashtag in posts to the right list. Posts with no match go to an unmarked list.\n"
+                "• <b>Set placeholder bullet:</b> change the symbol for one index message.\n"
+                "• <b>Import older posts:</b> forward old channel posts to add their links.\n"
+                "• <b>Add placeholder:</b> keep current index messages and register more.\n"
+                "• <b>Replace placeholders:</b> use the forwarded messages instead of the current ones.\n"
+                "• <b>Clear placeholders:</b> stop updating registered messages; it does not delete them."
             )
         else:
-            description = "• <b>Register placeholders</b> to choose the existing text messages Annie should update."
+            description = (
+                "• <b>Register placeholders:</b> forward the existing text messages you want Annie to update.\n"
+                "• Forward several together or one at a time, then tap Done to register them."
+            )
         text = (
             f"<b>Index lists · {html_escape(channel.title or 'Channel')}</b>\n\n"
-            f"Registered placeholders: <b>{len(targets)}</b>\n"
+            "Choose which existing messages Annie can update as your indexes.\n\n"
+            f"Registered index messages: <b>{len(targets)}</b>\n\n"
             f"{description}"
         )
         await self._send_or_edit(update, text, self._index_lists_keyboard(channel_id, config))
 
+    async def _show_index_exclusions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+    ) -> None:
+        channel = await self._private_channel_target(update, context, str(channel_id))
+        if channel is None:
+            return
+        repository = self._get_channel_index_repository()
+        config = await asyncio.to_thread(repository.get, channel_id) if repository else None
+        labels = (config or {}).get("excluded_sender_labels") or {}
+        sender_ids = sorted({
+            int(sender_id)
+            for sender_id in (config or {}).get("excluded_sender_ids") or []
+            if str(sender_id).lstrip("+").isdigit() and int(sender_id) > 0
+        })
+        rows = [[InlineKeyboardButton(
+            f"Remove {(str(labels.get(str(sender_id)) or sender_id))[:40]}",
+            callback_data=f"index_exclusion_remove:{channel_id}:{sender_id}",
+        )] for sender_id in sender_ids]
+        rows.append([InlineKeyboardButton(
+            "Add sender", callback_data=f"index_exclusion_add:{channel_id}"
+        )])
+        rows.append([InlineKeyboardButton(
+            "← Index settings", callback_data=f"index_choose:{channel_id}:open:-"
+        )])
+        listing = "\n".join(
+            f"• {html_escape(str(labels.get(str(sender_id)) or 'Sender'))} "
+            f"(<code>{sender_id}</code>)"
+            for sender_id in sender_ids
+        ) or "• None"
+        text = (
+            f"<b>Excluded senders · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            "Use this list to stop selected people or bots from being added to the Index.\n\n"
+            "• <b>Add sender:</b> forward one of their channel posts, enter their public <code>@username</code>, or enter the sender ID from Annie’s log.\n"
+            "• <b>Remove sender:</b> allow their future posts to be indexed again.\n\n"
+            f"{listing}"
+        )
+        await self._send_or_edit(update, text, InlineKeyboardMarkup(rows))
+
     async def _index_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_user is None or update.effective_message is None:
+            return
+        if self._channel_manager.has_pending_input(update.effective_user.id):
             return
         if update.effective_chat is None or update.effective_chat.type != "private":
             return
@@ -2191,6 +2347,56 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             self._index_pending_input.pop(user_id, None)
             await self._show_index_lists(update, context, state["channel_id"])
             return
+        if input_kind == "exclude_sender":
+            channel = await self._private_channel_target(update, context, str(state["channel_id"]))
+            if channel is None:
+                self._index_pending_input.pop(user_id, None)
+                return
+            repository = self._get_channel_index_repository()
+            if repository is None:
+                self._index_pending_input.pop(user_id, None)
+                await update.effective_message.reply_text("Channel indexes need MongoDB storage.")
+                return
+            raw_sender = (update.effective_message.text or "").strip()
+            sender_label = None
+            if raw_sender.startswith("@"):
+                if len(raw_sender) > 33 or len(raw_sender) < 6:
+                    await update.effective_message.reply_text(
+                        "Send a public username such as @postbot, or a positive sender ID."
+                    )
+                    return
+                if self._channel_index_runtime is None and not await self._ensure_channel_index_listener():
+                    await update.effective_message.reply_text(
+                        "I couldn’t look up that username. Try a sender ID from Annie’s log instead."
+                    )
+                    return
+                try:
+                    sender_id, sender_label = await self._channel_index_runtime.resolve_sender_username(raw_sender)
+                except Exception as exc:
+                    logger.info("Could not resolve excluded sender username error=%s", type(exc).__name__)
+                    sender_id, sender_label = None, None
+                await self._stop_channel_index_listener_if_idle()
+                if sender_id is None:
+                    await update.effective_message.reply_text(
+                        "I couldn’t find that public user or bot. Check the username and try again."
+                    )
+                    return
+            else:
+                try:
+                    sender_id = int(raw_sender)
+                except ValueError:
+                    sender_id = 0
+                if sender_id <= 0 or len(raw_sender.lstrip("+")) > 20:
+                    await update.effective_message.reply_text(
+                        "Send a public @username or the positive sender ID from Annie’s log, such as 273234066."
+                    )
+                    return
+            await asyncio.to_thread(
+                repository.add_excluded_sender, int(state["channel_id"]), sender_id, sender_label
+            )
+            self._index_pending_input.pop(user_id, None)
+            await self._show_index_exclusions(update, context, int(state["channel_id"]))
+            return
         if input_kind != "prefix":
             return
         prefix = (update.effective_message.text or "").strip()
@@ -2210,7 +2416,8 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
     async def _show_index_categories(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
     ) -> None:
-        if await self._private_channel_target(update, context, str(channel_id)) is None:
+        channel = await self._private_channel_target(update, context, str(channel_id))
+        if channel is None:
             return
         repository = self._get_channel_index_repository()
         config = await asyncio.to_thread(repository.get, channel_id) if repository else None
@@ -2234,9 +2441,11 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         rows.append([InlineKeyboardButton("← Index lists", callback_data=f"index_lists:{channel_id}")])
         await self._send_or_edit(
             update,
-            "<b>Choose a list and send its marker</b>\n\n"
-            "• Use text or a hashtag that appears in matching posts.\n"
-            "• Markers are yours to choose. Leave a list unmarked for posts without a marker.",
+            f"<b>List markers · {html_escape(channel.title or 'Channel')}</b>\n\n"
+            "Choose a list below, then send a short marker, such as <code>#Manga</code>.\n\n"
+            "• Posts with that marker go to the matching index message.\n"
+            "• Posts without a matching marker go to an unmarked list.\n"
+            "• Tap <b>Clear marker</b> to remove a list’s marker.",
             InlineKeyboardMarkup(rows),
         )
 
@@ -2277,9 +2486,11 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
     async def _index_forwarded_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_user is None or update.effective_message is None:
             return
+        if self._channel_manager.has_pending_input(update.effective_user.id):
+            return
         user_id = update.effective_user.id
         state = self._index_pending_input.get(user_id)
-        if not state or state.get("kind") not in {"targets", "backfill", "bullet_target"} or state.get("expires_at", 0) < time.time():
+        if not state or state.get("kind") not in {"targets", "backfill", "bullet_target", "exclude_sender"} or state.get("expires_at", 0) < time.time():
             return
         message = update.effective_message
         channel = await self._private_channel_target(update, context, str(state["channel_id"]))
@@ -2293,6 +2504,46 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         channel_id = int(state["channel_id"])
         if int(origin.chat.id) != channel_id:
             await message.reply_text("That post is from a different channel. Forward a post from the selected channel.")
+            return
+        if state.get("kind") == "exclude_sender":
+            if self._get_channel_index_repository() is None:
+                self._index_pending_input.pop(user_id, None)
+                await message.reply_text("Channel indexes need MongoDB storage.")
+                return
+            if self._channel_index_runtime is None and not await self._ensure_channel_index_listener():
+                await message.reply_text(
+                    "I couldn’t check that post’s sender. Send the positive sender ID from Annie’s log instead."
+                )
+                return
+            runtime = self._channel_index_runtime
+            try:
+                sender_id, sender_label = await runtime.get_sender_details(
+                    channel_id, int(origin.message_id)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[channel-index] sender lookup failed channel_id=%s post_id=%s error=%s",
+                    channel_id, int(origin.message_id), type(exc).__name__,
+                )
+                sender_id, sender_label = None, None
+            if sender_id is None or sender_id <= 0:
+                await message.reply_text(
+                    "I couldn’t identify the sender. Turn on the channel’s sender profile, then forward one of their posts again."
+                )
+                await self._stop_channel_index_listener_if_idle()
+                return
+            repository = self._get_channel_index_repository()
+            await asyncio.to_thread(
+                repository.add_excluded_sender, channel_id, sender_id, sender_label
+            )
+            self._index_pending_input.pop(user_id, None)
+            label = f" ({html_escape(sender_label)})" if sender_label else ""
+            await message.reply_text(
+                f"Posts from sender <code>{sender_id}</code>{label} will now be skipped.",
+                parse_mode=ParseMode.HTML,
+            )
+            await self._show_index_exclusions(update, context, channel_id)
+            await self._stop_channel_index_listener_if_idle()
             return
         if state.get("kind") == "bullet_target":
             repository = self._get_channel_index_repository()
@@ -2323,6 +2574,8 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
                 "no_title": "Couldn’t find an entry label in that post. Check the entry source setting, then forward another.",
                 "unmatched": "No list marker matched that post. Forward another, or tap Done.",
                 "ambiguous": "That post matches more than one list marker, so Annie skipped it. Forward another, or tap Done.",
+                "excluded": "That post is from an excluded sender, so Annie skipped it. Forward another, or tap Done.",
+                "sender_check_failed": "Annie couldn’t check who posted that. Please try again later.",
                 "unavailable": "Turn Index updates on and register a placeholder first.",
             }
             await message.reply_text(
@@ -2347,7 +2600,7 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         if all(int(item["message_id"]) != target["message_id"] for item in targets):
             targets.append(target)
         await message.reply_text(
-            f"Registered {len(targets)} index post(s). Forward more, or tap Done.",
+            f"Received {len(targets)} placeholder(s). Forward more, or tap Done to register them.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 "Done", callback_data=f"index_targets_done:{channel_id}"
             )]]),
@@ -2372,7 +2625,55 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
                 continue
             if getattr(member, "status", "") in ("administrator", "creator"):
                 names.append(html_escape(str(channel["name"])))
-        return "\n".join(names) if names else "You have no connected channels."
+        return "You are connected to:\n" + "\n".join(
+            f"• {name}" for name in names
+        ) if names else "You are not connected to any channels."
+
+    async def _show_disconnect_picker(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        notice: str | None = None,
+    ) -> None:
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            await self._send_or_edit(update, "Use /disconnect in a private chat with Annie.")
+            return
+        repository = self._get_channel_connection_repository()
+        if repository is None:
+            await self._send_or_edit(
+                update, "Channel connections need cloud storage. Configure MONGODB_URI first.",
+                self._misc_keyboard(),
+            )
+            return
+        try:
+            channels = await asyncio.to_thread(repository.list_channels)
+        except Exception as exc:
+            logger.warning("Could not list channels for disconnect error=%s", type(exc).__name__)
+            await self._send_or_edit(update, "I couldn’t load connected channels. Please try again.")
+            return
+        eligible = []
+        for channel in channels:
+            try:
+                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
+            except Exception:
+                continue
+            if getattr(member, "status", "") in ("administrator", "creator"):
+                eligible.append(channel)
+        if not eligible:
+            text = (notice + "\n\n" if notice else "") + "You are not connected to any channels."
+            await self._send_or_edit(
+                update, text,
+                InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "← Misc", callback_data="misc_home"
+                )]]),
+            )
+            return
+        rows = [[InlineKeyboardButton(
+            str(channel["name"])[:60], callback_data=f"disconnect_channel:{int(channel['id'])}"
+        )] for channel in eligible]
+        rows.append([InlineKeyboardButton("← Misc", callback_data="misc_home")])
+        text = (notice + "\n\n" if notice else "") + (
+            "<b>Connected channels</b>\nTap a channel to disconnect it:"
+        )
+        await self._send_or_edit(update, text, InlineKeyboardMarkup(rows))
 
     async def _private_channel_target(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, raw_id: str
@@ -2385,26 +2686,27 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             )
             return None
         try:
-            channel_id = int(raw_id)
+            identifier = raw_id.strip()
+            channel_id = int(identifier) if not identifier.startswith("@") else None
         except (TypeError, ValueError):
             await update.effective_message.reply_text(
-                "That doesn’t look like a channel ID. Use the numeric ID, for example <code>-1001234567890</code>.",
+                "Use a numeric channel ID or a public channel username such as <code>@mychannel</code>.",
                 parse_mode=ParseMode.HTML,
             )
             return None
-        if channel_id >= 0:
+        if channel_id is not None and channel_id >= 0:
             await update.effective_message.reply_text(
                 "Channel IDs are negative numbers. Send the full ID, including its minus sign."
             )
             return None
         try:
-            channel = await context.bot.get_chat(channel_id)
+            channel = await context.bot.get_chat(identifier if channel_id is None else channel_id)
             if getattr(channel, "type", None) != "channel":
                 await update.effective_message.reply_text(
-                    "That ID belongs to a chat, not a Telegram channel."
+                    "That username or ID belongs to a chat, not a Telegram channel."
                 )
                 return None
-            member = await context.bot.get_chat_member(channel_id, update.effective_user.id)
+            member = await context.bot.get_chat_member(channel.id, update.effective_user.id)
         except BadRequest as exc:
             logger.info(
                 "Channel connection lookup failed channel_id=%s error=%s",
@@ -2437,7 +2739,7 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             await message.reply_text("Use /connect in a private chat with Annie.")
             return
         if len(context.args) != 1:
-            await message.reply_text("Usage: /connect <channel_id>")
+            await message.reply_text("Usage: /connect <channel_id or @public_channel>")
             return
         channel = await self._private_channel_target(update, context, context.args[0])
         if channel is None:
@@ -2480,6 +2782,7 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
             f"<b>{html_escape(channel.title or 'Telegram channel')}</b> is already connected.",
             parse_mode=ParseMode.HTML,
         )
+        await self._refresh_user_command_scope(context.bot, update.effective_user.id)
 
     async def connections_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """List connected channels by name only; private chat only."""
@@ -2496,40 +2799,15 @@ Use the channel’s numeric ID (usually starts with <code>-100</code>)."""
         )
 
     async def disconnect_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Disconnect a channel after confirming the caller is its admin."""
+        """Show connected channels and let an admin choose one to disconnect."""
         message = update.effective_message
         if update.effective_chat is None or update.effective_chat.type != "private":
             await message.reply_text("Use /disconnect in a private chat with Annie.")
             return
-        if len(context.args) != 1:
-            await message.reply_text("Usage: /disconnect <channel_id>")
+        if context.args:
+            await message.reply_text("Use /disconnect with no arguments, then tap the channel to disconnect.")
             return
-        channel = await self._private_channel_target(update, context, context.args[0])
-        if channel is None:
-            return
-        repository = self._get_channel_connection_repository()
-        if repository is None:
-            await message.reply_text(
-                "Channel connections need cloud storage. Configure MONGODB_URI, then try again."
-            )
-            return
-        try:
-            removed = await asyncio.to_thread(repository.disconnect, channel.id)
-        except Exception as exc:
-            logger.warning(
-                "Could not remove channel connection channel_id=%s error=%s",
-                channel.id, type(exc).__name__,
-            )
-            await message.reply_text("I couldn’t disconnect that channel. Please try again.")
-            return
-        if removed and self._channel_index_runtime is not None:
-            await self._channel_index_runtime.cancel_channel(channel.id)
-            await self._stop_channel_index_listener_if_idle()
-        await message.reply_text(
-            f"Disconnected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
-            if removed else "That channel wasn’t connected.",
-            parse_mode=ParseMode.HTML,
-        )
+        await self._show_disconnect_picker(update, context)
 
     @staticmethod
     def _features_text() -> str:
@@ -2755,10 +3033,15 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             page = page_parameters[start_parameter]
             await self._send_mini_app(update, context, page)
             return
+        show_channel_manager = await self._channel_manager.should_show_button(update, context.bot)
+        if update.effective_chat and update.effective_chat.type == "private":
+            await self._refresh_user_command_scope(context.bot, update.effective_user.id)
         await update.message.reply_text(
             self._start_text(),
             parse_mode=ParseMode.HTML,
-            reply_markup=self._start_keyboard(update, context),
+            reply_markup=self._start_keyboard(
+                update, context, show_channel_manager,
+            ),
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4425,13 +4708,24 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             query = update.callback_query
             callback_data = query.data
 
+            is_channel_tools_callback = (
+                callback_data in {"start_misc", "help_misc", "misc_home", "misc_connections", "misc_list_connections", "misc_index"}
+                or callback_data.startswith(("disconnect_channel:", "index_"))
+            )
+            if is_channel_tools_callback and not await self._has_channel_tools_access(update, context):
+                await query.answer("Channel tools are only available to connected channel owners and admins.", show_alert=True)
+                return
+
             # Welcome-menu actions are shared by /start and Mini App fallbacks.
             if callback_data == "start_back":
                 await query.answer()
                 await query.edit_message_text(
                     self._start_text(),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=self._start_keyboard(update, context),
+                    reply_markup=self._start_keyboard(
+                        update, context,
+                        await self._channel_manager.should_show_button(update, context.bot),
+                    ),
                 )
                 return
             if callback_data == "start_help":
@@ -4479,6 +4773,39 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                     reply_markup=self._misc_keyboard(),
                 )
                 return
+            if callback_data.startswith("disconnect_channel:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                channel = await self._private_channel_target(update, context, raw_channel)
+                if channel is None:
+                    return
+                repository = self._get_channel_connection_repository()
+                if repository is None:
+                    await self._send_or_edit(
+                        update, "Channel connections need cloud storage.", self._misc_keyboard()
+                    )
+                    return
+                try:
+                    removed = await asyncio.to_thread(repository.disconnect, channel.id)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not remove channel connection channel_id=%s error=%s",
+                        channel.id, type(exc).__name__,
+                    )
+                    await self._send_or_edit(
+                        update, "I couldn’t disconnect that channel. Please try again."
+                    )
+                    return
+                if removed and self._channel_index_runtime is not None:
+                    await self._channel_index_runtime.cancel_channel(channel.id)
+                    await self._stop_channel_index_listener_if_idle()
+                await self._refresh_user_command_scope(context.bot, update.effective_user.id)
+                notice = (
+                    f"Disconnected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
+                    if removed else "That channel was already disconnected."
+                )
+                await self._show_disconnect_picker(update, context, notice)
+                return
             if callback_data == "misc_index":
                 await query.answer()
                 await self._show_index_channel_picker(update, context)
@@ -4499,6 +4826,47 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 await query.answer()
                 _, raw_channel = callback_data.split(":", 1)
                 await self._show_index_lists(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_exclusions:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                await self._show_index_exclusions(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_exclusion_add:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                channel_id = int(raw_channel)
+                if await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                self._index_pending_input[update.effective_user.id] = {
+                    "kind": "exclude_sender", "channel_id": channel_id,
+                    "expires_at": time.time() + 600,
+                }
+                await query.edit_message_text(
+                    "Forward a post by that sender from this channel, send their public @username, or enter the positive sender ID from Annie’s log.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "Cancel", callback_data=f"index_exclusion_cancel:{channel_id}"
+                    )]]),
+                )
+                return
+            if callback_data.startswith("index_exclusion_cancel:"):
+                await query.answer()
+                _, raw_channel = callback_data.split(":", 1)
+                self._index_pending_input.pop(update.effective_user.id, None)
+                await self._show_index_exclusions(update, context, int(raw_channel))
+                return
+            if callback_data.startswith("index_exclusion_remove:"):
+                await query.answer()
+                _, raw_channel, raw_sender = callback_data.split(":", 2)
+                channel_id, sender_id = int(raw_channel), int(raw_sender)
+                if sender_id <= 0 or await self._private_channel_target(update, context, raw_channel) is None:
+                    return
+                repository = self._get_channel_index_repository()
+                if repository is not None:
+                    await asyncio.to_thread(
+                        repository.remove_excluded_sender, channel_id, sender_id
+                    )
+                await self._show_index_exclusions(update, context, channel_id)
                 return
             if callback_data.startswith("index_toggle:"):
                 await query.answer()
@@ -4699,7 +5067,7 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                     "targets": [], "expires_at": time.time() + 600,
                 }
                 await query.edit_message_text(
-                    "Forward the existing index post(s) from this channel to Annie, one at a time. When finished, tap Done under the latest reply. You can register up to 12 posts.",
+                    "Forward one or more existing index posts from this channel. You can send several together or one at a time. Tap Done after the last one to register them (up to 12).",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                         "Cancel", callback_data=f"index_cancel:{channel.id}"
                     )]]),

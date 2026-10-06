@@ -166,7 +166,7 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 |---|---:|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot authentication |
 | `ANNIE_APP_URL` | For Mini App | Public HTTPS Mini App URL, ending in `/miniapp/` |
-| `MONGODB_URI` | Optional | MongoDB Atlas connection string for Bookshelf sync and the bot-admin allowlist |
+| `MONGODB_URI` | Optional | MongoDB Atlas connection string for Bookshelf sync and bot-admin settings; required for channel connections and Channel Manager data |
 | `MONGODB_DB_NAME` | Optional | Database name; defaults to `annie_db` |
 | `GOOGLE_BOOKS_API_KEY` | No | Higher Google Books API quota |
 | `HARDCOVER_API_KEY` | No | Hardcover catalog search, trending, and community ratings |
@@ -178,6 +178,10 @@ Copy `env.example` to `.env` for local use. In production, add values through yo
 | `BOT_OWNER_ID` | No | Telegram user ID that can manage the authorized-user allowlist and is exempt from search restrictions |
 
 The Mini App can show cached and provider-backed features without every optional key, but missing provider keys can reduce coverage. Keep real credentials out of Git and never put them in the README.
+
+### Channel Manager
+
+The private **Channel Manager** button is shown to the bot owner and admins of approved channels. The bot owner approves channels with `/channelapprove <channel_id or @username>`, can review them with `/channelapprovals`, and can remove access with `/channelrevoke <channel_id or @username>`. Then connect the channel with `/connect` and give Annie posting permission. Channel approvals, shared templates, private drafts, and scheduled posts are stored in MongoDB. Scheduling requires a continuously running bot process; interrupted sends are marked for review instead of being retried automatically.
 
 ### Enable bookshelf sync
 
@@ -192,6 +196,7 @@ The bookshelf allows up to **100 unique books per Telegram user across both tabs
 ├── goodreads_bot.py              # Polling entry point and Flask Mini App server
 ├── src/
 │   ├── handlers.py               # Telegram commands, inline search, and callbacks
+│   ├── channel_management.py      # Channel Manager, post composer, and scheduler
 │   ├── aggregator.py             # Search and book metadata providers
 │   └── miniapp/
 │       ├── routes.py             # Mini App API routes
