@@ -295,6 +295,7 @@ class ChannelManager:
         self._repository: MongoChannelManagementRepository | None = None
         self._inputs: dict[int, dict[str, Any]] = {}
         self._visibility_cache: dict[int, tuple[float, bool]] = {}
+        self._access_cache: dict[int, tuple[float, bool]] = {}
         self._ambiguous_send_ids: set[str] = set()
 
     def _get_repository(self) -> MongoChannelManagementRepository | None:
@@ -313,6 +314,15 @@ class ChannelManager:
 
     def has_pending_input(self, user_id: int) -> bool:
         return int(user_id) in self._inputs
+
+    def invalidate_access_cache(self, user_id: int | None = None) -> None:
+        if user_id is None:
+            self._access_cache.clear()
+            self._visibility_cache.clear()
+            return
+        user_id = int(user_id)
+        self._access_cache.pop(user_id, None)
+        self._visibility_cache.pop(user_id, None)
 
     @staticmethod
     def _is_private(update: Update) -> bool:
@@ -355,36 +365,44 @@ class ChannelManager:
     async def _eligible_channels(self, user_id: int, bot: Any) -> list[dict[str, Any]]:
         channels = await self._connected_channels()
         is_bot_owner = self.owner_user_id is not None and int(user_id) == self.owner_user_id
-        eligible = []
-        for channel in channels:
+        semaphore = asyncio.Semaphore(8)
+
+        async def get_member(channel_id: int, user_id: int) -> Any:
+            async with semaphore:
+                return await bot.get_chat_member(channel_id, user_id)
+
+        async def check_channel(channel: dict[str, Any]) -> dict[str, Any] | None:
             channel_id = int(channel["id"])
             try:
-                bot_member = await bot.get_chat_member(channel_id, bot.id)
+                if is_bot_owner:
+                    bot_member = await get_member(channel_id, int(bot.id))
+                    user_member = None
+                else:
+                    bot_member, user_member = await asyncio.gather(
+                        get_member(channel_id, int(bot.id)),
+                        get_member(channel_id, int(user_id)),
+                    )
             except Exception as exc:
                 logger.warning(
-                    "[channel-manager] bot access check failed channel_id=%s error=%s",
+                    "[channel-manager] channel access check failed channel_id=%s error=%s",
                     channel_id, type(exc).__name__,
                 )
-                continue
+                return None
             if not self._is_chat_admin(bot_member):
                 logger.info(
                     "[channel-manager] hidden channel without bot admin rights channel_id=%s",
                     channel_id,
                 )
-                continue
-            if not is_bot_owner:
-                try:
-                    user_member = await bot.get_chat_member(channel_id, int(user_id))
-                except Exception as exc:
-                    logger.info(
-                        "[channel-manager] user access check failed channel_id=%s user_id=%s error=%s",
-                        channel_id, int(user_id), type(exc).__name__,
-                    )
-                    continue
-                if not self._is_chat_admin(user_member):
-                    continue
-            eligible.append(channel)
-        return eligible
+                return None
+            if user_member is not None and not self._is_chat_admin(user_member):
+                return None
+            checked_channel = dict(channel)
+            checked_channel["_bot_member"] = bot_member
+            checked_channel["_actor_member"] = user_member
+            return checked_channel
+
+        checked = await asyncio.gather(*(check_channel(channel) for channel in channels))
+        return [channel for channel in checked if channel is not None]
 
     async def should_show_button(self, update: Update, bot: Any) -> bool:
         if not self._is_private(update):
@@ -409,18 +427,30 @@ class ChannelManager:
         """Whether a user is an admin of any channel already connected to Annie."""
         if self.owner_user_id is not None and int(user_id) == self.owner_user_id:
             return True
+        user_id = int(user_id)
+        now = time.monotonic()
+        cached = self._access_cache.get(user_id)
+        if cached and cached[0] > now:
+            return cached[1]
         try:
             repository = self.get_connection_repository()
             if repository is None:
                 return False
             channels = await asyncio.to_thread(repository.list_channels)
-            for channel in channels:
+            semaphore = asyncio.Semaphore(8)
+
+            async def is_admin(channel: dict[str, Any]) -> bool:
                 try:
-                    member = await bot.get_chat_member(int(channel["id"]), int(user_id))
+                    async with semaphore:
+                        member = await bot.get_chat_member(int(channel["id"]), int(user_id))
                 except Exception:
-                    continue
-                if getattr(member, "status", "") in {"administrator", "creator"}:
-                    return True
+                    return False
+                return self._is_chat_admin(member)
+
+            checks = await asyncio.gather(*(is_admin(channel) for channel in channels))
+            has_access = any(checks)
+            self._access_cache[user_id] = (time.monotonic() + 10, has_access)
+            return has_access
         except Exception as exc:
             logger.warning("[channel-manager] command visibility check failed user_id=%s error=%s", user_id, type(exc).__name__)
         return False
@@ -524,7 +554,7 @@ class ChannelManager:
             )
             await update.effective_message.reply_text("I couldn’t save that approval. Please try again.")
             return
-        self._visibility_cache.clear()
+        self.invalidate_access_cache()
         logger.info(
             "[channel-manager] channel %s channel_id=%s user_id=%s",
             "approved" if created else "approval refreshed", channel_id,
@@ -561,7 +591,7 @@ class ChannelManager:
             )
             await update.effective_message.reply_text("I couldn’t remove that approval. Please try again.")
             return
-        self._visibility_cache.clear()
+        self.invalidate_access_cache()
         logger.info(
             "[channel-manager] channel approval revoked channel_id=%s user_id=%s removed=%s",
             channel_id, update.effective_user.id, removed,
@@ -620,12 +650,18 @@ class ChannelManager:
             channel = next((item for item in channels if int(item["id"]) == int(channel_id)), None)
             if channel is None:
                 return None
-            bot_member = await bot.get_chat_member(int(channel_id), bot.id)
+            if self.owner_user_id is not None and int(user_id) == self.owner_user_id:
+                bot_member = await bot.get_chat_member(int(channel_id), bot.id)
+                actor_member = None
+            else:
+                bot_member, actor_member = await asyncio.gather(
+                    bot.get_chat_member(int(channel_id), bot.id),
+                    bot.get_chat_member(int(channel_id), int(user_id)),
+                )
             if not self._can_post(bot_member):
                 return None
-            if self.owner_user_id is None or int(user_id) != self.owner_user_id:
-                user_member = await bot.get_chat_member(int(channel_id), int(user_id))
-                if not self._can_post(user_member):
+            if actor_member is not None:
+                if not self._can_post(actor_member):
                     return None
             return channel
         except Exception as exc:
@@ -643,12 +679,18 @@ class ChannelManager:
             channel = next((item for item in channels if int(item["id"]) == int(channel_id)), None)
             if channel is None:
                 return None, None, None
-            bot_member = await bot.get_chat_member(int(channel_id), int(bot.id))
+            if self.owner_user_id is not None and int(user_id) == self.owner_user_id:
+                bot_member = await bot.get_chat_member(int(channel_id), int(bot.id))
+                member = None
+            else:
+                bot_member, member = await asyncio.gather(
+                    bot.get_chat_member(int(channel_id), int(bot.id)),
+                    bot.get_chat_member(int(channel_id), int(user_id)),
+                )
             if not self._is_chat_admin(bot_member):
                 return None, None, None
-            if self.owner_user_id is not None and int(user_id) == self.owner_user_id:
+            if member is None:
                 return channel, None, bot_member
-            member = await bot.get_chat_member(int(channel_id), int(user_id))
             if not self._is_chat_admin(member):
                 return None, None, None
             return channel, member, bot_member
@@ -964,7 +1006,9 @@ class ChannelManager:
             )
             return
         if len(channels) == 1 and auto_open_single:
-            await self._show_channel(update, context, int(channels[0]["id"]))
+            await self._show_channel(
+                update, context, int(channels[0]["id"]), validated_channel=channels[0]
+            )
             return
         rows = [[InlineKeyboardButton(
             str(channel["name"])[:55], callback_data=f"cm:channel:{int(channel['id'])}"
@@ -976,11 +1020,20 @@ class ChannelManager:
         )
 
     async def _show_channel(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int,
+        validated_channel: dict[str, Any] | None = None,
     ) -> None:
-        channel, actor_member, bot_member = await self._channel_for_menu(
-            channel_id, update.effective_user.id, context.bot
-        )
+        if validated_channel is not None:
+            channel = {
+                key: value for key, value in validated_channel.items()
+                if not key.startswith("_")
+            }
+            actor_member = validated_channel.get("_actor_member")
+            bot_member = validated_channel.get("_bot_member")
+        else:
+            channel, actor_member, bot_member = await self._channel_for_menu(
+                channel_id, update.effective_user.id, context.bot
+            )
         if channel is None:
             await self._access_denied(update)
             return
@@ -1022,21 +1075,41 @@ class ChannelManager:
             return
         try:
             admins = await context.bot.get_chat_administrators(channel_id)
-            lines = []
+            name = html_escape(str(channel.get("name") or "Channel"))
+            lines = [
+                "👥 <b>Channel Admins</b>",
+                f"Channel: <b>{name}</b>",
+                f"Total admins: {len(admins)}",
+                "",
+            ]
+            entries = []
             for member in admins:
                 user = member.user
-                name = html_escape(" ".join(filter(None, [user.first_name, user.last_name])) or "Telegram user")
-                username = f" (@{html_escape(user.username)})" if user.username else ""
+                display_name = html_escape(" ".join(filter(None, [user.first_name, user.last_name])) or "Telegram user")
+                username = (
+                    f' (<a href="https://t.me/{html_escape(user.username)}">@{html_escape(user.username)}</a>)'
+                    if user.username else ""
+                )
                 role = "Owner" if self._chat_member_status(member) == "creator" else "Admin"
-                lines.append(f"• <b>{role}:</b> {name}{username} · <code>{int(user.id)}</code>")
+                role_line = "👑 Owner" if role == "Owner" else "✅ Admin"
+                entries.append(
+                    f"{len(entries) + 1}. <b>{display_name}</b>{username}\n"
+                    f"   {role_line}\n"
+                    f"   ID: <code>{int(user.id)}</code>\n"
+                )
             visible = []
-            for line in lines:
-                if len("\n".join([*visible, line])) > 3400:
+            current_length = len("\n".join(lines))
+            for entry in entries:
+                if current_length + len(entry) > 3500:
                     break
-                visible.append(line)
-            body = "\n".join(visible) or "No channel admins were found."
-            if len(lines) > len(visible):
-                body += f"\n… and {len(lines) - len(visible)} more."
+                visible.append(entry)
+                current_length += len(entry)
+            lines.extend(visible)
+            if len(entries) > len(visible):
+                lines.append(f"… and {len(entries) - len(visible)} more.")
+            if not admins:
+                lines.append("No channel admins were found.")
+            body = "\n".join(lines).rstrip()
         except Exception as exc:
             logger.warning("[channel-manager] admin list failed channel_id=%s user_id=%s error=%s", channel_id, update.effective_user.id, type(exc).__name__)
             body = "I couldn’t load the admin list. Check Annie’s channel access and try again."
@@ -1046,10 +1119,9 @@ class ChannelManager:
             [InlineKeyboardButton("↻ Refresh list", callback_data=f"cm:admins:{channel_id}")],
             [InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{channel_id}")],
         ]
-        name = html_escape(str(channel.get("name") or "Channel"))
         await self._edit_or_send(
             update,
-            f"<b>Channel admins · {name}</b>\n\n{body}\n\n"
+            f"{body}\n\n"
             "Promote or demote a person who is already a member of this channel.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )

@@ -11,6 +11,7 @@ import tempfile
 import time
 import requests
 import unicodedata
+from typing import Any
 from html import unescape as html_unescape
 from src.admins import MongoBotAdminRepository
 from src.channel_connections import MongoChannelConnectionRepository
@@ -117,6 +118,12 @@ class GoodreadsBot:
         self._channel_index_repository: MongoChannelIndexRepository | None = None
         self._channel_index_runtime: ChannelIndexRuntime | None = None
         self._index_pending_input: dict[int, dict] = {}
+        # Private command suggestions are presentation-only and refreshed in
+        # the background. Keep them cached to avoid Telegram round trips on
+        # every /start while still rechecking channel access periodically.
+        self._user_command_scope_cache: dict[int, tuple[float, bool]] = {}
+        self._user_command_scope_locks: dict[int, asyncio.Lock] = {}
+        self._user_command_scope_tasks: set[asyncio.Task] = set()
         # Cache group-admin checks briefly so restriction checks do not add a
         # Telegram API call to every search/cancel interaction.
         self._group_admin_status_cache: dict[tuple[int, int], tuple[float, bool]] = {}
@@ -1391,7 +1398,7 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("connect", self.connect_command))
         self.app.add_handler(CommandHandler("connections", self.connections_command))
         self.app.add_handler(CommandHandler("disconnect", self.disconnect_command))
-        self.app.add_handler(CommandHandler("misc", self.misc_command))
+        self.app.add_handler(CommandHandler("id", self.id_command))
         self.app.add_handler(CommandHandler("index", self.index_command))
         self.app.add_handler(CommandHandler("cancel", self._channel_manager.cancel_command))
         self.app.add_handler(CommandHandler("channelmanager", self._channel_manager.open_command))
@@ -1546,7 +1553,6 @@ class GoodreadsBot:
             BotCommand("connect", "Connect a channel by ID or username"),
             BotCommand("connections", "List connected channels"),
             BotCommand("disconnect", "Choose a channel to disconnect"),
-            BotCommand("misc", "Channel tools and settings"),
             BotCommand("index", "Manage channel indexes"),
             BotCommand("channelmanager", "Open Channel Manager"),
             BotCommand("cancel", "Cancel the current Channel Manager step"),
@@ -1583,40 +1589,62 @@ class GoodreadsBot:
             except Exception as exc:
                 logger.warning("Could not publish owner command menu: %s", type(exc).__name__)
 
-    async def _refresh_user_command_scope(self, bot, user_id: int) -> None:
+    async def _refresh_user_command_scope(
+        self, bot, user_id: int, *, force: bool = False,
+    ) -> None:
         """Show Channel Manager commands only to the owner or connected channel admins."""
         if self._owner_user_id is not None and int(user_id) == self._owner_user_id:
             return  # The owner-specific command scope is installed at startup.
-        scope = BotCommandScopeChat(chat_id=int(user_id))
-        public_commands = [
-            BotCommand("start", "Welcome to Annie Search"),
-            BotCommand("help", "How to use Annie"),
-            BotCommand("portal", "Open Annie Search Portal"),
-            BotCommand("recom", "Open Annie Recommendations"),
-            BotCommand("bookshelf", "Open your Bookshelf"),
-            BotCommand("favorites", "Open your Favourites"),
-            BotCommand("search", "Search books by title or author"),
-            BotCommand("ping", "Check bot status and uptime"),
-        ]
-        channel_commands = [
-            BotCommand("connect", "Connect a channel by ID or username"),
-            BotCommand("connections", "List connected channels"),
-            BotCommand("disconnect", "Choose a channel to disconnect"),
-            BotCommand("misc", "Channel tools and settings"),
-            BotCommand("index", "Manage channel indexes"),
-            BotCommand("channelmanager", "Open Channel Manager"),
-            BotCommand("cancel", "Cancel the current Channel Manager step"),
-        ]
-        try:
-            if await self._channel_manager.has_connected_channel_access(user_id, bot):
-                await bot.set_my_commands(
-                    sorted(public_commands + channel_commands, key=lambda command: command.command),
-                    scope=scope,
-                )
-            else:
-                await bot.delete_my_commands(scope=scope)
-        except Exception as exc:
-            logger.warning("Could not refresh private command menu user_id=%s error=%s", user_id, type(exc).__name__)
+        user_id = int(user_id)
+        lock = self._user_command_scope_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            cached = self._user_command_scope_cache.get(user_id)
+            if not force and cached and cached[0] > now:
+                return
+            try:
+                has_access = await self._channel_manager.has_connected_channel_access(user_id, bot)
+                if cached and cached[1] == has_access:
+                    self._user_command_scope_cache[user_id] = (now + 15, has_access)
+                    return
+                scope = BotCommandScopeChat(chat_id=user_id)
+                if has_access:
+                    public_commands = [
+                        BotCommand("start", "Welcome to Annie Search"),
+                        BotCommand("help", "How to use Annie"),
+                        BotCommand("portal", "Open Annie Search Portal"),
+                        BotCommand("recom", "Open Annie Recommendations"),
+                        BotCommand("bookshelf", "Open your Bookshelf"),
+                        BotCommand("favorites", "Open your Favourites"),
+                        BotCommand("search", "Search books by title or author"),
+                        BotCommand("ping", "Check bot status and uptime"),
+                    ]
+                    channel_commands = [
+                        BotCommand("connect", "Connect a channel by ID or username"),
+                        BotCommand("connections", "List connected channels"),
+                        BotCommand("disconnect", "Choose a channel to disconnect"),
+                        BotCommand("index", "Manage channel indexes"),
+                        BotCommand("channelmanager", "Open Channel Manager"),
+                        BotCommand("cancel", "Cancel the current Channel Manager step"),
+                    ]
+                    await bot.set_my_commands(
+                        sorted(public_commands + channel_commands, key=lambda command: command.command),
+                        scope=scope,
+                    )
+                else:
+                    await bot.delete_my_commands(scope=scope)
+                self._user_command_scope_cache[user_id] = (time.monotonic() + 15, has_access)
+            except Exception as exc:
+                logger.warning("Could not refresh private command menu user_id=%s error=%s", user_id, type(exc).__name__)
+
+    def _schedule_user_command_scope_refresh(
+        self, bot, user_id: int, *, force: bool = False,
+    ) -> None:
+        task = asyncio.create_task(
+            self._refresh_user_command_scope(bot, user_id, force=force)
+        )
+        self._user_command_scope_tasks.add(task)
+        task.add_done_callback(self._user_command_scope_tasks.discard)
 
     def process_update(self, raw_update: dict) -> bool:
         """Process a single update dict received from Telegram webhook.
@@ -1798,11 +1826,10 @@ class GoodreadsBot:
 
     @staticmethod
     def _misc_keyboard() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 My connections", callback_data="misc_list_connections")],
-            [InlineKeyboardButton("How to connect a channel", callback_data="misc_connections")],
-            [InlineKeyboardButton("← Back to start", callback_data="start_back")],
-        ])
+        # Keep older Index/connection flows pointed at the current channel menu.
+        return InlineKeyboardMarkup([[InlineKeyboardButton(
+            "← Channel Manager", callback_data="cm:home"
+        )]])
 
     @staticmethod
     def _help_text() -> str:
@@ -1836,19 +1863,6 @@ Save books to My Books, move the ones you love to Favourites with the Like butto
 """
 
     @staticmethod
-    def _misc_text() -> str:
-        return """<b>⚙ Misc</b>
-
-Channel tools for channel owners and administrators. Connect Annie as a channel administrator, then use the index manager to keep older index posts updated when new channel posts arrive.
-
-<code>/connect &lt;channel_id or @username&gt;</code> · Connect a channel
-<code>/connections</code> · List connected channel names
-<code>/disconnect</code> · Choose a channel to disconnect
-<code>/index</code> · Configure an index
-
-Channel management commands work in Annie’s private chat. Only that channel’s owner or an administrator can manage its connection or index."""
-
-    @staticmethod
     def _connections_help_text() -> str:
         return """<b>🔗 Channel connections</b>
 
@@ -1869,20 +1883,6 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             return False
         return await self._channel_manager.has_connected_channel_access(
             update.effective_user.id, context.bot
-        )
-
-    async def misc_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.effective_chat is None or update.effective_chat.type != "private":
-            await update.effective_message.reply_text("Open /misc in a private chat with Annie.")
-            return
-        if not await self._has_channel_tools_access(update, context):
-            await update.effective_message.reply_text("Channel tools are only available to connected channel owners and admins.")
-            return
-        if context.args:
-            await update.effective_message.reply_text("Usage: /misc")
-            return
-        await update.effective_message.reply_text(
-            self._misc_text(), parse_mode=ParseMode.HTML, reply_markup=self._misc_keyboard()
         )
 
     async def index_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1923,14 +1923,9 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             logger.warning("[channel-index] could not list channels error=%s", type(exc).__name__)
             await self._send_or_edit(update, "I couldn’t load connected channels. Please try again.", self._misc_keyboard())
             return
-        eligible = []
-        for channel in channels:
-            try:
-                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
-            except Exception:
-                continue
-            if getattr(member, "status", "") in ("administrator", "creator"):
-                eligible.append(channel)
+        eligible = await self._connected_channels_administered_by(
+            context.bot, update.effective_user.id, channels
+        )
         if not eligible:
             await self._send_or_edit(
                 update,
@@ -1947,7 +1942,7 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             str(channel["name"])[:60],
             callback_data=f"index_choose:{int(channel['id'])}:{action}:{value or '-'}",
         )] for channel in eligible]
-        rows.append([InlineKeyboardButton("← Back to Misc", callback_data="misc_home")])
+        rows.append([InlineKeyboardButton("← Channel Manager", callback_data="cm:home")])
         prompt = "Choose one channel to manage at a time:"
         if action == "toggle":
             prompt = f"Turn automatic index updates {'on' if value == '1' else 'off'} for which channel?"
@@ -1997,7 +1992,7 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
                 f"Automatic index updates are <b>{'on' if desired else 'off'}</b> for <b>{html_escape(channel.title or 'this channel')}</b>.",
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton("Open index settings", callback_data=f"index_choose:{channel_id}:open:-")],
-                    [InlineKeyboardButton("← Misc", callback_data="misc_home")],
+                    [InlineKeyboardButton("← Channel Manager", callback_data="cm:home")],
                 ]),
             )
             return
@@ -2009,7 +2004,7 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
                 f"Delay set to <b>{int(value)} {delay_unit}</b> for <b>{html_escape(channel.title or 'this channel')}</b>. Annie will update the index {int(value)} {delay_unit} after a new post.",
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton("Open index settings", callback_data=f"index_choose:{channel_id}:open:-")],
-                    [InlineKeyboardButton("← Misc", callback_data="misc_home")],
+                    [InlineKeyboardButton("← Channel Manager", callback_data="cm:home")],
                 ]),
             )
             return
@@ -2606,6 +2601,25 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             )]]),
         )
 
+    async def _connected_channels_administered_by(
+        self, bot, user_id: int, channels: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Check channel admin membership concurrently to avoid serial API waits."""
+        semaphore = asyncio.Semaphore(8)
+
+        async def check(channel: dict[str, Any]) -> dict[str, Any] | None:
+            try:
+                async with semaphore:
+                    member = await bot.get_chat_member(int(channel["id"]), int(user_id))
+            except Exception:
+                return None
+            status = getattr(member, "status", "")
+            status = str(getattr(status, "value", status))
+            return channel if status in {"administrator", "creator"} else None
+
+        checked = await asyncio.gather(*(check(channel) for channel in channels))
+        return [channel for channel in checked if channel is not None]
+
     async def _connected_channel_names(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> str:
@@ -2617,14 +2631,10 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
         except Exception as exc:
             logger.warning("Could not list channel connections error=%s", type(exc).__name__)
             return "I couldn’t load connected channels. Please try again."
-        names = []
-        for channel in channels:
-            try:
-                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
-            except Exception:
-                continue
-            if getattr(member, "status", "") in ("administrator", "creator"):
-                names.append(html_escape(str(channel["name"])))
+        eligible = await self._connected_channels_administered_by(
+            context.bot, update.effective_user.id, channels
+        )
+        names = [html_escape(str(channel["name"])) for channel in eligible]
         return "You are connected to:\n" + "\n".join(
             f"• {name}" for name in names
         ) if names else "You are not connected to any channels."
@@ -2649,27 +2659,22 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             logger.warning("Could not list channels for disconnect error=%s", type(exc).__name__)
             await self._send_or_edit(update, "I couldn’t load connected channels. Please try again.")
             return
-        eligible = []
-        for channel in channels:
-            try:
-                member = await context.bot.get_chat_member(channel["id"], update.effective_user.id)
-            except Exception:
-                continue
-            if getattr(member, "status", "") in ("administrator", "creator"):
-                eligible.append(channel)
+        eligible = await self._connected_channels_administered_by(
+            context.bot, update.effective_user.id, channels
+        )
         if not eligible:
             text = (notice + "\n\n" if notice else "") + "You are not connected to any channels."
             await self._send_or_edit(
                 update, text,
                 InlineKeyboardMarkup([[InlineKeyboardButton(
-                    "← Misc", callback_data="misc_home"
+                    "← Channel Manager", callback_data="cm:home"
                 )]]),
             )
             return
         rows = [[InlineKeyboardButton(
             str(channel["name"])[:60], callback_data=f"disconnect_channel:{int(channel['id'])}"
         )] for channel in eligible]
-        rows.append([InlineKeyboardButton("← Misc", callback_data="misc_home")])
+        rows.append([InlineKeyboardButton("← Channel Manager", callback_data="cm:home")])
         text = (notice + "\n\n" if notice else "") + (
             "<b>Connected channels</b>\nTap a channel to disconnect it:"
         )
@@ -2776,13 +2781,16 @@ Use a channel ID (usually starts with <code>-100</code>) or a public channel’s
             )
             await message.reply_text("I couldn’t save that channel connection. Please try again.")
             return
+        self._channel_manager.invalidate_access_cache(update.effective_user.id)
         await message.reply_text(
             f"Connected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
             if created else
             f"<b>{html_escape(channel.title or 'Telegram channel')}</b> is already connected.",
             parse_mode=ParseMode.HTML,
         )
-        await self._refresh_user_command_scope(context.bot, update.effective_user.id)
+        self._schedule_user_command_scope_refresh(
+            context.bot, update.effective_user.id, force=True
+        )
 
     async def connections_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """List connected channels by name only; private chat only."""
@@ -3035,7 +3043,9 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             return
         show_channel_manager = await self._channel_manager.should_show_button(update, context.bot)
         if update.effective_chat and update.effective_chat.type == "private":
-            await self._refresh_user_command_scope(context.bot, update.effective_user.id)
+            self._schedule_user_command_scope_refresh(
+                context.bot, update.effective_user.id
+            )
         await update.message.reply_text(
             self._start_text(),
             parse_mode=ParseMode.HTML,
@@ -3079,6 +3089,26 @@ Save books to My Books or move favourites into their own list. Search, sort, and
             f"📱 <b>Mini App URL:</b> {mini_app}",
             parse_mode=ParseMode.HTML,
         )
+
+    async def id_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the ID of the current Telegram chat without publishing a menu entry."""
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        chat_type = str(getattr(chat.type, "value", chat.type))
+        chat_name = (
+            getattr(chat, "title", None)
+            or " ".join(filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)]))
+            or "Private chat"
+        )
+        text = (
+            f"🆔 <b>{html_escape(chat_name)}</b>\n"
+            f"Chat ID: <code>{int(chat.id)}</code>"
+        )
+        if chat_type == "private":
+            text += "\nRun /id inside a channel to get its channel ID."
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
 
     # ── Inline search ───────────────────────────────────────────────────────────
 
@@ -4736,21 +4766,9 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                     reply_markup=self._help_keyboard(),
                 )
                 return
-            if callback_data in {"start_misc", "help_misc"}:
+            if callback_data in {"start_misc", "help_misc", "misc_home"}:
                 await query.answer()
-                await query.edit_message_text(
-                    self._misc_text(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._misc_keyboard(),
-                )
-                return
-            if callback_data == "misc_home":
-                await query.answer()
-                await query.edit_message_text(
-                    self._misc_text(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._misc_keyboard(),
-                )
+                await self._channel_manager._show_home(update, context)
                 return
             if callback_data == "misc_connections":
                 await query.answer()
@@ -4758,13 +4776,13 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                     self._connections_help_text(),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("← Back to Misc", callback_data="misc_home")
+                        InlineKeyboardButton("← Channel Manager", callback_data="cm:home")
                     ]]),
                 )
                 return
             if callback_data == "misc_list_connections":
                 if update.effective_chat is None or update.effective_chat.type != "private":
-                    await query.answer("Open Misc in a private chat with Annie.", show_alert=True)
+                    await query.answer("Open Channel Manager in a private chat with Annie.", show_alert=True)
                     return
                 await query.answer()
                 await query.edit_message_text(
@@ -4799,7 +4817,10 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 if removed and self._channel_index_runtime is not None:
                     await self._channel_index_runtime.cancel_channel(channel.id)
                     await self._stop_channel_index_listener_if_idle()
-                await self._refresh_user_command_scope(context.bot, update.effective_user.id)
+                self._channel_manager.invalidate_access_cache(update.effective_user.id)
+                self._schedule_user_command_scope_refresh(
+                    context.bot, update.effective_user.id, force=True
+                )
                 notice = (
                     f"Disconnected <b>{html_escape(channel.title or 'Telegram channel')}</b>."
                     if removed else "That channel was already disconnected."

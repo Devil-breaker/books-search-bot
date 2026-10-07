@@ -41,7 +41,7 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {"ANNIE_APP_URL": "https://books.example/miniapp/"})
-    def test_start_menu_has_help_misc_features_portal_recommendations_bookshelf_and_favorites(self):
+    def test_start_menu_has_help_features_portal_recommendations_bookshelf_and_favorites(self):
         update = MagicMock()
         update.effective_chat.type = "private"
         context = MagicMock()
@@ -51,17 +51,16 @@ class TestMiniAppCommandLinks(unittest.TestCase):
         buttons = [button for row in markup.inline_keyboard for button in row]
 
         self.assertEqual(buttons[0].callback_data, "start_help")
-        self.assertEqual(buttons[1].callback_data, "start_misc")
-        self.assertEqual(buttons[2].callback_data, "start_features")
-        self.assertEqual(buttons[3].text, "🔎 Annie Search Portal")
-        self.assertEqual(buttons[3].web_app.url, "https://books.example/miniapp/")
-        self.assertEqual(buttons[4].text, "✨ Annie Recommendations")
-        self.assertEqual(buttons[4].web_app.url, "https://books.example/miniapp/?page=recommendations")
-        self.assertEqual(buttons[5].text, "📚 My Bookshelf")
-        self.assertEqual(buttons[5].web_app.url, "https://books.example/miniapp/?page=bookshelf")
-        self.assertEqual(buttons[6].text, "♥ Favourites")
-        self.assertEqual(buttons[6].web_app.url, "https://books.example/miniapp/?page=favorites")
-        self.assertNotEqual(buttons[3].text.split()[0], buttons[5].text.split()[0])
+        self.assertEqual(buttons[1].callback_data, "start_features")
+        self.assertEqual(buttons[2].text, "🔎 Annie Search Portal")
+        self.assertEqual(buttons[2].web_app.url, "https://books.example/miniapp/")
+        self.assertEqual(buttons[3].text, "✨ Annie Recommendations")
+        self.assertEqual(buttons[3].web_app.url, "https://books.example/miniapp/?page=recommendations")
+        self.assertEqual(buttons[4].text, "📚 My Bookshelf")
+        self.assertEqual(buttons[4].web_app.url, "https://books.example/miniapp/?page=bookshelf")
+        self.assertEqual(buttons[5].text, "♥ Favourites")
+        self.assertEqual(buttons[5].web_app.url, "https://books.example/miniapp/?page=favorites")
+        self.assertNotEqual(buttons[2].text.split()[0], buttons[4].text.split()[0])
 
     def test_features_list_describes_bookshelf(self):
         text = GoodreadsBot._features_text()
@@ -145,6 +144,8 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
 
     async def test_retired_startapp_alias_does_not_launch_a_page(self):
         bot = object.__new__(GoodreadsBot)
+        bot._channel_manager = MagicMock()
+        bot._channel_manager.should_show_button = AsyncMock(return_value=False)
         bot._send_mini_app = AsyncMock()
         bot._start_text = MagicMock(return_value="welcome")
         bot._start_keyboard = MagicMock(return_value="keyboard")
@@ -227,7 +228,7 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
 
         markup = GoodreadsBot._start_keyboard(object.__new__(GoodreadsBot), update, context)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        page_buttons = buttons[3:]
+        page_buttons = buttons[2:]
 
         self.assertEqual(
             [button.url for button in page_buttons],
@@ -261,8 +262,10 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command_names, sorted(command_names))
         self.assertEqual(private_names, sorted(private_names))
         self.assertEqual(group_names, sorted(group_names))
-        self.assertTrue({"connect", "connections", "disconnect", "index", "misc"}.issubset(private_names))
-        self.assertTrue({"connect", "connections", "disconnect", "index", "misc"}.isdisjoint(group_names))
+        channel_commands = {"connect", "connections", "disconnect", "index", "channelmanager", "cancel"}
+        self.assertTrue(channel_commands.isdisjoint(private_names))
+        self.assertTrue(channel_commands.isdisjoint(group_names))
+        self.assertNotIn("misc", private_names + group_names + command_names)
         self.assertIn("portal", command_names)
         self.assertIn("recom", command_names)
         self.assertNotIn("annie_app", command_names)
@@ -273,6 +276,7 @@ class TestStartCommand(unittest.IsolatedAsyncioTestCase):
     def test_old_command_names_are_not_registered_as_aliases(self):
         bot = object.__new__(GoodreadsBot)
         bot.app = MagicMock()
+        bot._channel_manager = MagicMock()
 
         bot.setup_handlers()
 
