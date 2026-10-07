@@ -17,7 +17,7 @@ from pymongo import MongoClient, ReturnDocument
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation,
     InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo,
-    MessageEntity,
+    LinkPreviewOptions, MessageEntity,
     ReplyKeyboardRemove, Update,
 )
 from telegram.constants import ParseMode
@@ -1051,7 +1051,8 @@ class ChannelManager:
         parse_mode: str | None = None, disable_web_page_preview: bool = False,
     ) -> None:
         preview_options = (
-            {"disable_web_page_preview": True} if disable_web_page_preview else {}
+            {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+            if disable_web_page_preview else {}
         )
         query = update.callback_query
         if query and query.message:
@@ -1628,6 +1629,35 @@ class ChannelManager:
         if channel is None:
             await self._access_denied(update)
             return
+        name = html_escape(str(channel.get("name") or "Channel"))
+        rows = [
+            [InlineKeyboardButton("👥 Show admin list", callback_data=f"cm:adminlist:{channel_id}")],
+            [InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{channel_id}")],
+        ]
+        text = (
+            f"<b>👥 Channel Admins · {name}</b>\n\n"
+            "View this channel’s current admin list or manage member roles.\n\n"
+            "<b>Commands</b> (send privately to Annie)\n"
+            "• <code>/adminlist [channel ID]</code> — Show connected channel admins.\n"
+            "• <code>/promote [channel ID] @user or ID</code> — Give posting permission only.\n"
+            "• <code>/fullpromote [channel ID] @user or ID</code> — Give all rights Annie can grant.\n"
+            "• <code>/demote [channel ID] @user or ID</code> — Remove admin rights.\n\n"
+            "Include the channel ID when you manage more than one channel. The member must already be in the channel."
+        )
+        await self._edit_or_send(
+            update, text, InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _send_channel_admin_list(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int,
+    ) -> None:
+        user = update.effective_user
+        if user is None:
+            return
+        channel, _, _ = await self._channel_for_menu(channel_id, int(user.id), context.bot)
+        if channel is None:
+            await self._access_denied(update)
+            return
         try:
             admins = await context.bot.get_chat_administrators(channel_id)
             admins = sorted(
@@ -1643,23 +1673,27 @@ class ChannelManager:
             ]
             entries = []
             for member in admins:
-                user = member.user
-                display_name = html_escape(" ".join(filter(None, [user.first_name, user.last_name])) or "Telegram user")
-                username = (
-                    f' (<a href="https://t.me/{html_escape(user.username)}">@{html_escape(user.username)}</a>)'
-                    if user.username else ""
+                admin_user = member.user
+                display_name = html_escape(
+                    " ".join(filter(None, [admin_user.first_name, admin_user.last_name]))
+                    or "Telegram user"
                 )
-                role = "Owner" if self._chat_member_status(member) == "creator" else "Admin"
-                role_line = "👑 Owner" if role == "Owner" else "✅ Admin"
+                username = (
+                    f' (<a href="https://t.me/{html_escape(admin_user.username)}">'
+                    f'@{html_escape(admin_user.username)}</a>)'
+                    if admin_user.username else ""
+                )
+                is_owner = self._chat_member_status(member) == "creator"
+                role_line = "👑 Owner" if is_owner else "✅ Admin"
                 entries.append(
                     f"{len(entries) + 1}. <b>{display_name}</b>{username}\n"
                     f"   {role_line}\n"
-                    f"   ID: <code>{int(user.id)}</code>\n"
+                    f"   ID: <code>{int(admin_user.id)}</code>\n"
                 )
             visible = []
             current_length = len("\n".join(lines))
             for entry in entries:
-                if current_length + len(entry) > 2850:
+                if current_length + len(entry) > 3800:
                     break
                 visible.append(entry)
                 current_length += len(entry)
@@ -1670,23 +1704,88 @@ class ChannelManager:
                 lines.append("No channel admins were found.")
             body = "\n".join(lines).rstrip()
         except Exception as exc:
-            logger.warning("[channel-manager] admin list failed channel_id=%s user_id=%s error=%s", channel_id, update.effective_user.id, type(exc).__name__)
+            logger.warning(
+                "[channel-manager] admin list failed channel_id=%s user_id=%s error=%s",
+                channel_id, user.id, type(exc).__name__,
+            )
             body = "I couldn’t load the admin list. Check Annie’s channel access and try again."
+
         rows = [
-            [InlineKeyboardButton("↻ Refresh list", callback_data=f"cm:admins:{channel_id}")],
+            [InlineKeyboardButton("↻ Refresh list", callback_data=f"cm:adminlist:{channel_id}")],
+            [InlineKeyboardButton("← Admins menu", callback_data=f"cm:admins:{channel_id}")],
             [InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{channel_id}")],
         ]
         await self._edit_or_send(
-            update,
-            f"{body}\n\n"
-            "<b>Admin commands</b> (send in a private chat with Annie)\n"
-            "• <code>/promote @user</code> or <code>/promote user_id</code> — allow posting only.\n"
-            "• <code>/fullpromote @user</code> or <code>/fullpromote user_id</code> — give all rights Annie can grant.\n"
-            "• <code>/demote @user</code> or <code>/demote user_id</code> — remove admin rights.\n"
-            "The user must already be a member. Annie checks before changing their role.\n"
-            f"For multiple channels: <code>/promote {channel_id} @user</code>. Use the same format for the other commands.",
-            InlineKeyboardMarkup(rows), ParseMode.HTML,
+            update, body, InlineKeyboardMarkup(rows), ParseMode.HTML,
             disable_web_page_preview=True,
+        )
+
+    async def adminlist_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        if not self._is_private(update) or message is None or update.effective_user is None:
+            if message:
+                await message.reply_text("Use /adminlist in a private chat with Annie.")
+            return
+        args = list(context.args or [])
+        if len(args) > 1:
+            await message.reply_text("Usage: /adminlist [channel ID]")
+            return
+        try:
+            channels = await self._eligible_channels(int(update.effective_user.id), context.bot)
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] admin list channel lookup failed user_id=%s error=%s",
+                update.effective_user.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t load your connected channels. Please try again.")
+            return
+        if not channels:
+            await self._access_denied(update)
+            return
+
+        if args:
+            requested_id: int | None = None
+            raw_channel = args[0]
+            try:
+                requested_id = int(raw_channel)
+            except ValueError:
+                if not raw_channel.startswith("@"):
+                    await message.reply_text("Use a channel ID or public @username.")
+                    return
+                try:
+                    chat = await context.bot.get_chat(raw_channel)
+                    requested_id = int(chat.id)
+                except Exception as exc:
+                    logger.info(
+                        "[channel-manager] admin list channel resolution failed user_id=%s error=%s",
+                        update.effective_user.id, type(exc).__name__,
+                    )
+            channel = next(
+                (item for item in channels if requested_id is not None and int(item["id"]) == requested_id),
+                None,
+            )
+            if channel is None:
+                await message.reply_text("That channel isn’t connected to Annie or you aren’t one of its admins.")
+                return
+            await self._send_channel_admin_list(update, context, int(channel["id"]))
+            return
+
+        if len(channels) == 1:
+            await self._send_channel_admin_list(update, context, int(channels[0]["id"]))
+            return
+
+        rows = [
+            [InlineKeyboardButton(
+                str(channel.get("name") or "Channel")[:55],
+                callback_data=f"cm:adminlist:{int(channel['id'])}",
+            )]
+            for channel in channels[:50]
+        ]
+        await message.reply_text(
+            "Choose the channel whose admin list you want to see:",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
 
     async def _begin_admin_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int, operation: str) -> None:
@@ -2877,6 +2976,9 @@ class ChannelManager:
                 return
             if action == "admins":
                 await self._show_channel_admins(update, context, int(parts[2]))
+                return
+            if action == "adminlist":
+                await self._send_channel_admin_list(update, context, int(parts[2]))
                 return
             if action == "admin_start":
                 await self._begin_admin_change(update, context, int(parts[2]), parts[3])

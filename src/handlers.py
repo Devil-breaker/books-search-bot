@@ -1412,6 +1412,7 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("promote", self._channel_manager.promote_command))
         self.app.add_handler(CommandHandler("fullpromote", self._channel_manager.fullpromote_command))
         self.app.add_handler(CommandHandler("demote", self._channel_manager.demote_command))
+        self.app.add_handler(CommandHandler("adminlist", self._channel_manager.adminlist_command))
         self.app.add_handler(CommandHandler("channelapprove", self._channel_manager.approve_channel_command))
         self.app.add_handler(CommandHandler("channelrevoke", self._channel_manager.revoke_channel_command))
         self.app.add_handler(CommandHandler("channelapprovals", self._channel_manager.list_approved_channels_command))
