@@ -15,8 +15,9 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo import MongoClient, ReturnDocument
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-    KeyboardButtonRequestUsers, MessageEntity, ReplyKeyboardMarkup,
+    InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation,
+    InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo,
+    MessageEntity,
     ReplyKeyboardRemove, Update,
 )
 from telegram.constants import ParseMode
@@ -52,6 +53,8 @@ class MongoChannelManagementRepository:
         self.records = self.client[database_name]["bot_channel_manager_records"]
         self.approvals = self.client[database_name]["bot_channel_manager_approvals"]
         self.marginals = self.client[database_name]["bot_channel_manager_marginals"]
+        self.clone_pairs = self.client[database_name]["bot_channel_manager_clone_pairs"]
+        self.clone_messages = self.client[database_name]["bot_channel_manager_clone_messages"]
         self._indexes_ready = False
 
     def ensure_indexes(self) -> None:
@@ -61,6 +64,9 @@ class MongoChannelManagementRepository:
         self.records.create_index([("status", 1), ("scheduled_at", 1)])
         self.approvals.create_index([("updated_at", -1)])
         self.marginals.create_index([("channel_id", 1)], unique=True)
+        self.clone_pairs.create_index([("source_channel_id", 1), ("destination_channel_id", 1)], unique=True)
+        self.clone_pairs.create_index([("source_channel_id", 1), ("auto_forward", 1)])
+        self.clone_messages.create_index([("pair_id", 1), ("source_message_id", 1)], unique=True)
         self._indexes_ready = True
 
     def list_approvals(self) -> list[dict[str, Any]]:
@@ -223,6 +229,7 @@ class MongoChannelManagementRepository:
         user_id: int | None = None,
         include_shared: bool = False,
         limit: int = 30,
+        skip: int = 0,
     ) -> list[dict[str, Any]]:
         query: dict[str, Any] = {"channel_id": int(channel_id), "kind": kind}
         if statuses:
@@ -234,8 +241,93 @@ class MongoChannelManagementRepository:
                 {"created_by": int(user_id)}, {"shared": True},
             ]
         return list(
-            self.records.find(query).sort("updated_at", -1).limit(max(1, int(limit)))
+            self.records.find(query).sort("updated_at", -1)
+            .skip(max(0, int(skip))).limit(max(1, int(limit)))
         )
+
+    @staticmethod
+    def clone_pair_id(source_channel_id: int, destination_channel_id: int) -> str:
+        return f"{int(source_channel_id)}:{int(destination_channel_id)}"
+
+    def get_clone_pair(self, source_channel_id: int, destination_channel_id: int) -> dict[str, Any] | None:
+        return self.clone_pairs.find_one({"_id": self.clone_pair_id(source_channel_id, destination_channel_id)})
+
+    def list_clone_pairs(self, source_channel_id: int | None = None) -> list[dict[str, Any]]:
+        query = {"source_channel_id": int(source_channel_id)} if source_channel_id is not None else {}
+        return list(self.clone_pairs.find(query).sort("updated_at", -1))
+
+    def save_clone_pair(
+        self, source_channel_id: int, destination_channel_id: int,
+        source_name: str, destination_name: str, configured_by: int,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        self.clone_pairs.update_one(
+            {"_id": pair_id},
+            {"$set": {
+                "source_channel_id": int(source_channel_id),
+                "destination_channel_id": int(destination_channel_id),
+                "source_name": str(source_name), "destination_name": str(destination_name),
+                "configured_by": int(configured_by), "updated_at": now,
+            }, "$setOnInsert": {"auto_forward": False, "created_at": now}},
+            upsert=True,
+        )
+        return self.get_clone_pair(source_channel_id, destination_channel_id) or {}
+
+    def set_auto_forward(self, source_channel_id: int, destination_channel_id: int, enabled: bool) -> bool:
+        result = self.clone_pairs.update_one(
+            {"_id": self.clone_pair_id(source_channel_id, destination_channel_id)},
+            {"$set": {"auto_forward": bool(enabled), "updated_at": datetime.now(timezone.utc)}},
+        )
+        return result.matched_count > 0
+
+    def list_published_records_for_clone(self, source_channel_id: int) -> list[dict[str, Any]]:
+        return list(self.records.find({
+            "channel_id": int(source_channel_id), "kind": "post", "status": "published",
+            "$or": [
+                {"published_message_ids": {"$exists": True, "$ne": []}},
+                {"published_message_id": {"$exists": True, "$ne": None}},
+            ],
+        }).sort([("published_at", 1), ("_id", 1)]))
+
+    def get_clone_message(self, source_channel_id: int, destination_channel_id: int, source_message_id: int) -> dict[str, Any] | None:
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        return self.clone_messages.find_one({"pair_id": pair_id, "source_message_id": int(source_message_id)})
+
+    def list_cloned_source_ids(self, source_channel_id: int, destination_channel_id: int, source_message_ids: list[int]) -> set[int]:
+        if not source_message_ids:
+            return set()
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        return {
+            int(item["source_message_id"])
+            for item in self.clone_messages.find(
+                {"pair_id": pair_id, "source_message_id": {"$in": [int(value) for value in source_message_ids]}},
+                {"source_message_id": 1},
+            )
+        }
+
+    def save_clone_message(
+        self, source_channel_id: int, destination_channel_id: int,
+        source_message_id: int, destination_message_id: int, record_id: str | None = None,
+    ) -> None:
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        self.clone_messages.update_one(
+            {"pair_id": pair_id, "source_message_id": int(source_message_id)},
+            {"$set": {
+                "pair_id": pair_id, "source_channel_id": int(source_channel_id),
+                "destination_channel_id": int(destination_channel_id),
+                "source_message_id": int(source_message_id),
+                "destination_message_id": int(destination_message_id),
+                "record_id": str(record_id) if record_id else None,
+                "updated_at": datetime.now(timezone.utc),
+            }}, upsert=True,
+        )
+
+    def delete_clone_message(self, source_channel_id: int, destination_channel_id: int, source_message_id: int) -> bool:
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        return self.clone_messages.delete_one({
+            "pair_id": pair_id, "source_message_id": int(source_message_id),
+        }).deleted_count > 0
 
     def claim_due(self, now: datetime) -> dict[str, Any] | None:
         """Atomically claim one scheduled post so concurrent workers cannot send it twice."""
@@ -288,15 +380,21 @@ class ChannelManager:
         owner_user_id: int | None,
         get_connection_repository: Callable[[], Any],
         open_index_callback: Callable[[Update, ContextTypes.DEFAULT_TYPE, int], Any],
+        resolve_user_username: Callable[[str], Any] | None = None,
+        delete_channel_messages: Callable[[int, list[int]], Any] | None = None,
     ) -> None:
         self.owner_user_id = int(owner_user_id) if owner_user_id is not None else None
         self.get_connection_repository = get_connection_repository
         self.open_index_callback = open_index_callback
+        self.resolve_user_username = resolve_user_username
+        self.delete_channel_messages = delete_channel_messages
         self._repository: MongoChannelManagementRepository | None = None
         self._inputs: dict[int, dict[str, Any]] = {}
         self._visibility_cache: dict[int, tuple[float, bool]] = {}
         self._access_cache: dict[int, tuple[float, bool]] = {}
         self._ambiguous_send_ids: set[str] = set()
+        self._published_previews: dict[int, list[int]] = {}
+        self._clone_pair_locks: dict[str, asyncio.Lock] = {}
 
     def _get_repository(self) -> MongoChannelManagementRepository | None:
         uri = os.getenv("MONGODB_URI", "").strip()
@@ -705,7 +803,15 @@ class ChannelManager:
         record = await asyncio.to_thread(repository.get, record_id) if repository else None
         if not record:
             return None, None
-        channel = await self._channel_for_action(int(record["channel_id"]), user_id, bot)
+        try:
+            channel_id = int(record["channel_id"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "[channel-manager] saved post has invalid channel ID record_id=%s",
+                record_id,
+            )
+            return record, None
+        channel = await self._channel_for_action(channel_id, user_id, bot)
         if channel is None:
             return record, None
         if record.get("kind") == "post" and record.get("status") == "draft":
@@ -717,6 +823,13 @@ class ChannelManager:
     @staticmethod
     def _back_button(callback: str, label: str = "← Back") -> list[InlineKeyboardButton]:
         return [InlineKeyboardButton(label, callback_data=callback)]
+
+    @staticmethod
+    def _callback_page(parts: list[str], position: int = 3) -> int:
+        try:
+            return max(0, int(parts[position])) if len(parts) > position else 0
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _record_label(record: dict[str, Any], fallback: str) -> str:
@@ -935,16 +1048,23 @@ class ChannelManager:
 
     async def _edit_or_send(
         self, update: Update, text: str, markup: InlineKeyboardMarkup | None = None,
-        parse_mode: str | None = None,
+        parse_mode: str | None = None, disable_web_page_preview: bool = False,
     ) -> None:
+        preview_options = (
+            {"disable_web_page_preview": True} if disable_web_page_preview else {}
+        )
         query = update.callback_query
         if query and query.message:
             message = query.message
             if any(getattr(message, media_type, None) for media_type in self.ALLOWED_MEDIA):
-                await message.reply_text(text, reply_markup=markup, parse_mode=parse_mode)
+                await message.reply_text(
+                    text, reply_markup=markup, parse_mode=parse_mode, **preview_options
+                )
                 return
             try:
-                await query.edit_message_text(text, reply_markup=markup, parse_mode=parse_mode)
+                await query.edit_message_text(
+                    text, reply_markup=markup, parse_mode=parse_mode, **preview_options
+                )
                 return
             except BadRequest as exc:
                 if "message is not modified" in str(exc).casefold():
@@ -952,7 +1072,9 @@ class ChannelManager:
                 logger.debug("[channel-manager] menu edit failed error=%s", type(exc).__name__)
         message = update.effective_message
         if message:
-            await message.reply_text(text, reply_markup=markup, parse_mode=parse_mode)
+            await message.reply_text(
+                text, reply_markup=markup, parse_mode=parse_mode, **preview_options
+            )
 
     async def _delete_message(self, bot: Any, chat_id: int, message_id: int | None) -> None:
         if not message_id:
@@ -1047,8 +1169,10 @@ class ChannelManager:
                 [InlineKeyboardButton("🧩 Header & Footer", callback_data=f"cm:marginals:{channel_id}")],
                 [InlineKeyboardButton("📝 Drafts", callback_data=f"cm:drafts:{channel_id}"),
                  InlineKeyboardButton("🕒 Scheduled", callback_data=f"cm:scheduled:{channel_id}")],
-                [InlineKeyboardButton("📋 Templates", callback_data=f"cm:templates:{channel_id}")],
-                [InlineKeyboardButton("📇 Index Manager", callback_data=f"cm:index:{channel_id}")],
+                [InlineKeyboardButton("📢 Published posts", callback_data=f"cm:published:{channel_id}:0"),
+                 InlineKeyboardButton("📋 Templates", callback_data=f"cm:templates:{channel_id}")],
+                [InlineKeyboardButton("📇 Index Manager", callback_data=f"cm:index:{channel_id}"),
+                 InlineKeyboardButton("🔁 Cloning", callback_data=f"cm:cloning:{channel_id}")],
             ]
         rows += [
             [InlineKeyboardButton("👥 Channel admins", callback_data=f"cm:admins:{channel_id}")],
@@ -1063,6 +1187,437 @@ class ChannelManager:
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
 
+    async def _show_cloning_home(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int | None = None) -> None:
+        repository = self._get_repository()
+        if repository is None:
+            await self._storage_error(update)
+            return
+        try:
+            channels = await self._eligible_channels(int(update.effective_user.id), context.bot)
+            pairs = await asyncio.to_thread(repository.list_clone_pairs, channel_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] cloning menu failed user_id=%s error=%s", update.effective_user.id, type(exc).__name__)
+            await self._edit_or_send(update, "I couldn’t load Cloning. Please try again.", None)
+            return
+        allowed = {
+            int(item["id"]): item for item in channels
+            if self._can_post(item.get("_bot_member"))
+            and (item.get("_actor_member") is None or self._can_post(item.get("_actor_member")))
+        }
+        if channel_id is not None and int(channel_id) not in allowed:
+            await self._access_denied(update)
+            return
+        visible = [pair for pair in pairs if int(pair["source_channel_id"]) in allowed and int(pair["destination_channel_id"]) in allowed]
+        rows = [[InlineKeyboardButton("📋 Choose channels / clone posts", callback_data=f"cm:clone_start:{int(channel_id or 0)}")]]
+        for pair in visible[:20]:
+            source_id, destination_id = int(pair["source_channel_id"]), int(pair["destination_channel_id"])
+            source_name = str(allowed[source_id].get("name") or pair.get("source_name") or source_id)
+            destination_name = str(allowed[destination_id].get("name") or pair.get("destination_name") or destination_id)
+            rows.append([InlineKeyboardButton(
+                f"{source_name[:22]} → {destination_name[:22]} · Auto {'ON' if pair.get('auto_forward') else 'OFF'}",
+                callback_data=f"cm:clone_toggle:{source_id}:{destination_id}:{0 if pair.get('auto_forward') else 1}",
+            )])
+            rows.append([InlineKeyboardButton("Clone missing posts", callback_data=f"cm:clone_pair:{source_id}:{destination_id}")])
+        rows.append([InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{int(channel_id)}" if channel_id else "cm:home")])
+        text = (
+            "<b>Cloning</b>\nCopy saved posts from one connected channel to another.\n\n"
+            "• Clone copies only posts Annie published through Channel Manager.\n"
+            "• Auto-forward copies new Annie posts and mirrors Annie’s edits while it is on.\n"
+            "• Other admins’ posts aren’t included.\n\n"
+            "<b>Commands</b>\n"
+            "• <code>/clone</code> — choose channels and copy Annie’s saved posts.\n"
+            "• <code>/autoforward on</code> (or <code>yes</code>) — turn automatic backups on.\n"
+            "• <code>/autoforward off</code> (or <code>no</code>) — turn automatic backups off."
+        )
+        if not channels:
+            text += "\n\nNo connected channel is currently available to you."
+        elif not visible:
+            text += "\n\nNo source/destination pairs are saved yet. Choose channels to clone posts or save a pair for Auto-forward."
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _clone_source_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE, preferred_source: int | None = None) -> None:
+        channels = await self._eligible_channels(int(update.effective_user.id), context.bot)
+        channels = [item for item in channels if self._can_post(item.get("_bot_member")) and (
+            item.get("_actor_member") is None or self._can_post(item.get("_actor_member"))
+        )]
+        if preferred_source and any(int(item["id"]) == int(preferred_source) for item in channels):
+            await self._clone_destination_prompt(update, context, int(preferred_source))
+            return
+        rows = [[InlineKeyboardButton(str(item.get("name") or item["id"])[:55], callback_data=f"cm:clone_source:{int(item['id'])}")] for item in channels]
+        rows.append([InlineKeyboardButton("Cancel", callback_data="cm:cloning")])
+        text = "<b>Choose the source channel</b>\nAnnie copies only posts she recorded in Channel Manager."
+        if not channels:
+            text += "\n\nNo connected channel is available where you and Annie can post."
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _clone_destination_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int) -> None:
+        source = await self._channel_for_menu(source_channel_id, int(update.effective_user.id), context.bot)
+        if source[0] is None:
+            await self._access_denied(update)
+            return
+        channels = await self._eligible_channels(int(update.effective_user.id), context.bot)
+        destinations = [item for item in channels if int(item["id"]) != int(source_channel_id)
+                        and self._can_post(item.get("_bot_member"))
+                        and (item.get("_actor_member") is None or self._can_post(item.get("_actor_member")))]
+        rows = [[InlineKeyboardButton(str(item.get("name") or item["id"])[:55], callback_data=f"cm:clone_dest:{source_channel_id}:{int(item['id'])}")] for item in destinations]
+        rows.append([InlineKeyboardButton("← Choose source", callback_data="cm:clone_start:0")])
+        text = "<b>Choose the destination channel</b>\nAnnie needs permission to post in both channels."
+        if not destinations:
+            text += "\n\nNo other connected channel is available for this pair."
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _clone_confirm_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int, destination_channel_id: int) -> None:
+        source = await self._channel_for_action(source_channel_id, int(update.effective_user.id), context.bot)
+        destination = await self._channel_for_action(destination_channel_id, int(update.effective_user.id), context.bot)
+        if source is None or destination is None or source_channel_id == destination_channel_id:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        try:
+            records = await asyncio.to_thread(repository.list_published_records_for_clone, source_channel_id) if repository else []
+            rows = []
+            if records:
+                rows.append([InlineKeyboardButton(f"Clone {len(records)} saved post{'s' if len(records) != 1 else ''}", callback_data=f"cm:clone_confirm:{source_channel_id}:{destination_channel_id}")])
+            rows.extend([
+                [InlineKeyboardButton("Save pair for Auto-forward", callback_data=f"cm:clone_save:{source_channel_id}:{destination_channel_id}")],
+                [InlineKeyboardButton("Cancel", callback_data="cm:cloning")],
+            ])
+            text = (
+                "<b>Confirm channel pair</b>\n"
+                f"Source: {html_escape(str(source.get('name') or source_channel_id))}\n"
+                f"Destination: {html_escape(str(destination.get('name') or destination_channel_id))}\n\n"
+                f"Annie found {len(records)} saved published post{'s' if len(records) != 1 else ''}. "
+                "Only posts Annie recorded in Channel Manager can be cloned."
+            )
+            await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+        except Exception as exc:
+            logger.warning("[channel-manager] clone confirmation failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            await self._edit_or_send(update, "I couldn’t check the saved posts. Please try again.", None)
+
+    async def clone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_private(update):
+            await update.effective_message.reply_text("Use /clone in a private chat with Annie.")
+            return
+        await self._clone_source_prompt(update, context)
+
+    async def autoforward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_private(update):
+            await update.effective_message.reply_text("Use /autoforward in a private chat with Annie.")
+            return
+        if len(context.args) != 1 or context.args[0].casefold() not in {"yes", "no", "on", "off"}:
+            await update.effective_message.reply_text("Choose a pair in Cloning, then use /autoforward on or /autoforward off. You can also use yes/no.")
+            return
+        enabled = context.args[0].casefold() in {"yes", "on"}
+        repository = self._get_repository()
+        try:
+            pairs = await asyncio.to_thread(repository.list_clone_pairs) if repository else []
+            eligible = []
+            for pair in pairs:
+                source_id, destination_id = int(pair["source_channel_id"]), int(pair["destination_channel_id"])
+                source, destination = await asyncio.gather(
+                    self._channel_for_menu(source_id, int(update.effective_user.id), context.bot),
+                    self._channel_for_menu(destination_id, int(update.effective_user.id), context.bot),
+                )
+                if source[0] and destination[0]:
+                    eligible.append(pair)
+        except Exception as exc:
+            logger.warning("[channel-manager] autoforward command failed user_id=%s error=%s", update.effective_user.id, type(exc).__name__)
+            await update.effective_message.reply_text("I couldn’t load your channel pairs. Please try again.")
+            return
+        if not eligible:
+            await update.effective_message.reply_text("Set a source and destination first in Cloning, then run this command again.")
+            return
+        if len(eligible) == 1:
+            pair = eligible[0]
+            await self._set_auto_forward(update, context, int(pair["source_channel_id"]), int(pair["destination_channel_id"]), enabled)
+            return
+        rows = [[InlineKeyboardButton(
+            f"{str(pair.get('source_name') or pair['source_channel_id'])[:22]} → {str(pair.get('destination_name') or pair['destination_channel_id'])[:22]}",
+            callback_data=f"cm:autofwd_set:{int(pair['source_channel_id'])}:{int(pair['destination_channel_id'])}:{int(enabled)}",
+        )] for pair in eligible[:20]]
+        rows.append([InlineKeyboardButton("Cancel", callback_data="cm:cloning")])
+        await self._edit_or_send(update, f"Which pair should Auto-forward be {'turned on' if enabled else 'turned off'} for?", InlineKeyboardMarkup(rows))
+
+    async def _set_auto_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int, destination_channel_id: int, enabled: bool) -> None:
+        if (await self._channel_for_action(source_channel_id, int(update.effective_user.id), context.bot) is None
+                or await self._channel_for_action(destination_channel_id, int(update.effective_user.id), context.bot) is None):
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        try:
+            changed = await asyncio.to_thread(repository.set_auto_forward, source_channel_id, destination_channel_id, enabled) if repository else False
+        except Exception as exc:
+            logger.warning("[channel-manager] autoforward setting failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            changed = False
+        if not changed:
+            await self._edit_or_send(update, "Save this source and destination pair in Cloning first.", None)
+            return
+        logger.info("[channel-manager] autoforward %s source=%s destination=%s user_id=%s", "enabled" if enabled else "disabled", source_channel_id, destination_channel_id, update.effective_user.id)
+        await self._show_cloning_home(update, context)
+
+    async def _save_clone_pair(self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int, destination_channel_id: int) -> None:
+        source = await self._channel_for_action(source_channel_id, int(update.effective_user.id), context.bot)
+        destination = await self._channel_for_action(destination_channel_id, int(update.effective_user.id), context.bot)
+        repository = self._get_repository()
+        if source is None or destination is None or repository is None or source_channel_id == destination_channel_id:
+            await self._access_denied(update)
+            return
+        try:
+            await asyncio.to_thread(
+                repository.save_clone_pair, source_channel_id, destination_channel_id,
+                str(source.get("name") or source_channel_id),
+                str(destination.get("name") or destination_channel_id), int(update.effective_user.id),
+            )
+            logger.info("[channel-manager] clone pair saved source=%s destination=%s user_id=%s", source_channel_id, destination_channel_id, update.effective_user.id)
+            await self._show_cloning_home(update, context, source_channel_id)
+        except Exception as exc:
+            logger.exception("[channel-manager] clone pair save failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            await self._edit_or_send(update, "I couldn’t save this channel pair. Please try again.", None)
+
+    @staticmethod
+    def _clone_message_ids(record: dict[str, Any]) -> list[int]:
+        values = record.get("published_message_ids") or []
+        if not values and record.get("published_message_id"):
+            values = [record["published_message_id"]]
+        ids = []
+        for value in values:
+            try:
+                message_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if message_id > 0 and message_id not in ids:
+                ids.append(message_id)
+        return ids
+
+    def _clone_markup_for_message(self, record: dict[str, Any], message_id: int) -> InlineKeyboardMarkup | None:
+        components = self._published_components(record)
+        for component in components:
+            if int(component.get("message_id") or 0) != int(message_id):
+                continue
+            kind = component.get("kind")
+            if kind == "main":
+                return self._post_keyboard(record)
+            settings = record.get("marginal_snapshot") or {}
+            field = "header" if kind == "header" else "footer" if kind == "footer" else None
+            if field:
+                field_components = [item for item in components if item.get("kind") == kind]
+                last_index = max((int(item.get("source_index", -1)) for item in field_components), default=-1)
+                if int(component.get("source_index", -1)) == last_index:
+                    return self._post_keyboard({"post_buttons": settings.get(f"{field}_buttons") or []})
+            return None
+        return None
+
+    async def _copy_message_once(
+        self, bot: Any, repository: MongoChannelManagementRepository,
+        source_channel_id: int, destination_channel_id: int, source_message_id: int,
+        markup: InlineKeyboardMarkup | None, record_id: str | None = None,
+    ) -> int | None:
+        pair_id = repository.clone_pair_id(source_channel_id, destination_channel_id)
+        lock = self._clone_pair_locks.setdefault(pair_id, asyncio.Lock())
+        async with lock:
+            existing = await asyncio.to_thread(
+                repository.get_clone_message, source_channel_id,
+                destination_channel_id, source_message_id,
+            )
+            if existing:
+                return None
+            try:
+                copied = await bot.copy_message(
+                    chat_id=destination_channel_id, from_chat_id=source_channel_id,
+                    message_id=source_message_id, reply_markup=markup,
+                )
+            except RetryAfter as exc:
+                await asyncio.sleep(max(1, int(getattr(exc, "retry_after", 1))))
+                copied = await bot.copy_message(
+                    chat_id=destination_channel_id, from_chat_id=source_channel_id,
+                    message_id=source_message_id, reply_markup=markup,
+                )
+            destination_message_id = int(copied.message_id)
+            await asyncio.to_thread(
+                repository.save_clone_message, source_channel_id,
+                destination_channel_id, source_message_id,
+                destination_message_id, record_id,
+            )
+            return destination_message_id
+
+    async def _clone_channel_records(self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int, destination_channel_id: int) -> None:
+        source = await self._channel_for_action(source_channel_id, int(update.effective_user.id), context.bot)
+        destination = await self._channel_for_action(destination_channel_id, int(update.effective_user.id), context.bot)
+        repository = self._get_repository()
+        if source is None or destination is None or repository is None or source_channel_id == destination_channel_id:
+            await self._access_denied(update)
+            return
+        try:
+            await asyncio.to_thread(
+                repository.save_clone_pair, source_channel_id, destination_channel_id,
+                str(source.get("name") or source_channel_id),
+                str(destination.get("name") or destination_channel_id), int(update.effective_user.id),
+            )
+            records = await asyncio.to_thread(repository.list_published_records_for_clone, source_channel_id)
+        except Exception as exc:
+            logger.exception("[channel-manager] clone load failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            await self._edit_or_send(update, "I couldn’t load Annie’s saved posts. No posts were copied.", None)
+            return
+        all_source_ids = [
+            source_message_id
+            for record in records for source_message_id in self._clone_message_ids(record)
+        ]
+        total = len(all_source_ids)
+        mapped_ids: set[int] = set()
+        try:
+            for start in range(0, len(all_source_ids), 500):
+                mapped_ids.update(await asyncio.to_thread(
+                    repository.list_cloned_source_ids, source_channel_id,
+                    destination_channel_id, all_source_ids[start:start + 500],
+                ))
+        except Exception as exc:
+            logger.warning("[channel-manager] clone mapping lookup failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            await self._edit_or_send(update, "I couldn’t check which posts are already copied. Nothing was copied; please try again.", None)
+            return
+        await self._edit_or_send(update, f"Cloning Annie’s saved posts… 0 of {total} messages copied.", None)
+        copied = skipped = already_copied = processed = 0
+        for record in records:
+            record_id = str(record.get("_id") or "")
+            for source_message_id in self._clone_message_ids(record):
+                try:
+                    if source_message_id in mapped_ids:
+                        already_copied += 1
+                        processed += 1
+                        continue
+                    destination_message_id = await self._copy_message_once(
+                        context.bot, repository, source_channel_id, destination_channel_id,
+                        source_message_id, self._clone_markup_for_message(record, source_message_id),
+                        record_id,
+                    )
+                    if destination_message_id is None:
+                        already_copied += 1
+                    else:
+                        copied += 1
+                except Exception as exc:
+                    skipped += 1
+                    logger.warning("[channel-manager] clone message skipped source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_channel_id, source_message_id, type(exc).__name__)
+                processed += 1
+                if processed % 25 == 0:
+                    await self._edit_or_send(update, f"Cloning Annie’s saved posts… {copied} of {total} messages copied.", None)
+        logger.info("[channel-manager] clone complete source=%s destination=%s copied=%s existing=%s skipped=%s user_id=%s", source_channel_id, destination_channel_id, copied, already_copied, skipped, update.effective_user.id)
+        result_text = f"Clone finished. {copied} messages copied."
+        if already_copied:
+            result_text += f" {already_copied} were already there."
+        if skipped:
+            result_text += f" {skipped} couldn’t be copied; check Annie’s channel access and the log."
+        await self._edit_or_send(
+            update, result_text,
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Cloning", callback_data=f"cm:cloning:{source_channel_id}")]]),
+        )
+
+    async def _auto_forward_published(self, bot: Any, source_channel_id: int, sent_messages: list[Any], record: dict[str, Any]) -> int:
+        repository = self._get_repository()
+        if repository is None:
+            return 0
+        try:
+            pairs = await asyncio.to_thread(repository.list_clone_pairs, source_channel_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] autoforward config load failed source=%s error=%s", source_channel_id, type(exc).__name__)
+            return 1
+        source_ids = [int(message.message_id) for message in sent_messages if getattr(message, "message_id", None)]
+        failed = 0
+        for pair in pairs:
+            if not pair.get("auto_forward"):
+                continue
+            destination_id = int(pair["destination_channel_id"])
+            for source_message_id in source_ids:
+                try:
+                    markup = self._clone_markup_for_message(
+                        {**record, "published_message_ids": source_ids}, source_message_id
+                    )
+                    await self._copy_message_once(
+                        bot, repository, source_channel_id, destination_id,
+                        source_message_id, markup, str(record.get("_id") or ""),
+                    )
+                except Exception as exc:
+                    failed += 1
+                    logger.warning("[channel-manager] autoforward message failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
+        return failed
+
+    async def _mirror_edit_to_backups(
+        self, bot: Any, source_channel_id: int, source_message_id: int,
+        updated_record: dict[str, Any], *, reply_markup: Any = None,
+        preserve_reply_markup: bool = False,
+    ) -> None:
+        repository = self._get_repository()
+        if repository is None:
+            return
+        try:
+            pairs = await asyncio.to_thread(repository.list_clone_pairs, source_channel_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] backup edit config load failed source=%s message_id=%s error=%s", source_channel_id, source_message_id, type(exc).__name__)
+            return
+        media = updated_record.get("media") or {}
+        media_type = str(media.get("type") or "")
+        try:
+            send_kwargs = self._send_kwargs(updated_record)
+            if media:
+                media_classes = {"photo": InputMediaPhoto, "video": InputMediaVideo, "animation": InputMediaAnimation,
+                                 "document": InputMediaDocument, "audio": InputMediaAudio}
+                media_class = media_classes.get(media_type)
+                if media_class is None:
+                    return
+                format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
+                payload = media_class(media=str(media.get("file_id") or ""), caption=send_kwargs.get("caption"), **format_kwargs)
+            else:
+                payload = None
+        except Exception as exc:
+            logger.warning("[channel-manager] backup edit payload failed source=%s message_id=%s error=%s", source_channel_id, source_message_id, type(exc).__name__)
+            return
+        for pair in pairs:
+            if not pair.get("auto_forward"):
+                continue
+            destination_id = int(pair["destination_channel_id"])
+            try:
+                mapping = await asyncio.to_thread(repository.get_clone_message, source_channel_id, destination_id, source_message_id)
+                if not mapping:
+                    continue
+                backup_id = int(mapping["destination_message_id"])
+                options = {} if preserve_reply_markup else {"reply_markup": reply_markup}
+                if media:
+                    await bot.edit_message_media(chat_id=destination_id, message_id=backup_id, media=payload, **options)
+                elif updated_record.get("source_message"):
+                    continue
+                elif send_kwargs.get("text") is not None:
+                    text_options = {key: send_kwargs[key] for key in ("parse_mode", "entities") if key in send_kwargs}
+                    await bot.edit_message_text(chat_id=destination_id, message_id=backup_id, text=send_kwargs.get("text") or "", **text_options, **options)
+                else:
+                    caption_options = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
+                    await bot.edit_message_caption(chat_id=destination_id, message_id=backup_id, caption=send_kwargs.get("caption") or "", **caption_options, **options)
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    logger.warning("[channel-manager] backup edit failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
+            except Exception as exc:
+                logger.warning("[channel-manager] backup edit failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
+
+    async def _delete_from_backups(self, bot: Any, source_channel_id: int, source_message_ids: list[int]) -> None:
+        repository = self._get_repository()
+        if repository is None:
+            return
+        try:
+            pairs = await asyncio.to_thread(repository.list_clone_pairs, source_channel_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] backup delete config load failed source=%s error=%s", source_channel_id, type(exc).__name__)
+            return
+        for pair in pairs:
+            if not pair.get("auto_forward"):
+                continue
+            destination_id = int(pair["destination_channel_id"])
+            for source_message_id in source_message_ids:
+                try:
+                    mapping = await asyncio.to_thread(repository.get_clone_message, source_channel_id, destination_id, source_message_id)
+                    if not mapping:
+                        continue
+                    await bot.delete_message(chat_id=destination_id, message_id=int(mapping["destination_message_id"]))
+                    await asyncio.to_thread(repository.delete_clone_message, source_channel_id, destination_id, source_message_id)
+                except Exception as exc:
+                    logger.warning("[channel-manager] backup delete failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
+
     @staticmethod
     def _chat_member_status(member: Any) -> str:
         status = getattr(member, "status", "")
@@ -1075,6 +1630,10 @@ class ChannelManager:
             return
         try:
             admins = await context.bot.get_chat_administrators(channel_id)
+            admins = sorted(
+                admins,
+                key=lambda member: self._chat_member_status(member) != "creator",
+            )
             name = html_escape(str(channel.get("name") or "Channel"))
             lines = [
                 "👥 <b>Channel Admins</b>",
@@ -1100,7 +1659,7 @@ class ChannelManager:
             visible = []
             current_length = len("\n".join(lines))
             for entry in entries:
-                if current_length + len(entry) > 3500:
+                if current_length + len(entry) > 2850:
                     break
                 visible.append(entry)
                 current_length += len(entry)
@@ -1114,20 +1673,24 @@ class ChannelManager:
             logger.warning("[channel-manager] admin list failed channel_id=%s user_id=%s error=%s", channel_id, update.effective_user.id, type(exc).__name__)
             body = "I couldn’t load the admin list. Check Annie’s channel access and try again."
         rows = [
-            [InlineKeyboardButton("Promote a member", callback_data=f"cm:admin_start:{channel_id}:promote")],
-            [InlineKeyboardButton("Demote an admin", callback_data=f"cm:admin_start:{channel_id}:demote")],
             [InlineKeyboardButton("↻ Refresh list", callback_data=f"cm:admins:{channel_id}")],
             [InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{channel_id}")],
         ]
         await self._edit_or_send(
             update,
             f"{body}\n\n"
-            "Promote or demote a person who is already a member of this channel.",
+            "<b>Admin commands</b> (send in a private chat with Annie)\n"
+            "• <code>/promote @user</code> or <code>/promote user_id</code> — allow posting only.\n"
+            "• <code>/fullpromote @user</code> or <code>/fullpromote user_id</code> — give all rights Annie can grant.\n"
+            "• <code>/demote @user</code> or <code>/demote user_id</code> — remove admin rights.\n"
+            "The user must already be a member. Annie checks before changing their role.\n"
+            f"For multiple channels: <code>/promote {channel_id} @user</code>. Use the same format for the other commands.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
+            disable_web_page_preview=True,
         )
 
     async def _begin_admin_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int, operation: str) -> None:
-        if operation not in {"promote", "demote"}:
+        if operation not in {"promote", "fullpromote", "demote"}:
             await self._access_denied(update)
             return
         channel, _, _ = await self._channel_for_menu(channel_id, update.effective_user.id, context.bot)
@@ -1148,27 +1711,153 @@ class ChannelManager:
             logger.warning("[channel-manager] admin permissions check failed channel_id=%s user_id=%s error=%s", channel_id, update.effective_user.id, type(exc).__name__)
             await self._edit_or_send(update, "I couldn’t check the permissions needed to change admins.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
             return
-        self._inputs[int(update.effective_user.id)] = {
-            "kind": "channel_admin_target", "channel_id": channel_id,
-            "operation": operation, "expires_at": time.time() + self.INPUT_TTL_SECONDS,
-        }
-        keyboard = ReplyKeyboardMarkup(
-            [[KeyboardButton("Select Telegram user", request_users=KeyboardButtonRequestUsers(
-                request_id=1, max_quantity=1, request_name=True, request_username=True,
-            ))]], resize_keyboard=True, one_time_keyboard=True,
-        )
-        verb = "promote" if operation == "promote" else "demote"
         await self._edit_or_send(
             update,
-            f"Select the member to {verb}, or send their numeric Telegram user ID. They must already be in this channel. Usernames alone can’t be looked up by Telegram’s bot API.",
-            None,
+            "Use /promote, /fullpromote, or /demote in a private chat with Annie. Send the member’s @username or numeric user ID.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]),
         )
-        message = update.callback_query.message if update.callback_query else None
-        if message:
-            await context.bot.send_message(chat_id=message.chat.id, text="Choose a user or send their ID:", reply_markup=keyboard)
+
+    async def admin_change_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, operation: str,
+    ) -> None:
+        message = update.effective_message
+        if not self._is_private(update) or message is None or update.effective_user is None:
+            if message:
+                await message.reply_text("Use this command in a private chat with Annie.")
+            return
+        if operation not in {"promote", "fullpromote", "demote"}:
+            await message.reply_text("That admin command isn’t available.")
+            return
+        args = list(context.args or [])
+        if len(args) not in {1, 2}:
+            await message.reply_text(
+                f"Usage: /{operation} <@username or user ID>\n"
+                f"For a specific channel: /{operation} <channel ID> <@username or user ID>"
+            )
+            return
+
+        try:
+            channels = await self._connected_channels()
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] admin command channel lookup failed user_id=%s error=%s",
+                update.effective_user.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t load connected channels. Please try again.")
+            return
+
+        channel_id: int | None = None
+        target_arg = args[-1]
+        if len(args) == 2:
+            raw_channel = args[0]
+            try:
+                channel_id = int(raw_channel)
+            except ValueError:
+                if not raw_channel.startswith("@"):
+                    await message.reply_text("Use a channel ID before the member, or use a member’s @username or user ID.")
+                    return
+                try:
+                    chat = await context.bot.get_chat(raw_channel)
+                    channel_id = int(chat.id)
+                except Exception as exc:
+                    logger.info(
+                        "[channel-manager] admin command channel resolution failed user_id=%s error=%s",
+                        update.effective_user.id, type(exc).__name__,
+                    )
+                    await message.reply_text("I couldn’t find that channel. Check its public @username.")
+                    return
+            if not any(int(channel["id"]) == channel_id for channel in channels):
+                await message.reply_text("That channel isn’t connected and approved for Channel Manager.")
+                return
+        else:
+            manageable: list[int] = []
+            for channel in channels:
+                candidate_id = int(channel["id"])
+                if (await self._channel_for_menu(candidate_id, int(update.effective_user.id), context.bot))[0] is None:
+                    continue
+                try:
+                    actor = await context.bot.get_chat_member(candidate_id, int(update.effective_user.id))
+                    if self.owner_user_id == int(update.effective_user.id) or bool(
+                        getattr(actor, "can_promote_members", False)
+                    ):
+                        manageable.append(candidate_id)
+                except Exception as exc:
+                    logger.info(
+                        "[channel-manager] admin command permission lookup failed channel_id=%s user_id=%s error=%s",
+                        candidate_id, update.effective_user.id, type(exc).__name__,
+                    )
+            if len(manageable) != 1:
+                if not manageable:
+                    await message.reply_text("You don’t have admin-management access to a connected channel.")
+                else:
+                    await message.reply_text(
+                        "Choose a channel by adding its ID. Example:\n"
+                        f"/{operation} {manageable[0]} {target_arg}"
+                    )
+                return
+            channel_id = manageable[0]
+
+        try:
+            actor = await context.bot.get_chat_member(channel_id, int(update.effective_user.id))
+            bot_member = await context.bot.get_chat_member(channel_id, int(context.bot.id))
+            actor_can_promote = (
+                self._chat_member_status(actor) == "creator"
+                or bool(getattr(actor, "can_promote_members", False))
+            )
+            if not actor_can_promote:
+                await message.reply_text("You need the channel owner’s permission to add or remove admins.")
+                return
+            if not bool(getattr(bot_member, "can_promote_members", False)):
+                await message.reply_text("Annie needs the ‘Add new admins’ permission in that channel.")
+                return
+        except Exception as exc:
+            logger.info(
+                "[channel-manager] admin command access check failed channel_id=%s user_id=%s error=%s",
+                channel_id, update.effective_user.id, type(exc).__name__,
+            )
+            await message.reply_text("I couldn’t check your admin permissions. Please try again.")
+            return
+
+        if target_arg.startswith("@"):
+            if self.resolve_user_username is None:
+                await message.reply_text("I can’t look up @usernames right now. Send the user’s numeric ID instead.")
+                return
+            try:
+                resolved = await self.resolve_user_username(target_arg.lstrip("@"))
+                target_id = int(resolved[0]) if resolved and resolved[0] else None
+            except Exception as exc:
+                logger.info(
+                    "[channel-manager] admin target username lookup failed channel_id=%s user_id=%s error=%s",
+                    channel_id, update.effective_user.id, type(exc).__name__,
+                )
+                target_id = None
+            if target_id is None:
+                await message.reply_text("I couldn’t find that Telegram user. Check the @username or send their numeric ID.")
+                return
+        elif re.fullmatch(r"\d+", target_arg):
+            target_id = int(target_arg)
+        else:
+            await message.reply_text("Send a member’s @username or numeric Telegram user ID.")
+            return
+
+        assert channel_id is not None
+        logger.info(
+            "[channel-manager] admin command requested channel_id=%s actor_id=%s target_id=%s action=%s",
+            channel_id, update.effective_user.id, target_id, operation,
+        )
+        await self._confirm_admin_change(update, context, channel_id, target_id, operation)
+
+    async def promote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.admin_change_command(update, context, "promote")
+
+    async def fullpromote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.admin_change_command(update, context, "fullpromote")
+
+    async def demote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.admin_change_command(update, context, "demote")
 
     async def _confirm_admin_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int, user_id: int, operation: str) -> None:
-        if operation not in {"promote", "demote"} or (await self._channel_for_menu(channel_id, update.effective_user.id, context.bot))[0] is None:
+        if operation not in {"promote", "fullpromote", "demote"} or (await self._channel_for_menu(channel_id, update.effective_user.id, context.bot))[0] is None:
             await self._access_denied(update)
             return
         try:
@@ -1185,7 +1874,7 @@ class ChannelManager:
             if target_status in {"left", "kicked"}:
                 await self._edit_or_send(update, "That person must join the channel before their role can be changed.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
                 return
-            if operation == "promote" and target_status in {"creator", "administrator"}:
+            if operation in {"promote", "fullpromote"} and target_status in {"creator", "administrator"}:
                 await self._edit_or_send(update, "That person is already a channel admin.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
                 return
             if operation == "demote" and target_status == "creator":
@@ -1194,19 +1883,17 @@ class ChannelManager:
             name = html_escape(" ".join(filter(None, [target.user.first_name, target.user.last_name])) or "Telegram user")
             verb = "Promote" if operation == "promote" else "Demote"
             change_note = ""
-            if operation == "promote":
-                rights = [
-                    ("can_post_messages", "post messages"),
-                    ("can_edit_messages", "edit channel posts"),
-                    ("can_delete_messages", "delete channel posts"),
-                    ("can_invite_users", "invite users"),
-                ]
-                grants = [label for key, label in rights if bool(getattr(bot_member, key, False))]
-                change_note = "\n\nThey will receive: " + (", ".join(grants) if grants else "the permissions Annie can delegate") + ". They will not be able to promote admins."
+            if operation in {"promote", "fullpromote"}:
+                if operation == "promote":
+                    change_note = "\n\nThey will only be able to publish posts. They won’t be able to edit or delete posts, manage members, or promote admins."
+                    verb = "Promote with posting rights"
+                else:
+                    change_note = "\n\nThey will receive all admin rights that you and Annie can grant, including the ability to promote other admins."
+                    verb = "Fully promote"
             await self._edit_or_send(
                 update, f"<b>{verb} {name}?</b>\n\nConfirm to change their channel role.{change_note}",
                 InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"Confirm {verb.lower()}", callback_data=f"cm:admin_apply:{operation}:{channel_id}:{user_id}")],
+                    [InlineKeyboardButton("Confirm", callback_data=f"cm:admin_apply:{operation}:{channel_id}:{user_id}")],
                     [InlineKeyboardButton("Cancel", callback_data=f"cm:admins:{channel_id}")],
                 ]), ParseMode.HTML,
             )
@@ -1227,19 +1914,39 @@ class ChannelManager:
             if not bool(getattr(bot_member, "can_promote_members", False)):
                 await self._edit_or_send(update, "Annie no longer has Telegram’s ‘Add new admins’ permission.", None)
                 return
-            if operation == "promote":
+            if operation in {"promote", "fullpromote"}:
                 grantable = [
-                    "can_post_messages", "can_edit_messages",
-                    "can_delete_messages", "can_invite_users",
+                    "can_change_info", "can_post_messages", "can_edit_messages",
+                    "can_delete_messages", "can_invite_users", "can_restrict_members",
+                    "can_pin_messages", "can_promote_members", "is_anonymous",
+                    "can_manage_chat", "can_manage_video_chats", "can_manage_topics",
+                    "can_post_stories", "can_edit_stories", "can_delete_stories",
                 ]
-                rights = {name: bool(getattr(bot_member, name, False)) for name in grantable}
-                rights["can_promote_members"] = False
+                actor_member = await context.bot.get_chat_member(channel_id, int(update.effective_user.id))
+                if self.owner_user_id == int(update.effective_user.id):
+                    actor_rights = {name: True for name in grantable}
+                else:
+                    actor_rights = {name: bool(getattr(actor_member, name, False)) for name in grantable}
+                if operation == "promote":
+                    if not bool(getattr(bot_member, "can_post_messages", False)) or not actor_rights["can_post_messages"]:
+                        await self._edit_or_send(update, "Annie and you must both have permission to post in this channel before using /promote.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
+                        return
+                    rights = {name: False for name in grantable}
+                    rights["can_post_messages"] = True
+                else:
+                    rights = {
+                        name: bool(getattr(bot_member, name, False)) and actor_rights[name]
+                        for name in grantable
+                    }
+                    if not any(rights.values()):
+                        await self._edit_or_send(update, "You and Annie don’t have any admin rights that can be granted.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
+                        return
                 target = await context.bot.get_chat_member(channel_id, user_id)
                 if self._chat_member_status(target) in {"creator", "administrator"}:
                     await self._edit_or_send(update, "That person is already a channel admin.", InlineKeyboardMarkup([[InlineKeyboardButton("← Admins", callback_data=f"cm:admins:{channel_id}")]]))
                     return
                 await context.bot.promote_chat_member(channel_id, user_id, **rights)
-                result = "Member promoted using only the channel permissions Annie can delegate. They can’t promote other admins."
+                result = "Member promoted with posting rights only." if operation == "promote" else "Member promoted with all admin rights you and Annie can grant."
             elif operation == "demote":
                 target = await context.bot.get_chat_member(channel_id, user_id)
                 if self._chat_member_status(target) == "creator":
@@ -1472,9 +2179,479 @@ class ChannelManager:
             text = "<b>Scheduled posts</b>\nNothing is scheduled for this channel yet."
         await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
 
+    async def _show_published_posts(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, page: int = 0,
+    ) -> None:
+        if await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        if repository is None:
+            await self._storage_error(update)
+            return
+        page = max(0, int(page))
+        page_size = 10
+        try:
+            records = await asyncio.to_thread(
+                repository.list_records, channel_id, "post", ["published"],
+                None, True, page_size + 1, page * page_size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] published post list failed channel_id=%s user_id=%s error=%s",
+                channel_id, update.effective_user.id, type(exc).__name__,
+            )
+            await self._storage_error(update)
+            return
+        has_next = len(records) > page_size
+        records = records[:page_size]
+        rows = [[InlineKeyboardButton(
+            self._record_label(record, "Published post"),
+            callback_data=f"cm:published_post:{record['_id']}:{page}",
+        )] for record in records]
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton(
+                "← Newer", callback_data=f"cm:published:{channel_id}:{page - 1}"
+            ))
+        if has_next:
+            navigation.append(InlineKeyboardButton(
+                "Older →", callback_data=f"cm:published:{channel_id}:{page + 1}"
+            ))
+        if navigation:
+            rows.append(navigation)
+        rows.append(self._back_button(f"cm:channel:{channel_id}"))
+        text = "<b>Published posts</b>\nChoose a post Annie sent to edit or delete it."
+        if not records:
+            text = (
+                "<b>Published posts</b>\nNo saved posts here yet. "
+                "This list only shows posts Annie published through Channel Manager."
+            )
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    @staticmethod
+    def _published_main_message_id(record: dict[str, Any]) -> int | None:
+        value = record.get("published_main_message_id")
+        if value:
+            try:
+                parsed = int(value)
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+        ids: list[int] = []
+        for item in record.get("published_message_ids") or []:
+            try:
+                parsed = int(item)
+                if parsed > 0:
+                    ids.append(parsed)
+            except (TypeError, ValueError):
+                continue
+        if not ids and record.get("published_message_id"):
+            try:
+                parsed = int(record["published_message_id"])
+                if parsed > 0:
+                    ids = [parsed]
+            except (TypeError, ValueError):
+                pass
+        if not ids:
+            return None
+        settings = record.get("marginal_snapshot") or {}
+        media_type = str((record.get("media") or {}).get("type") or "text")
+        if media_type not in set(settings.get("types") or []):
+            return ids[0]
+        header_items = list(settings.get("header_items") or [])
+        if not header_items and (settings.get("header") or {}).get("text"):
+            header_items.append(settings["header"])
+        if not header_items and settings.get("header_content"):
+            header_items.append(settings["header_content"])
+        return ids[len(header_items)] if len(header_items) < len(ids) else ids[0]
+
+    @classmethod
+    def _published_components(cls, record: dict[str, Any]) -> list[dict[str, Any]]:
+        """Map saved message IDs to the main post, margins, and extra messages."""
+        ids: list[int] = []
+        for value in record.get("published_message_ids") or []:
+            try:
+                message_id = int(value)
+                if message_id > 0:
+                    ids.append(message_id)
+            except (TypeError, ValueError):
+                continue
+        if not ids and record.get("published_message_id"):
+            try:
+                ids = [int(record["published_message_id"])]
+            except (TypeError, ValueError):
+                return []
+
+        settings = record.get("marginal_snapshot") or {}
+        main_type = str((record.get("media") or {}).get("type") or "text")
+        margins_active = main_type in set(settings.get("types") or [])
+
+        def margin_items(field: str) -> list[dict[str, Any]]:
+            items = list(settings.get(f"{field}_items") or [])
+            if items:
+                return items
+            legacy = settings.get(field) or {}
+            if legacy:
+                return [dict(legacy)]
+            content = settings.get(f"{field}_content") or {}
+            if content:
+                return [dict(content)]
+            if field == "footer":
+                sticker = settings.get("footer_sticker") or {}
+                if sticker.get("file_id"):
+                    return [{"media": {"type": "sticker", "file_id": sticker["file_id"]}}]
+            return []
+
+        components: list[dict[str, Any]] = []
+        if margins_active:
+            components.extend({"kind": "header", "source_index": i, "data": item}
+                              for i, item in enumerate(margin_items("header")))
+        components.append({"kind": "main", "source_index": 0, "data": record})
+        components.extend({"kind": "extra", "source_index": i, "data": item}
+                          for i, item in enumerate(record.get("followups") or []))
+        if margins_active:
+            components.extend({"kind": "footer", "source_index": i, "data": item}
+                              for i, item in enumerate(margin_items("footer")))
+        for component, message_id in zip(components, ids):
+            component["message_id"] = message_id
+        return [item for item in components if item.get("message_id")]
+
+    async def _show_published_components(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        components = self._published_components(record or {})
+        if not record or channel is None or record.get("status") != "published":
+            await self._access_denied(update)
+            return
+        extras = [item for item in components if item.get("kind") != "main"]
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, component in enumerate(extras):
+            kind = str(component["kind"])
+            data = component.get("data") or {}
+            media_type = str((data.get("media") or {}).get("type") or "")
+            label = {"header": "Header", "footer": "Footer", "extra": "Extra content"}.get(kind, "Message")
+            if media_type:
+                label += f" · {media_type.title()}"
+            else:
+                label += f" · {self._record_label(data, 'Text')[:28]}"
+            rows.append([InlineKeyboardButton(label[:60], callback_data=f"cm:pub_comp:{record_id}:{index}:{page}")])
+        rows.append(self._back_button(f"cm:pub_edit:{record_id}:{page}", "← Edit published post"))
+        await self._edit_or_send(
+            update,
+            "<b>Header, footer & extra messages</b>\nChoose an item to edit or remove. Changes apply to this published post only.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _show_published_component(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, index: int, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        components = self._published_components(record or {})
+        extras = [item for item in components if item.get("kind") != "main"]
+        if not record or channel is None or record.get("status") != "published" or not 0 <= index < len(extras):
+            await self._access_denied(update)
+            return
+        component = extras[index]
+        data = component.get("data") or {}
+        media_type = str((data.get("media") or {}).get("type") or "")
+        rows: list[list[InlineKeyboardButton]] = []
+        if media_type not in {"sticker", "video_note"} and not data.get("source_message"):
+            rows.append([InlineKeyboardButton("Edit text / caption", callback_data=f"cm:pub_comp_txt:{record_id}:{index}:{page}")])
+        if media_type in {"photo", "video", "animation", "document", "audio"}:
+            rows.append([InlineKeyboardButton("Replace media", callback_data=f"cm:pub_comp_med:{record_id}:{index}:{page}")])
+        rows.append([InlineKeyboardButton("Remove this message", callback_data=f"cm:pub_comp_ask:{record_id}:{index}:{page}")])
+        rows.append(self._back_button(f"cm:pub_comps:{record_id}:{page}", "← All extra messages"))
+        label = str(component.get("kind") or "message").replace("extra", "extra content").title()
+        note = (
+            "Telegram doesn’t let Annie edit a sticker in place. You can remove this message."
+            if media_type == "sticker" else
+            "This Telegram message type can only be removed."
+            if not rows[:-2] else
+            ""
+        )
+        await self._edit_or_send(
+            update, f"<b>{html_escape(label)}</b>\nChoose what to change." + (f"\n\n{note}" if note else ""),
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _start_published_component_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, index: int, mode: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        components = self._published_components(record or {})
+        extras = [item for item in components if item.get("kind") != "main"]
+        if not record or channel is None or record.get("status") != "published" or not 0 <= index < len(extras):
+            await self._access_denied(update)
+            return
+        component = extras[index]
+        media_type = str(((component.get("data") or {}).get("media") or {}).get("type") or "")
+        if mode == "text" and media_type in {"sticker", "video_note"}:
+            await self._edit_or_send(update, "Telegram doesn’t support text or captions on stickers or video notes.", None)
+            return
+        if mode == "media" and media_type not in {"photo", "video", "animation", "document", "audio"}:
+            await self._edit_or_send(update, "This message type can’t have its media replaced in Telegram.", None)
+            return
+        query = update.callback_query
+        prompt_message = query.message
+        self._inputs[int(update.effective_user.id)] = {
+            "kind": f"published_component_{mode}", "record_id": record_id,
+            "channel_id": int(record["channel_id"]), "component_index": index,
+            "page": page, "expires_at": time.time() + self.INPUT_TTL_SECONDS,
+            "prompt_chat_id": int(prompt_message.chat.id),
+            "prompt_message_id": int(prompt_message.message_id),
+        }
+        prompt = ("Send the new text or caption for this published message."
+                  if mode == "text" else
+                  "Send a new photo, video, animation, audio, or file. Annie will keep the current caption.")
+        await self._edit_or_send(
+            update, prompt,
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                "Cancel", callback_data=f"cm:pub_comp:{record_id}:{index}:{page}"
+            )]]),
+        )
+
+    async def _component_record_changes(
+        self, record: dict[str, Any], component: dict[str, Any],
+        new_data: dict[str, Any] | None = None, remove: bool = False,
+    ) -> dict[str, Any]:
+        kind, source_index = str(component["kind"]), int(component["source_index"])
+        if kind == "extra":
+            items = list(record.get("followups") or [])
+            if not 0 <= source_index < len(items):
+                raise ValueError("extra message is no longer present")
+            if remove:
+                items.pop(source_index)
+            else:
+                items[source_index] = new_data or {}
+            return {"followups": items}
+
+        settings = dict(record.get("marginal_snapshot") or {})
+        field = kind
+        items = list(settings.get(f"{field}_items") or [])
+        if not items:
+            legacy = settings.get(field) or {}
+            content = settings.get(f"{field}_content") or {}
+            if legacy:
+                items = [dict(legacy)]
+            elif content:
+                items = [dict(content)]
+            elif field == "footer" and (settings.get("footer_sticker") or {}).get("file_id"):
+                items = [{"media": dict(settings["footer_sticker"])}]
+        if not 0 <= source_index < len(items):
+            raise ValueError(f"{field} message is no longer present")
+        if remove:
+            items.pop(source_index)
+        else:
+            items[source_index] = new_data or {}
+        settings[f"{field}_items"] = items
+        settings.pop(field, None)
+        settings.pop(f"{field}_content", None)
+        if field == "footer":
+            settings.pop("footer_sticker", None)
+        return {"marginal_snapshot": settings}
+
+    async def _apply_published_component_edit(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record: dict[str, Any], index: int, content: dict[str, Any], mode: str,
+        page: int = 0,
+    ) -> bool:
+        components = self._published_components(record)
+        extras = [item for item in components if item.get("kind") != "main"]
+        if not 0 <= index < len(extras):
+            await update.effective_message.reply_text("That message is no longer part of this post.")
+            return False
+        component = extras[index]
+        data = dict(component.get("data") or {})
+        message_id = int(component["message_id"])
+        channel_id = int(record["channel_id"])
+        if mode == "text":
+            text = str(content.get("text") or "")
+            if not text.strip():
+                await update.effective_message.reply_text("Send some text for this message.")
+                return False
+            if data.get("media"):
+                send_kwargs = self._send_kwargs({**data, "caption": text, "entities": content.get("entities") or []})
+                format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
+                await context.bot.edit_message_caption(
+                    chat_id=channel_id, message_id=message_id,
+                    caption=text, **format_kwargs,
+                )
+                data.update({"caption": text, "entities": content.get("entities") or [], "format_mode": "telegram"})
+            else:
+                send_kwargs = self._send_kwargs({**data, "text": text, "entities": content.get("entities") or []})
+                format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "entities") if key in send_kwargs}
+                await context.bot.edit_message_text(
+                    chat_id=channel_id, message_id=message_id,
+                    text=text, **format_kwargs,
+                )
+                data.update({"text": text, "entities": content.get("entities") or [], "format_mode": "telegram"})
+        else:
+            media = content.get("media") or {}
+            media_classes = {
+                "photo": InputMediaPhoto, "video": InputMediaVideo,
+                "animation": InputMediaAnimation, "document": InputMediaDocument,
+                "audio": InputMediaAudio,
+            }
+            media_class = media_classes.get(str(media.get("type") or ""))
+            if not media_class:
+                await update.effective_message.reply_text("Send a photo, video, animation, audio, or file.")
+                return False
+            caption = str(data.get("caption") or data.get("text") or "")
+            temp_record = {**data, "media": media, "caption": caption}
+            send_kwargs = self._send_kwargs(temp_record)
+            format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
+            input_media = media_class(media=str(media.get("file_id") or ""), caption=caption or None, **format_kwargs)
+            await context.bot.edit_message_media(
+                chat_id=channel_id, message_id=message_id, media=input_media,
+            )
+            data.update({"media": media, "caption": caption, "text": "", "source_message": None})
+
+        changes = await self._component_record_changes(record, component, new_data=data)
+        try:
+            saved = await asyncio.to_thread(self._get_repository().update, str(record["_id"]), changes)
+        except Exception as exc:
+            logger.error("[channel-manager] extra message edited but save failed channel_id=%s post_id=%s message_id=%s error=%s", channel_id, record.get("_id"), message_id, type(exc).__name__)
+            await update.effective_message.reply_text("The channel message changed, but Annie couldn’t save its details.")
+            return False
+        if not saved:
+            await update.effective_message.reply_text("The channel message changed, but Annie couldn’t save its details.")
+            return False
+        await self._mirror_edit_to_backups(
+            context.bot, channel_id, message_id, data, preserve_reply_markup=True,
+        )
+        return True
+
+    async def _preview_published_post(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "published":
+            await self._access_denied(update)
+            return
+        user_id = int(update.effective_user.id)
+        for old_id in self._published_previews.pop(user_id, []):
+            await self._delete_message(context.bot, user_id, old_id)
+        ids = []
+        for value in record.get("published_message_ids") or []:
+            try:
+                message_id = int(value)
+                if message_id > 0:
+                    ids.append(message_id)
+            except (TypeError, ValueError):
+                continue
+        if not ids and record.get("published_message_id"):
+            try:
+                ids = [int(record["published_message_id"])]
+            except (TypeError, ValueError):
+                ids = []
+        sent_ids: list[int] = []
+        try:
+            for message_id in ids:
+                copied = await context.bot.copy_message(
+                    chat_id=user_id, from_chat_id=int(record["channel_id"]),
+                    message_id=message_id,
+                )
+                sent_ids.append(int(copied.message_id))
+        except Exception as exc:
+            for sent_id in sent_ids:
+                await self._delete_message(context.bot, user_id, sent_id)
+            logger.warning("[channel-manager] published preview failed channel_id=%s user_id=%s post_id=%s error=%s", record.get("channel_id"), user_id, record_id, type(exc).__name__)
+            await self._edit_or_send(update, "Annie couldn’t show the preview. Check that she can access the post in the channel.", None)
+            return
+        self._published_previews[user_id] = sent_ids
+        controls = await context.bot.send_message(
+            chat_id=user_id,
+            text="Current preview. Changes here update the channel post.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Edit post", callback_data=f"cm:published_edit:{record_id}:{page}")],
+                [InlineKeyboardButton("← Published post", callback_data=f"cm:published_post:{record_id}:{page}")],
+            ]),
+        )
+        self._published_previews[user_id].append(int(controls.message_id))
+
+    async def _remove_published_component(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, index: int, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        components = self._published_components(record or {})
+        extras = [item for item in components if item.get("kind") != "main"]
+        if not record or channel is None or record.get("status") != "published" or not 0 <= index < len(extras):
+            await self._access_denied(update)
+            return
+        component = extras[index]
+        message_id = int(component["message_id"])
+        try:
+            deleted = False
+            if self.delete_channel_messages:
+                try:
+                    deleted = bool(await self.delete_channel_messages(int(record["channel_id"]), [message_id]))
+                except Exception as exc:
+                    logger.warning("[channel-manager] extra message MTProto delete failed channel_id=%s message_id=%s error=%s", record["channel_id"], message_id, type(exc).__name__)
+            if not deleted:
+                await context.bot.delete_message(chat_id=int(record["channel_id"]), message_id=message_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] extra message delete failed channel_id=%s post_id=%s message_id=%s error=%s", record["channel_id"], record_id, message_id, type(exc).__name__)
+            await self._edit_or_send(update, "Annie couldn’t remove that message. Check her channel permissions and try again.", None)
+            return
+        ids = [int(value) for value in (record.get("published_message_ids") or []) if str(value).isdigit()]
+        remaining_ids = [value for value in ids if value != message_id]
+        try:
+            changes = await self._component_record_changes(record, component, remove=True)
+            changes.update({
+                "published_message_ids": remaining_ids,
+                "published_message_id": remaining_ids[0] if remaining_ids else None,
+            })
+            repository = self._get_repository()
+            saved = await asyncio.to_thread(repository.update, record_id, changes) if repository else False
+        except Exception as exc:
+            logger.error("[channel-manager] removed extra message but save failed channel_id=%s post_id=%s message_id=%s error=%s", record["channel_id"], record_id, message_id, type(exc).__name__)
+            saved = False
+        if not saved:
+            await self._edit_or_send(update, "The channel message was removed, but Annie couldn’t update the saved post details.", None)
+            return
+        await self._delete_from_backups(context.bot, int(record["channel_id"]), [message_id])
+        await self._preview_published_post(update, context, record_id, page)
+
+    async def _show_published_post(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("kind") != "post" or record.get("status") != "published":
+            await self._access_denied(update)
+            return
+        main_message_id = self._published_main_message_id(record)
+        rows = []
+        if main_message_id is not None:
+            rows.append([InlineKeyboardButton("Edit post", callback_data=f"cm:published_edit:{record_id}:{page}")])
+        rows.extend([
+            [InlineKeyboardButton("Delete post", callback_data=f"cm:published_delete:{record_id}:{page}")],
+            [InlineKeyboardButton("Preview post", callback_data=f"cm:published_preview:{record_id}:{page}")],
+            self._back_button(f"cm:published:{record['channel_id']}:{page}", "← Published posts"),
+        ])
+        sent_at = record.get("published_at")
+        when = sent_at.strftime("%d %b %Y, %H:%M UTC") if isinstance(sent_at, datetime) else ""
+        text = f"<b>{html_escape(self._record_label(record, 'Published post'))}</b>"
+        if when:
+            text += f"\nPublished: {html_escape(when)}"
+        if main_message_id is None:
+            text += "\n\nAnnie doesn’t have a saved message ID for editing this post."
+        else:
+            text += "\n\nEdits update the post in the channel. Delete removes the post and any extra messages Annie sent with it."
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
     async def _confirm_sensitive_action(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-        action: str, record_id: str,
+        action: str, record_id: str, page: int = 0,
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         if not record or channel is None:
@@ -1512,14 +2689,24 @@ class ChannelManager:
             prompt = f"<b>Cancel this scheduled post?</b>\n\n{title}\n\nIt will return to Drafts and won’t be published at the scheduled time."
             confirm_label, confirm_action = "Cancel schedule", "confirm_unschedule"
             cancel_action = "cancel_unschedule"
+        elif action == "published_delete":
+            if record.get("kind") != "post" or record.get("status") != "published":
+                await self._access_denied(update)
+                return
+            prompt = (
+                f"<b>Delete this published post?</b>\n\n{title}\n\n"
+                "Annie will remove the post and its extra messages from the channel."
+            )
+            confirm_label, confirm_action = "Delete published post", "confirm_published_delete"
+            cancel_action = "cancel_published_delete"
         else:
             await self._access_denied(update)
             return
         await self._edit_or_send(
             update, prompt,
             InlineKeyboardMarkup([
-                [InlineKeyboardButton(confirm_label, callback_data=f"cm:{confirm_action}:{record_id}")],
-                [InlineKeyboardButton("Go back", callback_data=f"cm:{cancel_action}:{record_id}")],
+                [InlineKeyboardButton(confirm_label, callback_data=f"cm:{confirm_action}:{record_id}:{page}")],
+                [InlineKeyboardButton("Go back", callback_data=f"cm:{cancel_action}:{record_id}:{page}")],
             ]),
             ParseMode.HTML,
         )
@@ -1653,6 +2840,34 @@ class ChannelManager:
                 # button did nothing because the user is already on that page.
                 await self._show_home(update, context, auto_open_single=False)
                 return
+            if action == "cloning":
+                await self._show_cloning_home(update, context, int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None)
+                return
+            if action == "clone_start":
+                preferred = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) else None
+                await self._clone_source_prompt(update, context, preferred)
+                return
+            if action == "clone_source":
+                await self._clone_destination_prompt(update, context, int(parts[2]))
+                return
+            if action == "clone_dest":
+                await self._clone_confirm_prompt(update, context, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_save":
+                await self._save_clone_pair(update, context, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_pair":
+                await self._clone_confirm_prompt(update, context, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_confirm":
+                await self._clone_channel_records(update, context, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_toggle":
+                await self._set_auto_forward(update, context, int(parts[2]), int(parts[3]), parts[4] == "1")
+                return
+            if action == "autofwd_set":
+                await self._set_auto_forward(update, context, int(parts[2]), int(parts[3]), parts[4] == "1")
+                return
             if action == "index":
                 channel_id = int(parts[2])
                 if await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
@@ -1665,6 +2880,11 @@ class ChannelManager:
                 return
             if action == "admin_start":
                 await self._begin_admin_change(update, context, int(parts[2]), parts[3])
+                return
+            if action == "admin_target":
+                await self._confirm_admin_change(
+                    update, context, int(parts[3]), int(parts[4]), parts[2]
+                )
                 return
             if action == "admin_apply":
                 await self._apply_admin_change(update, context, int(parts[3]), int(parts[4]), parts[2])
@@ -1820,6 +3040,7 @@ class ChannelManager:
                             [InlineKeyboardButton("✍️ Create post", callback_data=f"cm:create:{channel_id}")],
                             [InlineKeyboardButton("🧩 Header & Footer", callback_data=f"cm:marginals:{channel_id}")],
                             [InlineKeyboardButton("📝 Drafts", callback_data=f"cm:drafts:{channel_id}"), InlineKeyboardButton("🕒 Scheduled", callback_data=f"cm:scheduled:{channel_id}")],
+                            [InlineKeyboardButton("📢 Published posts", callback_data=f"cm:published:{channel_id}:0")],
                             [InlineKeyboardButton("📋 Templates", callback_data=f"cm:templates:{channel_id}")],
                             [InlineKeyboardButton("📇 Index Manager", callback_data=f"cm:index:{channel_id}")],
                         ]
@@ -1921,6 +3142,66 @@ class ChannelManager:
             if action == "confirm_unschedule":
                 await self._unschedule(update, context, parts[2])
                 return
+            if action == "published":
+                await self._show_published_posts(update, context, int(parts[2]), self._callback_page(parts))
+                return
+            if action == "published_post":
+                await self._show_published_post(update, context, parts[2], self._callback_page(parts))
+                return
+            if action in {"published_edit", "pub_edit"}:
+                if len(parts) < 3:
+                    await self._access_denied(update)
+                    return
+                await self._begin_published_edit(update, context, parts[2], self._callback_page(parts))
+                return
+            if action == "published_preview":
+                await self._preview_published_post(update, context, parts[2], self._callback_page(parts))
+                return
+            if action in {"published_components", "pub_comps"}:
+                await self._show_published_components(update, context, parts[2], self._callback_page(parts))
+                return
+            if action in {"published_component", "pub_comp"}:
+                state = self._inputs.get(int(update.effective_user.id)) or {}
+                if state.get("record_id") == parts[2] and str(state.get("kind") or "").startswith("published_component_"):
+                    self._inputs.pop(int(update.effective_user.id), None)
+                await self._show_published_component(update, context, parts[2], int(parts[3]), self._callback_page(parts, 4))
+                return
+            if action in {"published_component_text", "published_component_media", "pub_comp_txt", "pub_comp_med"}:
+                await self._start_published_component_input(
+                    update, context, parts[2], int(parts[3]),
+                    "text" if action.endswith("text") or action == "pub_comp_txt" else "media", self._callback_page(parts, 4),
+                )
+                return
+            if action in {"published_component_remove", "pub_comp_ask"}:
+                record, channel = await self._record_for_user(parts[2], update.effective_user.id, context.bot)
+                components = self._published_components(record or {})
+                extras = [item for item in components if item.get("kind") != "main"]
+                index, page = int(parts[3]), self._callback_page(parts, 4)
+                if not record or channel is None or record.get("status") != "published" or not 0 <= index < len(extras):
+                    await self._access_denied(update)
+                    return
+                item = extras[index]
+                label = html_escape(str(item.get("kind") or "message").replace("extra", "extra content"))
+                await self._edit_or_send(
+                    update, f"<b>Remove this {label.lower()} message?</b>\n\nThis deletes it from the channel.",
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Remove message", callback_data=f"cm:pub_comp_rm:{parts[2]}:{index}:{page}")],
+                        [InlineKeyboardButton("Cancel", callback_data=f"cm:pub_comp:{parts[2]}:{index}:{page}")],
+                    ]), ParseMode.HTML,
+                )
+                return
+            if action == "pub_comp_rm":
+                await self._remove_published_component(update, context, parts[2], int(parts[3]), self._callback_page(parts, 4))
+                return
+            if action == "published_delete":
+                await self._confirm_sensitive_action(update, context, "published_delete", parts[2], self._callback_page(parts))
+                return
+            if action == "confirm_published_delete":
+                await self._delete_published_post(update, context, parts[2], self._callback_page(parts))
+                return
+            if action == "cancel_published_delete":
+                await self._show_published_post(update, context, parts[2], self._callback_page(parts))
+                return
             if action == "confirm_schedule":
                 await self._confirm_schedule_submission(update, context, parts[2])
                 return
@@ -2020,6 +3301,12 @@ class ChannelManager:
                 return
             if action == "edit_cancel":
                 state = self._inputs.get(int(update.effective_user.id)) or {}
+                existing = await asyncio.to_thread(self._get_repository().get, parts[2]) if self._get_repository() else None
+                if existing and existing.get("status") == "published":
+                    if state.get("record_id") == parts[2]:
+                        self._inputs.pop(int(update.effective_user.id), None)
+                    await self._begin_published_edit(update, context, parts[2])
+                    return
                 followup_record = None
                 if state.get("record_id") != parts[2] or state.get("kind") != "add_followup":
                     repository = self._get_repository()
@@ -2098,8 +3385,14 @@ class ChannelManager:
                 return
             await self._edit_or_send(update, "That Channel Manager action isn’t available. Open the menu and try again.", None)
         except (ValueError, IndexError) as exc:
-            logger.info("[channel-manager] invalid callback user_id=%s error=%s", getattr(update.effective_user, "id", None), type(exc).__name__)
-            await self._edit_or_send(update, "That button has expired. Open Channel Manager and try again.", None)
+            logger.warning(
+                "[channel-manager] invalid callback user_id=%s callback_data=%r error=%s detail=%s",
+                getattr(update.effective_user, "id", None), data,
+                type(exc).__name__, str(exc),
+            )
+            await self._edit_or_send(
+                update, "This menu is out of date. Open Channel Manager again and retry.", None
+            )
         except Exception as exc:
             logger.exception(
                 "[channel-manager] callback failed user_id=%s callback=%s error=%s",
@@ -2250,11 +3543,48 @@ class ChannelManager:
             ]),
         )
 
+    async def _save_post_buttons(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record: dict[str, Any], buttons: list[dict[str, Any]],
+    ) -> bool:
+        repository = self._get_repository()
+        record_id = str(record.get("_id") or "")
+        if record.get("status") == "published":
+            message_id = self._published_main_message_id(record)
+            if not message_id:
+                await update.effective_message.reply_text("Annie can’t find the published post to update its buttons.")
+                return False
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=int(record["channel_id"]), message_id=message_id,
+                    reply_markup=self._post_keyboard({**record, "post_buttons": buttons}),
+                )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    await update.effective_message.reply_text("Telegram couldn’t update those buttons. The saved settings are unchanged.")
+                    return False
+            except Exception as exc:
+                logger.warning("[channel-manager] published button update failed channel_id=%s post_id=%s error=%s", record.get("channel_id"), record_id, type(exc).__name__)
+                await update.effective_message.reply_text("Telegram couldn’t update those buttons. The saved settings are unchanged.")
+                return False
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, {"post_buttons": buttons}) if repository else False
+        except Exception as exc:
+            logger.warning("[channel-manager] button save failed channel_id=%s post_id=%s error=%s", record.get("channel_id"), record_id, type(exc).__name__)
+            saved = False
+        if saved and record.get("status") == "published":
+            await self._mirror_edit_to_backups(
+                context.bot, int(record["channel_id"]), int(message_id),
+                {**record, "post_buttons": buttons},
+                reply_markup=self._post_keyboard({**record, "post_buttons": buttons}),
+            )
+        return bool(saved)
+
     async def _show_post_buttons(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
-        if not record or channel is None or record.get("status") != "draft":
+        if not record or channel is None or record.get("status") not in {"draft", "published"}:
             await self._access_denied(update)
             return
         buttons = record.get("post_buttons") or []
@@ -2262,7 +3592,9 @@ class ChannelManager:
         for index, item in enumerate(buttons):
             label = str(item.get("text") or "Link")[:22]
             rows.append([InlineKeyboardButton(f"🔗 {index + 1}. {label}", callback_data=f"cm:button_item:{record_id}:{index}")])
-        rows.append([InlineKeyboardButton("← Back to post", callback_data=f"cm:post_preview:{record_id}")])
+        back = (f"cm:published_edit:{record_id}:0" if record.get("status") == "published"
+                else f"cm:post_preview:{record_id}")
+        rows.append([InlineKeyboardButton("← Back to post", callback_data=back)])
         await self._edit_or_send(
             update,
             "<b>Post buttons</b>\nAdd a link button under the post, or tap one to remove it. Telegram shows one button per row.",
@@ -2275,7 +3607,7 @@ class ChannelManager:
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         buttons = list((record or {}).get("post_buttons") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(buttons):
+        if not record or channel is None or record.get("status") not in {"draft", "published"} or not 0 <= index < len(buttons):
             await self._access_denied(update)
             return
         item = buttons[index]
@@ -2298,7 +3630,7 @@ class ChannelManager:
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         buttons = list((record or {}).get("post_buttons") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(buttons):
+        if not record or channel is None or record.get("status") not in {"draft", "published"} or not 0 <= index < len(buttons):
             await self._access_denied(update)
             return
         style = str(buttons[index].get("style") or "default")
@@ -2322,24 +3654,22 @@ class ChannelManager:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         buttons = list((record or {}).get("post_buttons") or [])
         if (style not in allowed or not record or channel is None
-                or record.get("status") != "draft" or not 0 <= index < len(buttons)):
+                or record.get("status") not in {"draft", "published"} or not 0 <= index < len(buttons)):
             await self._access_denied(update)
             return
         if style == "default":
             buttons[index].pop("style", None)
         else:
             buttons[index]["style"] = style
-        repository = self._get_repository()
-        try:
-            saved = await asyncio.to_thread(repository.update, record_id, {"post_buttons": buttons}) if repository else False
-        except Exception as exc:
-            logger.warning("[channel-manager] button color save failed channel_id=%s user_id=%s post_id=%s error=%s", record["channel_id"], update.effective_user.id, record_id, type(exc).__name__)
-            saved = False
+        saved = await self._save_post_buttons(update, context, record, buttons)
         if not saved:
             await self._storage_error(update)
             return
         logger.info("[channel-manager] button color changed channel_id=%s user_id=%s post_id=%s button=%s style=%s", record["channel_id"], update.effective_user.id, record_id, index, style)
-        await self._show_post_preview(update, context, record_id)
+        if record.get("status") == "published":
+            await self._preview_published_post(update, context, record_id)
+        else:
+            await self._show_post_preview(update, context, record_id)
 
     async def _start_button_field_input(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -2347,7 +3677,7 @@ class ChannelManager:
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         buttons = list((record or {}).get("post_buttons") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(buttons):
+        if not record or channel is None or record.get("status") not in {"draft", "published"} or not 0 <= index < len(buttons):
             await self._access_denied(update)
             return
         if field not in {"text", "url"}:
@@ -2373,7 +3703,7 @@ class ChannelManager:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
-        if not record or channel is None or record.get("status") != "draft":
+        if not record or channel is None or record.get("status") not in {"draft", "published"}:
             await self._access_denied(update)
             return
         if len(record.get("post_buttons") or []) >= 8:
@@ -2397,7 +3727,7 @@ class ChannelManager:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str, index: int,
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
-        if not record or channel is None or record.get("status") != "draft":
+        if not record or channel is None or record.get("status") not in {"draft", "published"}:
             await self._access_denied(update)
             return
         buttons = list(record.get("post_buttons") or [])
@@ -2406,11 +3736,14 @@ class ChannelManager:
             return
         buttons.pop(index)
         repository = self._get_repository()
-        saved = await asyncio.to_thread(repository.update, record_id, {"post_buttons": buttons}) if repository else False
+        saved = await self._save_post_buttons(update, context, record, buttons)
         if not saved:
             await self._storage_error(update)
             return
-        await self._show_post_buttons(update, context, record_id)
+        if record.get("status") == "published":
+            await self._preview_published_post(update, context, record_id)
+        else:
+            await self._show_post_buttons(update, context, record_id)
 
     async def _show_post_preview(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
@@ -2602,6 +3935,219 @@ class ChannelManager:
         await self._preview(update, context, record_id)
         logger.info("[channel-manager] followup removed channel_id=%s user_id=%s post_id=%s index=%s", record["channel_id"], update.effective_user.id, record_id, index)
 
+    async def _begin_published_edit(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("kind") != "post" or record.get("status") != "published":
+            await self._access_denied(update)
+            return
+        main_id = self._published_main_message_id(record)
+        if main_id is None:
+            await self._edit_or_send(update, "Annie doesn’t have a saved message ID for this post.", None)
+            return
+        media_type = str((record.get("media") or {}).get("type") or "")
+        rows: list[list[InlineKeyboardButton]] = []
+        if not record.get("source_message") and media_type not in {"sticker", "video_note"}:
+            rows.append([InlineKeyboardButton("Edit text / caption", callback_data=f"cm:edit_text:{record_id}")])
+            rows.append([InlineKeyboardButton("Add text / caption", callback_data=f"cm:edit_append:{record_id}")])
+        if media_type in {"photo", "video", "animation", "document", "audio"}:
+            rows.append([InlineKeyboardButton("Replace media", callback_data=f"cm:edit_media:{record_id}")])
+        rows.append([InlineKeyboardButton(
+            f"Edit URL buttons ({len(record.get('post_buttons') or [])})",
+            callback_data=f"cm:edit_buttons:{record_id}",
+        )])
+        extra_count = sum(1 for item in self._published_components(record) if item.get("kind") != "main")
+        if extra_count:
+            rows.append([InlineKeyboardButton(
+                f"Edit header, footer & extra content ({extra_count})",
+                callback_data=f"cm:published_components:{record_id}:{page}",
+            )])
+        rows.append([InlineKeyboardButton(
+            "Preview post", callback_data=f"cm:published_preview:{record_id}:{page}"
+        )])
+        rows.append(self._back_button(f"cm:published_post:{record_id}:{page}", "← Published post"))
+        await self._edit_or_send(
+            update,
+            "<b>Edit published post</b>\nChanges update the post in the channel.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _delete_published_post(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("kind") != "post" or record.get("status") != "published":
+            await self._access_denied(update)
+            return
+        message_ids = [int(value) for value in (record.get("published_message_ids") or []) if value]
+        if not message_ids and record.get("published_message_id"):
+            message_ids = [int(record["published_message_id"])]
+        if not message_ids:
+            await self._edit_or_send(update, "Annie has no saved message IDs for this post, so it can’t delete it automatically.", None)
+            return
+
+        deleted_ids: set[int] = set()
+        try:
+            if self.delete_channel_messages:
+                try:
+                    deleted = await self.delete_channel_messages(int(record["channel_id"]), message_ids)
+                    if deleted:
+                        deleted_ids.update(message_ids)
+                except Exception as exc:
+                    logger.warning("[channel-manager] MTProto post delete failed channel_id=%s post_id=%s error=%s", record["channel_id"], record_id, type(exc).__name__)
+            for message_id in message_ids:
+                if message_id in deleted_ids:
+                    continue
+                try:
+                    await context.bot.delete_message(chat_id=int(record["channel_id"]), message_id=message_id)
+                    deleted_ids.add(message_id)
+                except BadRequest as exc:
+                    error_text = str(exc).casefold()
+                    if "message to delete not found" in error_text or "message_id_invalid" in error_text:
+                        deleted_ids.add(message_id)
+                    else:
+                        logger.warning("[channel-manager] post message delete failed channel_id=%s post_id=%s message_id=%s error=%s", record["channel_id"], record_id, message_id, type(exc).__name__)
+                except Exception as exc:
+                    logger.warning("[channel-manager] post message delete failed channel_id=%s post_id=%s message_id=%s error=%s", record["channel_id"], record_id, message_id, type(exc).__name__)
+
+            repository = self._get_repository()
+            remaining = [value for value in message_ids if value not in deleted_ids]
+            if remaining:
+                if repository:
+                    await asyncio.to_thread(repository.update, record_id, {"published_message_ids": remaining})
+                await self._delete_from_backups(context.bot, int(record["channel_id"]), sorted(deleted_ids))
+                await self._edit_or_send(
+                    update,
+                    f"Annie removed {len(deleted_ids)} of {len(message_ids)} messages. Some could not be deleted; try again or remove them in Telegram.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("← Published post", callback_data=f"cm:published_post:{record_id}:{page}")]]),
+                )
+                return
+            if not repository:
+                await self._storage_error(update)
+                return
+            saved = await asyncio.to_thread(repository.update, record_id, {
+                "status": "deleted", "published_message_ids": [],
+                "published_message_id": None, "published_main_message_id": None,
+                "deleted_at": datetime.now(timezone.utc),
+            })
+            if not saved:
+                await self._edit_or_send(update, "The channel messages were deleted, but Annie couldn’t update the saved record. Reopen the list to refresh it.", None)
+                return
+            await self._delete_from_backups(context.bot, int(record["channel_id"]), message_ids)
+        except Exception as exc:
+            logger.exception("[channel-manager] published post deletion failed channel_id=%s user_id=%s post_id=%s error=%s", record.get("channel_id"), update.effective_user.id, record_id, type(exc).__name__)
+            await self._edit_or_send(update, "Annie couldn’t finish deleting this post. Check the channel before trying again.", None)
+            return
+        logger.info("[channel-manager] published post deleted channel_id=%s user_id=%s post_id=%s messages=%s", record["channel_id"], update.effective_user.id, record_id, len(message_ids))
+        await self._show_published_posts(update, context, int(record["channel_id"]), page)
+
+    async def _apply_published_content_edit(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record: dict[str, Any], changes: dict[str, Any],
+    ) -> bool:
+        repository = self._get_repository()
+        record_id = str(record.get("_id") or "")
+        channel_id = int(record["channel_id"])
+        main_id = self._published_main_message_id(record)
+        if not repository or not main_id:
+            await update.effective_message.reply_text("Annie can’t find the published message to edit.")
+            return False
+        updated_record = {**record, **changes}
+        media = updated_record.get("media") or {}
+        keyboard = self._post_keyboard(updated_record)
+        try:
+            if "media" in changes:
+                media_type = str(media.get("type") or "")
+                media_classes = {
+                    "photo": InputMediaPhoto,
+                    "video": InputMediaVideo,
+                    "animation": InputMediaAnimation,
+                    "document": InputMediaDocument,
+                    "audio": InputMediaAudio,
+                }
+                media_class = media_classes.get(media_type)
+                if media_class is None:
+                    await update.effective_message.reply_text(
+                        "Telegram can’t replace this post’s media type. The channel post is unchanged."
+                    )
+                    return False
+                send_kwargs = self._send_kwargs(updated_record)
+                format_kwargs = {}
+                if "parse_mode" in send_kwargs:
+                    format_kwargs["parse_mode"] = send_kwargs["parse_mode"]
+                if "caption_entities" in send_kwargs:
+                    format_kwargs["caption_entities"] = send_kwargs["caption_entities"]
+                input_media = media_class(
+                    media=str(media.get("file_id") or ""),
+                    caption=send_kwargs.get("caption"),
+                    **format_kwargs,
+                )
+                await context.bot.edit_message_media(
+                    chat_id=channel_id, message_id=main_id,
+                    media=input_media, reply_markup=keyboard,
+                )
+            elif media:
+                media_type = str(media.get("type") or "")
+                if media_type in {"sticker", "video_note"}:
+                    await update.effective_message.reply_text(
+                        "This post type can’t have an edited caption. The channel post is unchanged."
+                    )
+                    return False
+                send_kwargs = self._send_kwargs(updated_record)
+                caption_kwargs = {
+                    key: send_kwargs[key]
+                    for key in ("parse_mode", "caption_entities")
+                    if key in send_kwargs
+                }
+                await context.bot.edit_message_caption(
+                    chat_id=channel_id, message_id=main_id,
+                    caption=send_kwargs.get("caption") or "",
+                    reply_markup=keyboard, **caption_kwargs,
+                )
+            else:
+                send_kwargs = self._send_kwargs(updated_record)
+                text_kwargs = {
+                    key: send_kwargs[key]
+                    for key in ("parse_mode", "entities")
+                    if key in send_kwargs
+                }
+                await context.bot.edit_message_text(
+                    chat_id=channel_id, message_id=main_id,
+                    text=send_kwargs.get("text") or "",
+                    reply_markup=keyboard, **text_kwargs,
+                )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                raise
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, changes)
+        except Exception as exc:
+            logger.error(
+                "[channel-manager] published post changed but record save failed channel_id=%s user_id=%s post_id=%s error=%s",
+                channel_id, update.effective_user.id, record_id, type(exc).__name__,
+            )
+            await update.effective_message.reply_text(
+                "The channel post changed, but Annie couldn’t save the updated details."
+            )
+            return False
+        if not saved:
+            await update.effective_message.reply_text(
+                "The channel post changed, but Annie couldn’t save the updated details."
+            )
+            return False
+        logger.info(
+            "[channel-manager] published post edited channel_id=%s user_id=%s post_id=%s fields=%s",
+            channel_id, update.effective_user.id, record_id, ",".join(sorted(changes)),
+        )
+        await self._mirror_edit_to_backups(
+            context.bot, channel_id, main_id, updated_record,
+            reply_markup=keyboard,
+        )
+        return True
+
     async def _begin_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         if not record or channel is None or record.get("status") != "draft":
@@ -2639,13 +4185,16 @@ class ChannelManager:
         record_id: str, edit_mode: str,
     ) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
-        if not record or channel is None or record.get("status") != "draft" or edit_mode not in {"replace", "append", "text", "media"}:
+        published_edit = bool(record and record.get("status") == "published")
+        if (not record or channel is None or record.get("status") not in {"draft", "published"}
+                or edit_mode not in {"replace", "append", "text", "media"}
+                or (published_edit and edit_mode == "replace")):
             await self._access_denied(update)
             return
-        if edit_mode == "text" and (record.get("source_message") or str((record.get("media") or {}).get("type") or "") in {"sticker", "video_note"}):
+        if edit_mode == "text" and ((record.get("source_message") and not published_edit) or str((record.get("media") or {}).get("type") or "") in {"sticker", "video_note"}):
             await self._edit_or_send(update, "This post type doesn’t support text editing. You can replace the entire post instead.", None)
             return
-        if edit_mode == "media" and not record.get("media"):
+        if edit_mode == "media" and not record.get("media") and not published_edit:
             await self._edit_or_send(update, "This draft has no media to replace. Choose Replace entire post to add media.", None)
             return
         prompt_message = update.callback_query.message
@@ -2656,6 +4205,7 @@ class ChannelManager:
         self._inputs[int(update.effective_user.id)] = {
             "kind": input_kind,
             "record_id": record_id, "channel_id": int(record["channel_id"]),
+            "published_edit": published_edit,
             "mode": str(record.get("format_mode") or "telegram"),
             "prompt_chat_id": int(prompt_message.chat.id),
             "prompt_message_id": int(prompt_message.message_id),
@@ -2666,7 +4216,7 @@ class ChannelManager:
                 "replace": "Send the new text or media. This replaces the whole post.",
                 "append": "Send text to add after the current post. Annie will keep the existing content.",
                 "text": "Send the replacement text or caption. The current media and link buttons will stay.",
-                "media": "Send one new photo, video, or file. Annie will keep the caption and link buttons. Replacing it with a sticker/video note clears the caption because Telegram doesn’t allow one there.",
+                "media": "Send a new photo, video, animation, audio, or file. Annie will keep the caption and link buttons.",
             }[edit_mode]
         )
         await self._edit_or_send(
@@ -2842,6 +4392,44 @@ class ChannelManager:
             return
         kind = state["kind"]
         message = update.effective_message
+        if kind in {"published_component_text", "published_component_media"}:
+            record, channel = await self._record_for_user(str(state["record_id"]), user_id, context.bot)
+            if not record or channel is None or record.get("status") != "published":
+                self._inputs.pop(user_id, None)
+                await message.reply_text("That published post is no longer available.")
+                return
+            content = self._content_from_message(message, "telegram")
+            if not content:
+                await message.reply_text("Send text, a photo, video, animation, audio, or a file.")
+                return
+            mode = "text" if kind.endswith("_text") else "media"
+            if mode == "text":
+                text_value = str(content.get("caption") or content.get("text") or "")
+                if content.get("media") or content.get("source_message") or not text_value.strip():
+                    await message.reply_text("Send text only for this message.")
+                    return
+                components = [item for item in self._published_components(record) if item.get("kind") != "main"]
+                component_index = int(state.get("component_index", -1))
+                component_data = (components[component_index].get("data") or {}) if 0 <= component_index < len(components) else {}
+                limit = 1024 if component_data.get("media") else 4096
+                if len(text_value) > limit:
+                    await message.reply_text(f"Keep the text under {limit} characters.")
+                    return
+                content = {"text": text_value, "entities": list(content.get("entities") or [])}
+            elif not content.get("media"):
+                await message.reply_text("Send a photo, video, animation, audio, or file to replace this message.")
+                return
+            if await self._apply_published_component_edit(
+                update, context, record, int(state.get("component_index", -1)),
+                content, mode, int(state.get("page", 0)),
+            ):
+                self._inputs.pop(user_id, None)
+                await self._delete_message(context.bot, message.chat.id, message.message_id)
+                await self._clear_input_prompt(context, state)
+                await self._preview_published_post(
+                    update, context, str(state["record_id"]), int(state.get("page", 0)),
+                )
+            return
         if kind == "channel_admin_target":
             target_id = None
             shared = getattr(message, "users_shared", None)
@@ -3036,9 +4624,9 @@ class ChannelManager:
                 await message.reply_text("That link doesn’t look right. Send a full http:// or https:// link.")
                 return
             current, current_channel = await self._record_for_user(str(state["record_id"]), user_id, context.bot)
-            if not current or current_channel is None or current.get("status") != "draft":
+            if not current or current_channel is None or current.get("status") not in {"draft", "published"}:
                 self._inputs.pop(user_id, None)
-                await message.reply_text("That draft is no longer available.")
+                await message.reply_text("That post is no longer available.")
                 return
             buttons = list(current.get("post_buttons") or [])
             if len(buttons) >= 8:
@@ -3046,12 +4634,17 @@ class ChannelManager:
                 await message.reply_text("This post already has 8 buttons, the Telegram limit used here.")
                 return
             buttons.append({"text": str(state["button_label"]), "url": url})
-            saved = await asyncio.to_thread(repo.update, str(state["record_id"]), {"post_buttons": buttons})
+            saved = await self._save_post_buttons(update, context, current, buttons)
             if not saved:
                 await message.reply_text("I couldn’t save that button. Please try again.")
                 return
             record_id = str(state["record_id"])
             self._inputs.pop(user_id, None)
+            if current.get("status") == "published":
+                await self._delete_message(context.bot, message.chat.id, message.message_id)
+                await self._clear_input_prompt(context, state)
+                await self._preview_published_post(update, context, record_id)
+                return
             previewed = await self._preview(update, context, record_id)
             if previewed:
                 await self._clear_input_prompt(context, state)
@@ -3071,13 +4664,13 @@ class ChannelManager:
             current, current_channel = await self._record_for_user(str(state["record_id"]), user_id, context.bot)
             buttons = list((current or {}).get("post_buttons") or [])
             index = int(state.get("button_index", -1))
-            if not current or current_channel is None or current.get("status") != "draft" or not 0 <= index < len(buttons):
+            if not current or current_channel is None or current.get("status") not in {"draft", "published"} or not 0 <= index < len(buttons):
                 self._inputs.pop(user_id, None)
                 await message.reply_text("That button or draft is no longer available.")
                 return
             buttons[index][field] = value
             try:
-                saved = await asyncio.to_thread(repo.update, str(state["record_id"]), {"post_buttons": buttons})
+                saved = await self._save_post_buttons(update, context, current, buttons)
             except Exception as exc:
                 logger.warning("[channel-manager] button edit failed channel_id=%s user_id=%s post_id=%s error=%s", channel_id, user_id, state["record_id"], type(exc).__name__)
                 saved = False
@@ -3086,6 +4679,11 @@ class ChannelManager:
                 return
             record_id = str(state["record_id"])
             self._inputs.pop(user_id, None)
+            if current.get("status") == "published":
+                await self._delete_message(context.bot, message.chat.id, message.message_id)
+                await self._clear_input_prompt(context, state)
+                await self._preview_published_post(update, context, record_id)
+                return
             previewed = await self._preview(update, context, record_id)
             if previewed:
                 await self._delete_message(context.bot, message.chat.id, message.message_id)
@@ -3179,7 +4777,8 @@ class ChannelManager:
             input_message_id = content.pop("input_message_id", None)
             if kind == "edit_text":
                 current = await asyncio.to_thread(repo.get, str(state["record_id"]))
-                if not current or current.get("source_message"):
+                published_edit = bool(state.get("published_edit"))
+                if not current or (current.get("source_message") and not published_edit):
                     await message.reply_text("This post type can’t be edited as text. Replace the entire post instead.")
                     return
                 media_type = str((current.get("media") or {}).get("type") or "")
@@ -3196,7 +4795,7 @@ class ChannelManager:
                 }
             elif kind == "edit_media":
                 current = await asyncio.to_thread(repo.get, str(state["record_id"]))
-                if not current or not current.get("media"):
+                if not current or (not current.get("media") and not state.get("published_edit")):
                     await message.reply_text("There’s no media in this draft to replace.")
                     return
                 if not content.get("media"):
@@ -3211,7 +4810,7 @@ class ChannelManager:
                 content = media_fields
             if kind == "edit_append" and (current := await asyncio.to_thread(repo.get, str(state["record_id"]))) is not None:
                 media_type = str((current.get("media") or {}).get("type") or "")
-                if current.get("source_message"):
+                if current.get("source_message") and not state.get("published_edit"):
                     await message.reply_text("Annie can’t add text to this Telegram post type. Replace it with text or media to edit its content.")
                     return
                 if media_type in {"sticker", "video_note"}:
@@ -3239,9 +4838,27 @@ class ChannelManager:
                     "entities": old_entities + new_entities,
                 }
             current_record = await asyncio.to_thread(repo.get, str(state["record_id"]))
+            if not current_record or current_record.get("status") != (
+                "published" if state.get("published_edit") else "draft"
+            ):
+                await message.reply_text("That post is no longer available to edit.")
+                self._inputs.pop(user_id, None)
+                return
             has_media = bool((current_record or {}).get("media")) if kind in {"edit_text", "edit_append"} else bool(content.get("media"))
             if len(content.get("text") or content.get("caption") or "") > (1024 if has_media else 4096):
                 await message.reply_text("That text is too long for one Telegram post. Shorten it or use a separate message.")
+                return
+            if state.get("published_edit"):
+                updated = await self._apply_published_content_edit(
+                    update, context, current_record, content,
+                )
+                if not updated:
+                    return
+                self._inputs.pop(user_id, None)
+                if input_message_id:
+                    await self._delete_message(context.bot, message.chat.id, int(input_message_id))
+                await self._clear_input_prompt(context, state)
+                await self._preview_published_post(update, context, str(state["record_id"]))
                 return
             try:
                 updated = await asyncio.to_thread(repo.update, str(state["record_id"]), content)
@@ -3459,13 +5076,24 @@ class ChannelManager:
             receipt_saved = await asyncio.to_thread(repo.update, record_id, {
                 "status": "published", "published_at": datetime.now(timezone.utc),
                 "published_message_id": sent_ids[0] if sent_ids else None,
+                "published_main_message_id": self._published_main_message_id({
+                    **record, "published_message_ids": sent_ids,
+                    "marginal_snapshot": settings,
+                }),
                 "published_message_ids": sent_ids, "last_error": None,
+                "marginal_snapshot": settings,
                 "publishing_at": None,
             })
         except Exception as exc:
             logger.error("[channel-manager] publish receipt save failed channel_id=%s user_id=%s post_id=%s error=%s", record["channel_id"], update.effective_user.id, record_id, type(exc).__name__)
             receipt_saved = False
         logger.info("[channel-manager] post published channel_id=%s user_id=%s post_id=%s messages=%s", record["channel_id"], update.effective_user.id, record_id, len(sent_ids))
+        backup_failures = 0
+        if receipt_saved:
+            backup_failures = await self._auto_forward_published(
+                context.bot, int(record["channel_id"]), sent_messages,
+                {**record, "marginal_snapshot": settings},
+            )
         preview_ids = list(record.get("preview_message_ids") or [])
         if not preview_ids and record.get("preview_message_id"):
             preview_ids = [record["preview_message_id"]]
@@ -3484,6 +5112,8 @@ class ChannelManager:
             if receipt_saved else
             "Published, but Annie couldn’t save the receipt. Check the channel before retrying to avoid a duplicate."
         )
+        if backup_failures:
+            result_text += f" Auto-forward missed {backup_failures} message(s); check the backup channel and Annie’s permissions."
         await self._edit_or_send(update, result_text, InlineKeyboardMarkup([[InlineKeyboardButton("Channel Manager", callback_data=f"cm:channel:{record['channel_id']}")]]))
 
     async def _delete_draft(self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str) -> None:
@@ -3692,14 +5322,25 @@ class ChannelManager:
                 await asyncio.to_thread(repo.finish_schedule, record["_id"], "published", {
                     "published_at": datetime.now(timezone.utc),
                     "published_message_id": sent_ids[0] if sent_ids else None,
+                    "published_main_message_id": self._published_main_message_id({
+                        **record, "published_message_ids": sent_ids,
+                        "marginal_snapshot": settings,
+                    }),
                     "published_message_ids": sent_ids, "last_error": None,
+                    "marginal_snapshot": settings,
                 })
             except Exception as exc:
                 logger.error("[channel-manager] scheduled post receipt save failed channel_id=%s post_id=%s error=%s", channel_id, record_id, type(exc).__name__)
                 await self._notify_creator(bot, record, "Your scheduled post was sent, but Annie couldn’t save the receipt. Check the channel before retrying.")
                 return
             logger.info("[channel-manager] scheduled post published channel_id=%s post_id=%s messages=%s", channel_id, record_id, len(sent_ids))
-            await self._notify_creator(bot, record, "Your scheduled post was published.")
+            backup_failures = await self._auto_forward_published(
+                bot, channel_id, sent_messages, {**record, "marginal_snapshot": settings}
+            )
+            notification = "Your scheduled post was published."
+            if backup_failures:
+                notification += f" Auto-forward missed {backup_failures} message(s); check the backup channel and Annie’s permissions."
+            await self._notify_creator(bot, record, notification)
         except PartialPostSendError as exc:
             await asyncio.to_thread(repo.finish_schedule, record["_id"], "needs_review", {
                 "published_message_ids": exc.sent_message_ids,

@@ -146,6 +146,8 @@ class GoodreadsBot:
             self._owner_user_id,
             self._get_channel_connection_repository,
             self._open_channel_manager_index,
+            self._resolve_channel_admin_username,
+            self._delete_channel_messages_mtproto,
         )
         self._channel_manager_task: asyncio.Task | None = None
         self.setup_handlers()
@@ -1402,6 +1404,14 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("index", self.index_command))
         self.app.add_handler(CommandHandler("cancel", self._channel_manager.cancel_command))
         self.app.add_handler(CommandHandler("channelmanager", self._channel_manager.open_command))
+        # Private Channel Manager commands; intentionally omitted from Telegram command suggestions.
+        self.app.add_handler(CommandHandler("clone", self._channel_manager.clone_command))
+        self.app.add_handler(CommandHandler("autoforward", self._channel_manager.autoforward_command))
+        # These work as private-chat commands but are intentionally omitted
+        # from Telegram's public command suggestions.
+        self.app.add_handler(CommandHandler("promote", self._channel_manager.promote_command))
+        self.app.add_handler(CommandHandler("fullpromote", self._channel_manager.fullpromote_command))
+        self.app.add_handler(CommandHandler("demote", self._channel_manager.demote_command))
         self.app.add_handler(CommandHandler("channelapprove", self._channel_manager.approve_channel_command))
         self.app.add_handler(CommandHandler("channelrevoke", self._channel_manager.revoke_channel_command))
         self.app.add_handler(CommandHandler("channelapprovals", self._channel_manager.list_approved_channels_command))
@@ -1494,6 +1504,45 @@ class GoodreadsBot:
                 type(exc).__name__,
             )
             return False
+
+    async def _resolve_channel_admin_username(
+        self, username: str,
+    ) -> tuple[int | None, str | None]:
+        """Resolve a member username through the shared MTProto listener."""
+        started_for_lookup = self._channel_index_runtime is None
+        if started_for_lookup and not await self._ensure_channel_index_listener():
+            return None, None
+        runtime = self._channel_index_runtime
+        if runtime is None:
+            return None, None
+        try:
+            return await runtime.resolve_sender_username(username)
+        finally:
+            if started_for_lookup:
+                await self._stop_channel_index_listener_if_idle()
+
+    async def _delete_channel_messages_mtproto(
+        self, channel_id: int, message_ids: list[int],
+    ) -> bool:
+        """Delete saved channel posts through the shared bot-authenticated MTProto client."""
+        started_for_delete = self._channel_index_runtime is None
+        if started_for_delete and not await self._ensure_channel_index_listener():
+            return False
+        runtime = self._channel_index_runtime
+        if runtime is None or runtime.client is None:
+            return False
+        try:
+            await runtime.client.delete_messages(int(channel_id), [int(value) for value in message_ids])
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] MTProto delete unavailable channel_id=%s messages=%s error=%s",
+                channel_id, len(message_ids), type(exc).__name__,
+            )
+            return False
+        finally:
+            if started_for_delete:
+                await self._stop_channel_index_listener_if_idle()
 
     async def _stop_channel_index_listener_if_idle(self) -> None:
         runtime = self._channel_index_runtime
