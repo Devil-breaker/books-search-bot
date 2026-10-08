@@ -63,6 +63,7 @@ class MongoChannelManagementRepository:
             return
         self.records.create_index([("channel_id", 1), ("kind", 1), ("status", 1)])
         self.records.create_index([("status", 1), ("scheduled_at", 1)])
+        self.records.create_index([("channel_id", 1), ("published_main_message_id", 1)])
         self.approvals.create_index([("updated_at", -1)])
         self.marginals.create_index([("channel_id", 1)], unique=True)
         self.clone_pairs.create_index([("source_channel_id", 1), ("destination_channel_id", 1)], unique=True)

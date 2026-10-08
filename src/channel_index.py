@@ -26,6 +26,19 @@ class MongoChannelIndexRepository:
             maxPoolSize=5,
         )
         self.configs = self.client[database_name]["bot_channel_indexes"]
+        self.channel_manager_records = self.client[database_name]["bot_channel_manager_records"]
+
+    def is_channel_manager_main_post(self, channel_id: int, message_id: int) -> bool:
+        """Only allow Annie-authored posts that Channel Manager recorded as main content."""
+        return self.channel_manager_records.find_one(
+            {
+                "channel_id": int(channel_id),
+                "published_main_message_id": int(message_id),
+                "kind": "post",
+                "status": "published",
+            },
+            {"_id": 1},
+        ) is not None
 
     def get(self, channel_id: int) -> dict[str, Any] | None:
         return self.configs.find_one({"_id": int(channel_id)})
@@ -422,9 +435,14 @@ class ChannelIndexRuntime:
         if not event.is_channel or not getattr(message, "post", False):
             return
         channel_id = int(event.chat_id)
+        from src.utils import logger
         try:
             config = await asyncio.to_thread(self.repository.get, channel_id)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[channel-index] could not load config for new post channel_id=%s post_id=%s error=%s",
+                channel_id, getattr(message, "id", None), type(exc).__name__,
+            )
             return
         if not config or not config.get("enabled") or not config.get("targets"):
             return
@@ -432,15 +450,21 @@ class ChannelIndexRuntime:
                for target in config.get("targets") or []):
             return
         sender_id = getattr(message, "sender_id", None)
-        from src.utils import logger
         logger.info(
             "[channel-index] received channel post channel_id=%s post_id=%s sender_id=%s post_author=%s",
             channel_id, int(message.id), sender_id, getattr(message, "post_author", None),
         )
-        if sender_id == self.bot_user_id:
-            return
         try:
-            is_excluded = sender_id is not None and int(sender_id) in self._excluded_sender_ids(config)
+            sender_id = int(sender_id) if sender_id is not None else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "[channel-index] post has invalid sender ID channel_id=%s post_id=%s",
+                channel_id, int(message.id),
+            )
+            sender_id = None
+        sender_is_bot = sender_id is not None and sender_id == self.bot_user_id
+        try:
+            is_excluded = sender_id is not None and sender_id in self._excluded_sender_ids(config)
         except (TypeError, ValueError):
             is_excluded = False
         if is_excluded:
@@ -469,11 +493,16 @@ class ChannelIndexRuntime:
         pending = {
             "message_id": post_id, "title": title, "due_at": due_at,
             "category_marker": category_marker, "categorized": categorized,
-            "sender_id": int(sender_id) if sender_id is not None else None,
+            "sender_id": sender_id,
+            "sender_is_bot": sender_is_bot,
         }
         try:
             queued = await asyncio.to_thread(self.repository.schedule_post, channel_id, pending)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[channel-index] could not queue post channel_id=%s post_id=%s error=%s",
+                channel_id, post_id, type(exc).__name__,
+            )
             return
         if not queued:
             return
@@ -615,8 +644,24 @@ class ChannelIndexRuntime:
                     item for item in config.get("pending_posts") or []
                     if int(item.get("message_id", -1)) == post_id
                 )
-                excluded_sender_ids = self._excluded_sender_ids(config)
                 sender_id = pending_item.get("sender_id")
+                sender_is_bot = bool(pending_item.get("sender_is_bot")) or (
+                    sender_id is not None and int(sender_id) == self.bot_user_id
+                )
+                if sender_is_bot:
+                    is_managed_main_post = await asyncio.to_thread(
+                        self.repository.is_channel_manager_main_post,
+                        channel_id, post_id,
+                    )
+                    if not is_managed_main_post:
+                        await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+                        from src.utils import logger
+                        logger.info(
+                            "[channel-index] skipped Annie post that is not a saved Channel Manager main post channel_id=%s post_id=%s",
+                            channel_id, post_id,
+                        )
+                        return
+                excluded_sender_ids = self._excluded_sender_ids(config)
                 if sender_id is None and excluded_sender_ids:
                     try:
                         source = await self.client.get_messages(channel_id, ids=post_id)
@@ -868,48 +913,87 @@ class ChannelIndexRuntime:
         channel_id = getattr(event, "chat_id", None)
         if channel_id is None:
             return
-        for post_id in getattr(event, "deleted_ids", ()):
-            key = (int(channel_id), int(post_id))
+        from src.utils import logger
+        try:
+            channel_id = int(channel_id)
+            deleted_ids = {int(value) for value in (getattr(event, "deleted_ids", ()) or ())}
+        except (TypeError, ValueError):
+            logger.warning("[channel-index] deletion update had invalid IDs")
+            return
+        if not deleted_ids:
+            return
+        for post_id in deleted_ids:
+            key = (channel_id, post_id)
             task = self._pending.pop(key, None)
             if task:
                 task.cancel()
             try:
-                await asyncio.to_thread(self.repository.remove_pending, int(channel_id), int(post_id))
-            except Exception:
-                pass
+                await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+            except Exception as exc:
+                logger.warning(
+                    "[channel-index] pending deletion cleanup failed channel_id=%s post_id=%s error=%s",
+                    channel_id, post_id, type(exc).__name__,
+                )
             self._retry_counts.pop(key, None)
         try:
             async with self._lock:
-                config = await asyncio.to_thread(self.repository.get, int(channel_id))
+                config = await asyncio.to_thread(self.repository.get, channel_id)
                 if not config:
                     return
-                deleted = {int(value) for value in getattr(event, "deleted_ids", ())}
                 entries = list(config.get("entries") or [])
-                removed = [entry for entry in entries
-                           if int(entry.get("source_message_id", -1)) in deleted]
+                def source_was_deleted(entry: dict[str, Any]) -> bool:
+                    try:
+                        return int(entry.get("source_message_id", -1)) in deleted_ids
+                    except (TypeError, ValueError):
+                        return False
+
+                removed = [entry for entry in entries if source_was_deleted(entry)]
                 if not removed:
                     return
-                entries = [entry for entry in entries
-                           if int(entry.get("source_message_id", -1)) not in deleted]
+                entries = [entry for entry in entries if not source_was_deleted(entry)]
                 targets = list(config.get("targets") or [])
-                await asyncio.to_thread(self.repository.update, int(channel_id), {"entries": entries})
+                await asyncio.to_thread(self.repository.update, channel_id, {"entries": entries})
                 for target in targets:
-                    target_id = int(target["message_id"])
-                    if not any(int(entry.get("target_message_id", -1)) == target_id for entry in removed):
+                    try:
+                        target_id = int(target["message_id"])
+                    except (KeyError, TypeError, ValueError):
+                        logger.warning(
+                            "[channel-index] ignored placeholder with invalid message ID channel_id=%s",
+                            channel_id,
+                        )
                         continue
-                    remaining = [entry for entry in entries
-                                 if int(entry.get("target_message_id", -1)) == target_id]
+                    def entry_targets_message(entry: dict[str, Any]) -> bool:
+                        try:
+                            return int(entry.get("target_message_id", -1)) == target_id
+                        except (TypeError, ValueError):
+                            return False
+
+                    if not any(entry_targets_message(entry) for entry in removed):
+                        continue
+                    remaining = [entry for entry in entries if entry_targets_message(entry)]
                     rendered = self._render_target(
                         str(target.get("base_html") or ""), remaining,
                         str(config.get("sort_order") or "added"),
                         str(target.get("entry_bullet") or config.get("entry_bullet") or "🔹"),
                     )
-                    await self.bot.edit_message_text(
-                        chat_id=int(channel_id), message_id=target_id,
-                        text=rendered, parse_mode="HTML", disable_web_page_preview=True,
-                    )
+                    try:
+                        await self.bot.edit_message_text(
+                            chat_id=channel_id, message_id=target_id,
+                            text=rendered, parse_mode="HTML", disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        if "message is not modified" in str(exc).casefold():
+                            continue
+                        logger.warning(
+                            "[channel-index] deleted source entry saved but index message refresh failed channel_id=%s source_post_ids=%s index_post_id=%s error=%s",
+                            channel_id, sorted(deleted_ids), target_id, type(exc).__name__,
+                        )
+                        continue
+                logger.info(
+                    "[channel-index] removed deleted source entries channel_id=%s source_post_ids=%s entries=%s",
+                    channel_id, sorted(deleted_ids), len(removed),
+                )
         except Exception as exc:
-            from src.utils import logger
             logger.warning(
                 "[channel-index] deletion cleanup failed channel_id=%s error=%s",
                 channel_id, type(exc).__name__,
