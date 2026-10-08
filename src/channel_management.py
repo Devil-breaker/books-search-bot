@@ -563,7 +563,15 @@ class ChannelManager:
             await update.effective_message.reply_text("Usage: /channelmanager")
             return
         if not await self.has_connected_channel_access(update.effective_user.id, context.bot):
-            await update.effective_message.reply_text("Channel Manager is only available to connected channel owners and admins.")
+            await update.effective_message.reply_text(
+                "You are not connected to any channel you can manage yet.\n\n"
+                "To connect one, send <code>/connect @channelusername</code> or "
+                "<code>/connect -1001234567890</code> in a private chat with Annie.\n"
+                "You must be that channel’s owner or admin, and Annie must already be an admin there.\n\n"
+                "To find the channel ID, send <code>/id</code> in the channel. "
+                "Ask the bot owner to approve it with <code>/channelapprove</code> before using Channel Manager.",
+                parse_mode=ParseMode.HTML,
+            )
             return
         await self._show_home(update, context)
 

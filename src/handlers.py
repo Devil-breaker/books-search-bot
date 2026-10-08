@@ -1400,7 +1400,12 @@ class GoodreadsBot:
         self.app.add_handler(CommandHandler("connect", self.connect_command))
         self.app.add_handler(CommandHandler("connections", self.connections_command))
         self.app.add_handler(CommandHandler("disconnect", self.disconnect_command))
-        self.app.add_handler(CommandHandler("id", self.id_command))
+        # Include channel posts explicitly: CommandHandler defaults to regular
+        # messages, so /id sent in a channel would otherwise be ignored.
+        self.app.add_handler(CommandHandler(
+            "id", self.id_command,
+            filters=filters.UpdateType.MESSAGES | filters.UpdateType.CHANNEL_POST,
+        ))
         self.app.add_handler(CommandHandler("index", self.index_command))
         self.app.add_handler(CommandHandler("cancel", self._channel_manager.cancel_command))
         self.app.add_handler(CommandHandler("channelmanager", self._channel_manager.open_command))
