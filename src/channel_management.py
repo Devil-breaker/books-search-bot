@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import os
 import re
 import time
@@ -989,7 +990,7 @@ class ChannelManager:
         marginal_settings: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Send the main post and any separately appended messages in order."""
-        items = [record, *(record.get("followups") or [])]
+        post_items = [record, *(record.get("followups") or [])]
         sent: list[Any] = []
         allowed_types = set((marginal_settings or {}).get("types") or [])
         main_type = str((record.get("media") or {}).get("type") or "text")
@@ -997,19 +998,19 @@ class ChannelManager:
         header_items = list((marginal_settings or {}).get("header_items") or [])
         footer_items = list((marginal_settings or {}).get("footer_items") or [])
         # Older saved previews contain the former one-item setting shape.
-        for field, items in (("header", header_items), ("footer", footer_items)):
-            if items:
+        for field, margin_items in (("header", header_items), ("footer", footer_items)):
+            if margin_items:
                 continue
             legacy = (marginal_settings or {}).get(field) or {}
             if legacy.get("text"):
-                items.append(dict(legacy))
+                margin_items.append(dict(legacy))
             content = (marginal_settings or {}).get(f"{field}_content") or {}
             if content:
-                items.append(dict(content))
-            if field == "footer" and not items:
+                margin_items.append(dict(content))
+            if field == "footer" and not margin_items:
                 sticker = (marginal_settings or {}).get("footer_sticker") or {}
                 if sticker.get("file_id"):
-                    items.append({"media": {"type": "sticker", "file_id": sticker["file_id"]}})
+                    margin_items.append({"media": {"type": "sticker", "file_id": sticker["file_id"]}})
         async def send_margin_items(items: list[dict[str, Any]], field: str) -> None:
             buttons = list((marginal_settings or {}).get(f"{field}_buttons") or [])
             for margin_index, item in enumerate(items):
@@ -1026,8 +1027,8 @@ class ChannelManager:
                     raise
         if add_media_margins:
             await send_margin_items(header_items, "header")
-        for index, item in enumerate(items):
-            is_last = index == len(items) - 1
+        for index, item in enumerate(post_items):
+            is_last = index == len(post_items) - 1
             message_record = {**record, **item, "_id": str(record.get("_id")), "followups": []}
             # Channel post URL buttons belong to the main post, even when
             # extra messages follow it. The preview controls stay on the last item.
@@ -2859,6 +2860,10 @@ class ChannelManager:
         if not record:
             await self._edit_or_send(update, "I couldn’t save that draft. Please try again.", None)
             return False
+        recovery_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Open draft options", callback_data=f"cm:keep:{record_id}")],
+            [InlineKeyboardButton("Drafts", callback_data=f"cm:drafts:{int(record['channel_id'])}")],
+        ])
         try:
             old_chat_id = record.get("preview_chat_id")
             old_message_ids = list(record.get("preview_message_ids") or [])
@@ -2870,6 +2875,8 @@ class ChannelManager:
                 marginal_settings=settings,
             )
             message_ids = [int(item.message_id) for item in sent if getattr(item, "message_id", None)]
+            if not message_ids:
+                raise RuntimeError("preview send returned no message IDs")
             message_id = message_ids[-1] if message_ids else None
             if message_id:
                 saved = await asyncio.to_thread(repository.update, record_id, {
@@ -2897,15 +2904,15 @@ class ChannelManager:
             for sent_id in exc.sent_message_ids:
                 await self._delete_message(context.bot, int(update.effective_user.id), sent_id)
             logger.warning("[channel-manager] partial preview cleaned user_id=%s post_id=%s sent=%s cause=%s", int(update.effective_user.id), record_id, len(exc.sent_message_ids), type(exc.cause).__name__)
-            await self._edit_or_send(update, "I couldn’t preview every part of this post. Your draft is saved; try again or edit the extra content.", None)
+            await self._edit_or_send(update, "I couldn’t preview every part of this post. Your draft is saved; open its options to retry or edit it.", recovery_markup)
         except BadRequest as exc:
             logger.info("[channel-manager] invalid post formatting channel_id=%s user_id=%s post_id=%s", int(record["channel_id"]), int(update.effective_user.id), record_id)
-            await self._edit_or_send(update, "Telegram couldn’t read that formatting. Check the text or MarkdownV2 symbols, then edit the draft.", None)
+            await self._edit_or_send(update, "Telegram couldn’t read that formatting. Your draft is saved; open its options to edit it.", recovery_markup)
         except ValueError as exc:
-            await self._edit_or_send(update, str(exc), None)
+            await self._edit_or_send(update, f"{exc}\nYour draft is saved; open its options to edit it.", recovery_markup)
         except Exception as exc:
             logger.warning("[channel-manager] preview failed channel_id=%s user_id=%s post_id=%s error=%s", int(record["channel_id"]), int(update.effective_user.id), record_id, type(exc).__name__)
-            await self._edit_or_send(update, "I couldn’t show the preview. Your draft is saved; please try again.", None)
+            await self._edit_or_send(update, "I couldn’t show the preview. Your draft is saved; open its options to retry or edit it.", recovery_markup)
         return False
 
     async def _storage_error(self, update: Update) -> None:
@@ -3482,6 +3489,45 @@ class ChannelManager:
             if action == "schedule":
                 await self._begin_schedule(update, context, parts[2])
                 return
+            if action == "sch_noop":
+                return
+            if action == "sch_cal":
+                state = self._inputs.get(int(update.effective_user.id)) or {}
+                if state.get("kind") == "schedule_timezone":
+                    self._inputs.pop(int(update.effective_user.id), None)
+                    await self._clear_input_prompt(context, state)
+                await self._show_schedule_calendar(
+                    update, context, parts[2], int(parts[3]), int(parts[4])
+                )
+                return
+            if action == "sch_date":
+                await self._show_schedule_hours(update, context, parts[2], parts[3])
+                return
+            if action == "sch_hr":
+                await self._show_schedule_minutes(
+                    update, context, parts[2], parts[3], int(parts[4])
+                )
+                return
+            if action == "sch_min":
+                local_time = f"{parts[3]} {int(parts[4]):02d}:{int(parts[5]):02d}"
+                await self._show_schedule_timezones(update, context, parts[2], local_time)
+                return
+            if action == "sch_tz":
+                local_time = datetime.strptime(parts[3], "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M")
+                await self._set_pending_schedule(update, context, parts[2], local_time, parts[4])
+                return
+            if action == "sch_tzc":
+                local_time = datetime.strptime(parts[3], "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M")
+                await self._begin_schedule_timezone_input(update, context, parts[2], local_time)
+                return
+            if action == "sch_tzx":
+                state = self._inputs.get(int(update.effective_user.id)) or {}
+                if state.get("record_id") == parts[2] and state.get("kind") == "schedule_timezone":
+                    self._inputs.pop(int(update.effective_user.id), None)
+                    await self._clear_input_prompt(context, state)
+                local_time = datetime.strptime(parts[3], "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M")
+                await self._show_schedule_timezones(update, context, parts[2], local_time)
+                return
             if action == "unschedule":
                 await self._confirm_sensitive_action(update, context, "unschedule", parts[2])
                 return
@@ -3851,9 +3897,16 @@ class ChannelManager:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
     ) -> None:
         query = update.callback_query
-        if query and query.message:
-            await self._delete_message(context.bot, query.message.chat.id, query.message.message_id)
-        await self._preview(update, context, record_id)
+        # Keep the current menu available until the replacement preview is
+        # successfully sent. If Telegram rejects the post (for example, due to
+        # malformed formatting or an unavailable forwarded message), _preview
+        # reports the error through this message; deleting it first leaves the
+        # user with no visible result.
+        shown = await self._preview(update, context, record_id)
+        if shown and query and query.message:
+            await self._delete_message(
+                context.bot, query.message.chat.id, query.message.message_id
+            )
 
     async def _start_followup_input(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
@@ -4396,16 +4449,240 @@ class ChannelManager:
         if record.get("pending_followups"):
             await self._edit_or_send(update, "Finish adding extra messages with Done or Cancel before scheduling this post.", None)
             return
+        now = datetime.now(timezone.utc)
+        await self._show_schedule_calendar(update, context, record_id, now.year, now.month)
+
+    async def _show_schedule_calendar(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, year: int, month: int, notice: str | None = None,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        if record.get("pending_followups"):
+            await self._edit_or_send(
+                update, "Finish adding extra messages before scheduling this post.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("← Draft", callback_data=f"cm:keep:{record_id}")]]),
+            )
+            return
+        if not 1 <= month <= 12 or not 2000 <= year <= 2100:
+            await self._edit_or_send(update, "That calendar page is out of range. Choose Schedule again.", None)
+            return
+
+        previous = datetime(year, month, 1) - timedelta(days=1)
+        next_month = datetime(year, month, 1) + timedelta(days=32)
+        rows = [[
+            InlineKeyboardButton("‹", callback_data=f"cm:sch_cal:{record_id}:{previous.year}:{previous.month}"),
+            InlineKeyboardButton(f"{calendar.month_name[month]} {year}", callback_data="cm:sch_noop"),
+            InlineKeyboardButton("›", callback_data=f"cm:sch_cal:{record_id}:{next_month.year}:{next_month.month}"),
+        ]]
+        rows.append([
+            InlineKeyboardButton(day, callback_data="cm:sch_noop")
+            for day in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+        ])
+        for week in calendar.monthcalendar(year, month):
+            rows.append([
+                InlineKeyboardButton(
+                    str(day) if day else "·",
+                    callback_data=(
+                        f"cm:sch_date:{record_id}:{year:04d}-{month:02d}-{day:02d}"
+                        if day else "cm:sch_noop"
+                    ),
+                )
+                for day in week
+            ])
+        rows.append([InlineKeyboardButton("Cancel", callback_data=f"cm:keep:{record_id}")])
+        text = "<b>Schedule post</b>\nChoose a date. You’ll choose a time and timezone next."
+        if notice:
+            text = f"{html_escape(notice)}\n\n{text}"
+        await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _show_schedule_hours(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, selected_date: str,
+    ) -> None:
+        try:
+            date_value = datetime.strptime(selected_date, "%Y-%m-%d").date()
+        except ValueError:
+            await self._edit_or_send(update, "That date is invalid. Choose another date.", None)
+            return
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        rows = []
+        for start in range(0, 24, 6):
+            rows.append([
+                InlineKeyboardButton(
+                    f"{hour:02d}",
+                    callback_data=f"cm:sch_hr:{record_id}:{date_value.isoformat()}:{hour:02d}",
+                )
+                for hour in range(start, start + 6)
+            ])
+        rows.append([InlineKeyboardButton(
+            "‹ Choose another date", callback_data=f"cm:sch_cal:{record_id}:{date_value.year}:{date_value.month}"
+        )])
+        rows.append([InlineKeyboardButton("Cancel", callback_data=f"cm:keep:{record_id}")])
+        await self._edit_or_send(
+            update,
+            f"<b>Choose a time</b> for {date_value.strftime('%A, %d %B %Y')}\nChoose the hour; you’ll select minutes next.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _show_schedule_minutes(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, selected_date: str, hour: int,
+    ) -> None:
+        try:
+            date_value = datetime.strptime(selected_date, "%Y-%m-%d").date()
+            if not 0 <= hour <= 23:
+                raise ValueError
+        except ValueError:
+            await self._edit_or_send(update, "That time is invalid. Choose it again.", None)
+            return
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        rows = [[
+            InlineKeyboardButton(
+                f"{hour:02d}:{minute:02d}",
+                callback_data=f"cm:sch_min:{record_id}:{date_value.isoformat()}:{hour:02d}:{minute:02d}",
+            )
+            for minute in (0, 15, 30, 45)
+        ], [InlineKeyboardButton(
+            "‹ Choose another hour", callback_data=f"cm:sch_date:{record_id}:{date_value.isoformat()}"
+        )], [InlineKeyboardButton("Cancel", callback_data=f"cm:keep:{record_id}")]]
+        await self._edit_or_send(
+            update,
+            f"<b>Choose minutes</b> for {date_value.strftime('%d %B')} at {hour:02d}:__",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _show_schedule_timezones(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, local_time: str,
+    ) -> None:
+        try:
+            datetime.strptime(local_time, "%Y-%m-%d %H:%M")
+        except ValueError:
+            await self._edit_or_send(update, "That date or time is invalid. Please choose it again.", None)
+            return
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        compact_time = local_time.replace("-", "").replace(" ", "").replace(":", "")
+        rows = [
+            [InlineKeyboardButton("Asia/Kolkata", callback_data=f"cm:sch_tz:{record_id}:{compact_time}:Asia/Kolkata"),
+             InlineKeyboardButton("UTC", callback_data=f"cm:sch_tz:{record_id}:{compact_time}:UTC")],
+            [InlineKeyboardButton("Europe/London", callback_data=f"cm:sch_tz:{record_id}:{compact_time}:Europe/London"),
+             InlineKeyboardButton("America/New_York", callback_data=f"cm:sch_tz:{record_id}:{compact_time}:America/New_York")],
+            [InlineKeyboardButton("Enter another timezone", callback_data=f"cm:sch_tzc:{record_id}:{compact_time}")],
+            [InlineKeyboardButton("‹ Choose another time", callback_data=f"cm:sch_cal:{record_id}:{local_time[:4]}:{int(local_time[5:7])}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"cm:keep:{record_id}")],
+        ]
+        await self._edit_or_send(
+            update,
+            f"<b>Choose timezone</b>\nSelected: {datetime.strptime(local_time, '%Y-%m-%d %H:%M').strftime('%d %b %Y, %H:%M')}\n\nChoose a common timezone or enter an IANA timezone name, such as <code>Asia/Tokyo</code>.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _begin_schedule_timezone_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, local_time: str,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        query_message = update.callback_query.message
         self._inputs[int(update.effective_user.id)] = {
-            "kind": "schedule_time", "record_id": record_id,
-            "channel_id": int(record["channel_id"]),
+            "kind": "schedule_timezone", "record_id": record_id,
+            "channel_id": int(record["channel_id"]), "local_time": local_time,
+            "prompt_chat_id": int(query_message.chat.id),
+            "prompt_message_id": int(query_message.message_id),
             "expires_at": time.time() + self.INPUT_TTL_SECONDS,
         }
         await self._edit_or_send(
             update,
-            "Send the date, time, and timezone. Example: <code>2026-10-08 19:30 Asia/Kolkata</code>.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:draft:{record_id}")]]),
-            ParseMode.HTML,
+            "Send an IANA timezone name for this time, such as <code>Asia/Tokyo</code> or <code>Europe/Paris</code>.",
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                "Cancel", callback_data=f"cm:sch_tzx:{record_id}:{local_time.replace('-', '').replace(' ', '').replace(':', '')}"
+            )]]), ParseMode.HTML,
+        )
+
+    async def _set_pending_schedule(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, local_time: str, timezone_name: str,
+        prompt_state: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            zone = ZoneInfo(timezone_name)
+            local_naive = datetime.strptime(local_time, "%Y-%m-%d %H:%M")
+            local_aware = local_naive.replace(tzinfo=zone)
+            scheduled_at = local_aware.astimezone(timezone.utc)
+            if scheduled_at.astimezone(zone).replace(tzinfo=None) != local_naive:
+                if prompt_state is not None:
+                    self._inputs.pop(int(update.effective_user.id), None)
+                    await self._clear_input_prompt(context, prompt_state)
+                await self._show_schedule_calendar(
+                    update, context, record_id, local_naive.year, local_naive.month,
+                    "That local time does not exist because the clocks change. Choose another time.",
+                )
+                return
+        except (ValueError, ZoneInfoNotFoundError):
+            if prompt_state is not None:
+                await update.effective_message.reply_text(
+                    "I couldn’t read that timezone. Try a name like Asia/Kolkata, Europe/London, or UTC."
+                )
+            else:
+                await self._edit_or_send(update, "I couldn’t read that timezone. Choose another one or enter a valid IANA timezone name.", None)
+            return
+        if scheduled_at < datetime.now(timezone.utc) + timedelta(minutes=1):
+            if prompt_state is not None:
+                self._inputs.pop(int(update.effective_user.id), None)
+                await self._clear_input_prompt(context, prompt_state)
+            await self._show_schedule_calendar(
+                update, context, record_id, local_naive.year, local_naive.month,
+                "Choose a time at least one minute in the future.",
+            )
+            return
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft":
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, {
+                "pending_scheduled_at": scheduled_at,
+                "pending_timezone": timezone_name,
+            }) if repository else False
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] calendar schedule save failed channel_id=%s user_id=%s post_id=%s error=%s",
+                record["channel_id"], update.effective_user.id, record_id, type(exc).__name__,
+            )
+            saved = False
+        if not saved:
+            await self._edit_or_send(update, "I couldn’t save this schedule time. Your draft is still safe; please try again.", None)
+            return
+        if prompt_state is not None:
+            self._inputs.pop(int(update.effective_user.id), None)
+            await self._clear_input_prompt(context, prompt_state)
+        local_label = scheduled_at.astimezone(zone).strftime("%a, %d %b %Y at %H:%M %Z")
+        logger.info(
+            "[channel-manager] schedule time selected channel_id=%s user_id=%s post_id=%s local_time=%s timezone=%s scheduled_at=%s",
+            record["channel_id"], update.effective_user.id, record_id, local_label,
+            timezone_name, scheduled_at.isoformat(),
+        )
+        await self._edit_or_send(
+            update, f"Schedule this post for <b>{html_escape(local_label)}</b>?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirm schedule", callback_data=f"cm:confirm_schedule:{record_id}")],
+                [InlineKeyboardButton("Go back", callback_data=f"cm:cancel_schedule_confirmation:{record_id}")],
+            ]), ParseMode.HTML,
         )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4977,6 +5254,21 @@ class ChannelManager:
                 if input_message_id and not content.get("source_message"):
                     await self._delete_message(context.bot, message.chat.id, int(input_message_id))
                 await self._clear_input_prompt(context, state)
+            else:
+                # The saved draft and actionable recovery message replace this
+                # now-stale "send content" prompt. Keep the submitted message
+                # so the user can still refer back to what they sent.
+                await self._clear_input_prompt(context, state)
+            return
+        if kind == "schedule_timezone":
+            timezone_name = (message.text or "").strip()
+            if not timezone_name:
+                await message.reply_text("Send a timezone name, such as Asia/Kolkata, Europe/Paris, or UTC.")
+                return
+            await self._set_pending_schedule(
+                update, context, str(state["record_id"]),
+                str(state["local_time"]), timezone_name, prompt_state=state,
+            )
             return
         if kind == "schedule_time":
             raw = (message.text or "").strip()
