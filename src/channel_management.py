@@ -37,6 +37,106 @@ class PartialPostSendError(Exception):
         self.cause = cause
 
 
+def _is_emoji_codepoint(char: str) -> bool:
+    value = ord(char)
+    return (
+        0x1F000 <= value <= 0x1FAFF
+        or 0x2600 <= value <= 0x27BF
+        or 0x2300 <= value <= 0x23FF
+        or 0x1F1E6 <= value <= 0x1F1FF
+        or value in {0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x2B50, 0x2B55, 0x3030, 0x303D, 0x3297, 0x3299}
+        or 0xFE00 <= value <= 0xFE0F
+        or 0x1F3FB <= value <= 0x1F3FF
+        or value in {0x200D, 0x20E3}
+    )
+
+
+def _remove_emojis_with_entities(
+    text: str, entities: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Remove emoji codepoints and keep Telegram entity offsets aligned (UTF-16)."""
+    kept: list[str] = []
+    retained_units: set[int] = set()
+    original_offset = 0
+    for char in text:
+        width = len(char.encode("utf-16-le")) // 2
+        if not _is_emoji_codepoint(char):
+            kept.append(char)
+            retained_units.update(range(original_offset, original_offset + width))
+        original_offset += width
+
+    def mapped_offset(offset: int) -> int:
+        return sum(1 for unit in retained_units if unit < offset)
+
+    adjusted: list[dict[str, Any]] = []
+    for entity in entities:
+        try:
+            start = int(entity.get("offset", 0))
+            end = start + int(entity.get("length", 0))
+        except (TypeError, ValueError):
+            continue
+        new_start = mapped_offset(start)
+        new_end = mapped_offset(end)
+        if new_end > new_start:
+            adjusted.append({**entity, "offset": new_start, "length": new_end - new_start})
+    return "".join(kept), adjusted
+
+
+def _replace_text_with_entities(
+    text: str, entities: list[dict[str, Any]], find: str, replacement: str,
+) -> tuple[str, list[dict[str, Any]], int]:
+    """Replace literal matches and remap entity offsets in Telegram UTF-16 units."""
+    if not find:
+        return text, entities, 0
+    parts: list[str] = []
+    boundary_map: dict[int, int] = {0: 0}
+    unit_offsets = [0]
+    for char in text:
+        unit_offsets.append(unit_offsets[-1] + len(char.encode("utf-16-le")) // 2)
+    old_pos = new_pos = matches = 0
+    while old_pos < len(text):
+        if text.startswith(find, old_pos):
+            old_end = old_pos + len(find)
+            replacement_units = len(replacement.encode("utf-16-le")) // 2
+            for cursor in range(old_pos, old_end):
+                boundary_map[unit_offsets[cursor]] = new_pos
+            parts.append(replacement)
+            new_pos += replacement_units
+            boundary_map[unit_offsets[old_end]] = new_pos
+            old_pos = old_end
+            matches += 1
+            continue
+        char = text[old_pos]
+        parts.append(char)
+        old_units_start = unit_offsets[old_pos]
+        width = len(char.encode("utf-16-le")) // 2
+        boundary_map[old_units_start] = new_pos
+        new_pos += width
+        boundary_map[old_units_start + width] = new_pos
+        old_pos += 1
+    if not matches:
+        return text, entities, 0
+    final_text = "".join(parts)
+
+    def map_offset(offset: int) -> int:
+        if offset in boundary_map:
+            return boundary_map[offset]
+        prior = max((key for key in boundary_map if key < offset), default=0)
+        return boundary_map[prior]
+
+    adjusted = []
+    for entity in entities:
+        try:
+            start = int(entity.get("offset", 0))
+            end = start + int(entity.get("length", 0))
+        except (TypeError, ValueError):
+            continue
+        mapped_start, mapped_end = map_offset(start), map_offset(end)
+        if mapped_end > mapped_start:
+            adjusted.append({**entity, "offset": mapped_start, "length": mapped_end - mapped_start})
+    return final_text, adjusted, matches
+
+
 class MongoChannelManagementRepository:
     """Persist templates, drafts, and scheduled posts independently of connections."""
 
@@ -3272,6 +3372,12 @@ class ChannelManager:
                     return
                 await self._begin_published_edit(update, context, parts[2], self._callback_page(parts))
                 return
+            if action == "published_quick":
+                await self._open_published_quick_edit(update, context, parts[2], self._callback_page(parts))
+                return
+            if action in {"pubq_emoji", "pubq_edit", "pubq_replace", "pubq_undo", "pubq_save", "pubq_cancel", "pubq_back"}:
+                await self._handle_published_quick_action(update, context, action, parts[2], self._callback_page(parts, 3))
+                return
             if action == "published_preview":
                 await self._preview_published_post(update, context, parts[2], self._callback_page(parts))
                 return
@@ -4114,6 +4220,7 @@ class ChannelManager:
         media_type = str((record.get("media") or {}).get("type") or "")
         rows: list[list[InlineKeyboardButton]] = []
         if not record.get("source_message") and media_type not in {"sticker", "video_note"}:
+            rows.append([InlineKeyboardButton("Quick text edits", callback_data=f"cm:published_quick:{record_id}:{page}")])
             rows.append([InlineKeyboardButton("Edit text / caption", callback_data=f"cm:edit_text:{record_id}")])
             rows.append([InlineKeyboardButton("Add text / caption", callback_data=f"cm:edit_append:{record_id}")])
         if media_type in {"photo", "video", "animation", "document", "audio"}:
@@ -4137,6 +4244,152 @@ class ChannelManager:
             "<b>Edit published post</b>\nChanges update the post in the channel.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
+
+    @staticmethod
+    def _published_text_changes(record: dict[str, Any]) -> dict[str, Any]:
+        field = "caption" if record.get("media") else "text"
+        return {field: str(record.get(field) or ""), "entities": list(record.get("entities") or [])}
+
+    async def _render_published_quick_edit(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int,
+        state: dict[str, Any], record: dict[str, Any],
+    ) -> None:
+        pending = dict(state.get("pending_changes") or self._published_text_changes(record))
+        text = str(pending.get("caption") or pending.get("text") or "")
+        excerpt = text if len(text) <= 900 else text[:897] + "…"
+        preview = html_escape(excerpt) if excerpt else "<i>(No text or caption)</i>"
+        save_label = "Save to channel" if record.get("status") == "published" else "Save to draft"
+        rows = [
+            [InlineKeyboardButton("Remove all emojis", callback_data=f"cm:pubq_emoji:{record['_id']}:{state.get('page', 0)}")],
+            [InlineKeyboardButton("Find & replace", callback_data=f"cm:pubq_replace:{record['_id']}:{state.get('page', 0)}")],
+            [InlineKeyboardButton("Edit text", callback_data=f"cm:pubq_edit:{record['_id']}:{state.get('page', 0)}")],
+            [InlineKeyboardButton("Undo changes", callback_data=f"cm:pubq_undo:{record['_id']}:{state.get('page', 0)}")],
+            [InlineKeyboardButton(save_label, callback_data=f"cm:pubq_save:{record['_id']}:{state.get('page', 0)}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"cm:pubq_cancel:{record['_id']}:{state.get('page', 0)}")],
+        ]
+        panel_text = f"<b>Quick text edits</b>\nChanges stay here until you save.\n\n{preview}"
+        try:
+            await context.bot.edit_message_text(
+                chat_id=int(state["prompt_chat_id"]),
+                message_id=int(state["prompt_message_id"]),
+                text=panel_text, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                logger.warning("[channel-manager] quick edit panel refresh failed user_id=%s post_id=%s error=%s", user_id, record.get("_id"), type(exc).__name__)
+                raise
+
+    async def _open_published_quick_edit(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, page: int = 0,
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        record, channel = await self._record_for_user(record_id, user_id, context.bot)
+        media_type = str(((record or {}).get("media") or {}).get("type") or "")
+        if (not record or channel is None or record.get("kind") != "post"
+                or record.get("status") not in {"draft", "published"}
+                or record.get("source_message") or media_type in {"sticker", "video_note"}):
+            await self._access_denied(update)
+            return
+        query_message = update.callback_query.message
+        state = {
+            "kind": "published_quick_edit", "record_id": record_id,
+            "channel_id": int(record["channel_id"]), "page": page,
+            "original_changes": self._published_text_changes(record),
+            "pending_changes": self._published_text_changes(record),
+            "prompt_chat_id": int(query_message.chat.id),
+            "prompt_message_id": int(query_message.message_id),
+            "expires_at": time.time() + self.INPUT_TTL_SECONDS,
+        }
+        self._inputs[user_id] = state
+        await self._render_published_quick_edit(context, user_id, state, record)
+
+    async def _handle_published_quick_action(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        action: str, record_id: str, page: int = 0,
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        state = self._inputs.get(user_id) or {}
+        record, channel = await self._record_for_user(record_id, user_id, context.bot)
+        state_kind = str(state.get("kind") or "")
+        active_quick_edit = state_kind == "published_quick_edit" or (
+            action in {"pubq_back", "pubq_cancel"}
+            and state_kind in {"published_quick_text", "published_quick_replace"}
+        )
+        if (not record or channel is None or record.get("status") not in {"draft", "published"}
+                or not active_quick_edit or state.get("record_id") != record_id):
+            await self._access_denied(update)
+            return
+        original = dict(state.get("original_changes") or self._published_text_changes(record))
+        pending = dict(state.get("pending_changes") or original)
+        if action == "pubq_back":
+            state.update({"kind": "published_quick_edit", "expires_at": time.time() + self.INPUT_TTL_SECONDS})
+            self._inputs[user_id] = state
+            await self._render_published_quick_edit(context, user_id, state, record)
+            return
+        if action == "pubq_emoji":
+            field = "caption" if "caption" in pending else "text"
+            new_text, new_entities = _remove_emojis_with_entities(
+                str(pending.get(field) or ""), list(pending.get("entities") or []),
+            )
+            pending[field] = new_text
+            pending["entities"] = new_entities
+            state.update({"pending_changes": pending, "kind": "published_quick_edit"})
+            self._inputs[user_id] = state
+            await self._render_published_quick_edit(context, user_id, state, record)
+            return
+        if action in {"pubq_edit", "pubq_replace"}:
+            state["kind"] = "published_quick_text" if action == "pubq_edit" else "published_quick_replace"
+            state["pending_changes"] = pending
+            state["expires_at"] = time.time() + self.INPUT_TTL_SECONDS
+            self._inputs[user_id] = state
+            instruction = (
+                "Send the complete replacement text or caption. Your current changes will remain unsaved."
+                if action == "pubq_edit" else
+                "Send the text to find, then `=>`, then its replacement. Example: `😅 => 🙂`. Use `=>` with nothing after it to remove the match."
+            )
+            await self._edit_or_send(update, instruction, InlineKeyboardMarkup([
+                [InlineKeyboardButton("Back to quick edits", callback_data=f"cm:pubq_back:{record_id}:{page}")],
+                [InlineKeyboardButton("Cancel", callback_data=f"cm:pubq_cancel:{record_id}")],
+            ]))
+            return
+        if action == "pubq_undo":
+            state.update({"pending_changes": original, "kind": "published_quick_edit"})
+            self._inputs[user_id] = state
+            await self._render_published_quick_edit(context, user_id, state, record)
+            return
+        if action == "pubq_cancel":
+            self._inputs.pop(user_id, None)
+            if record.get("status") == "draft":
+                await self._begin_edit(update, context, record_id)
+            else:
+                await self._begin_published_edit(update, context, record_id, page)
+            return
+        if action == "pubq_save":
+            changes = pending
+            if changes == original:
+                await self._render_published_quick_edit(context, user_id, state, record)
+                return
+            if len(str(changes.get("caption") or changes.get("text") or "")) > (1024 if record.get("media") else 4096):
+                await update.callback_query.answer("Text is too long for this post.", show_alert=True)
+                return
+            if record.get("status") == "draft":
+                repository = self._get_repository()
+                try:
+                    saved = await asyncio.to_thread(repository.update, record_id, changes) if repository else False
+                except Exception as exc:
+                    logger.warning("[channel-manager] quick edit draft save failed channel_id=%s user_id=%s post_id=%s error=%s", record.get("channel_id"), user_id, record_id, type(exc).__name__)
+                    saved = False
+                if not saved:
+                    await update.callback_query.answer("Couldn’t save the draft. It is unchanged; try again.", show_alert=True)
+                    return
+                self._inputs.pop(user_id, None)
+                logger.info("[channel-manager] quick edit draft saved channel_id=%s user_id=%s post_id=%s", record.get("channel_id"), user_id, record_id)
+                await self._preview(update, context, record_id)
+            elif await self._apply_published_content_edit(update, context, record, changes):
+                self._inputs.pop(user_id, None)
+                await self._preview_published_post(update, context, record_id, page)
 
     async def _delete_published_post(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -4206,7 +4459,12 @@ class ChannelManager:
             await self._edit_or_send(update, "Annie couldn’t finish deleting this post. Check the channel before trying again.", None)
             return
         logger.info("[channel-manager] published post deleted channel_id=%s user_id=%s post_id=%s messages=%s", record["channel_id"], update.effective_user.id, record_id, len(message_ids))
-        await self._show_published_posts(update, context, int(record["channel_id"]), page)
+        post_name = html_escape(self._record_label(record, "Published post"))
+        await self._edit_or_send(
+            update, f"✅ Published post <b>{post_name}</b> deleted from the channel.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Published posts", callback_data=f"cm:published:{record['channel_id']}:{page}")]]),
+            ParseMode.HTML,
+        )
 
     async def _apply_published_content_edit(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -4321,6 +4579,7 @@ class ChannelManager:
         media_type = str((record.get("media") or {}).get("type") or "")
         editable_text = not record.get("source_message") and media_type not in {"sticker", "video_note"}
         if editable_text:
+            rows.append([InlineKeyboardButton("Quick text edits", callback_data=f"cm:published_quick:{record_id}:0")])
             rows.append([InlineKeyboardButton("Edit text / caption", callback_data=f"cm:edit_text:{record_id}")])
         if record.get("media"):
             rows.append([InlineKeyboardButton("Replace media", callback_data=f"cm:edit_media:{record_id}")])
@@ -4780,6 +5039,46 @@ class ChannelManager:
             return
         kind = state["kind"]
         message = update.effective_message
+        if kind in {"published_quick_text", "published_quick_replace"}:
+            record_id = str(state.get("record_id") or "")
+            record, channel = await self._record_for_user(record_id, user_id, context.bot)
+            expected_status = "published" if state.get("published_edit") else record.get("status") if record else None
+            if not record or channel is None or expected_status not in {"draft", "published"} or record.get("status") != expected_status:
+                self._inputs.pop(user_id, None)
+                await message.reply_text("That post is no longer available to edit.")
+                return
+            if message.media_group_id or not message.text:
+                await message.reply_text("Send text only for this quick edit.")
+                return
+            pending = dict(state.get("pending_changes") or self._published_text_changes(record))
+            field = "caption" if "caption" in pending else "text"
+            if kind == "published_quick_text":
+                new_text = message.text
+                new_entities = [item.to_dict() for item in (message.entities or [])]
+            else:
+                if "=>" not in message.text:
+                    await message.reply_text("Use this format: text to find => replacement text")
+                    return
+                find_text, replacement = message.text.split("=>", 1)
+                find_text, replacement = find_text.strip(), replacement.strip()
+                new_text, new_entities, match_count = _replace_text_with_entities(
+                    str(pending.get(field) or ""), list(pending.get("entities") or []),
+                    find_text, replacement,
+                )
+                if not find_text or not match_count:
+                    await message.reply_text("I couldn’t find that text. Nothing changed; try another search.")
+                    return
+            if len(new_text) > (1024 if record.get("media") else 4096):
+                await message.reply_text("That text is too long for this Telegram post. Nothing changed.")
+                return
+            pending[field] = new_text
+            pending["entities"] = new_entities
+            state.update({"kind": "published_quick_edit", "pending_changes": pending,
+                          "expires_at": time.time() + self.INPUT_TTL_SECONDS})
+            self._inputs[user_id] = state
+            await self._render_published_quick_edit(context, user_id, state, record)
+            await self._delete_message(context.bot, message.chat.id, message.message_id)
+            return
         if kind in {"published_component_text", "published_component_media"}:
             record, channel = await self._record_for_user(str(state["record_id"]), user_id, context.bot)
             if not record or channel is None or record.get("status") != "published":
@@ -5356,9 +5655,16 @@ class ChannelManager:
         except Exception as exc:
             logger.warning("[channel-manager] template delete failed channel_id=%s user_id=%s template_id=%s error=%s", record["channel_id"], update.effective_user.id, record_id, type(exc).__name__)
             deleted = False
-        if deleted:
-            logger.info("[channel-manager] template deleted channel_id=%s user_id=%s template_id=%s", record["channel_id"], update.effective_user.id, record_id)
-        await self._show_templates(update, context, int(record["channel_id"]))
+        if not deleted:
+            await self._storage_error(update)
+            return
+        logger.info("[channel-manager] template deleted channel_id=%s user_id=%s template_id=%s", record["channel_id"], update.effective_user.id, record_id)
+        template_name = html_escape(self._record_label(record, "Untitled template"))
+        await self._edit_or_send(
+            update, f"✅ Template <b>{template_name}</b> deleted.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Templates", callback_data=f"cm:templates:{record['channel_id']}")]]),
+            ParseMode.HTML,
+        )
 
     async def _publish_draft(
         self,
@@ -5560,11 +5866,17 @@ class ChannelManager:
             if query and query.message and any(getattr(query.message, kind, None) for kind in self.ALLOWED_MEDIA):
                 await self._delete_message(context.bot, query.message.chat.id, query.message.message_id)
                 await context.bot.send_message(
-                    chat_id=query.message.chat.id, text="Draft deleted.",
+                    chat_id=query.message.chat.id,
+                    text=f"✅ Draft {self._record_label(record, 'Untitled')} deleted.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Drafts", callback_data=f"cm:drafts:{record['channel_id']}")]]),
                 )
             else:
-                await self._edit_or_send(update, "Draft deleted.", InlineKeyboardMarkup([[InlineKeyboardButton("← Drafts", callback_data=f"cm:drafts:{record['channel_id']}")]]))
+                draft_name = html_escape(self._record_label(record, "Untitled"))
+                await self._edit_or_send(
+                    update, f"✅ Draft <b>{draft_name}</b> deleted.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("← Drafts", callback_data=f"cm:drafts:{record['channel_id']}")]]),
+                    ParseMode.HTML,
+                )
         else:
             await self._storage_error(update)
 
