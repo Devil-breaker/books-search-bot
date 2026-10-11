@@ -484,12 +484,14 @@ class ChannelManager:
         open_index_callback: Callable[[Update, ContextTypes.DEFAULT_TYPE, int], Any],
         resolve_user_username: Callable[[str], Any] | None = None,
         delete_channel_messages: Callable[[int, list[int]], Any] | None = None,
+        get_channel_messages: Callable[[int, list[int]], Any] | None = None,
     ) -> None:
         self.owner_user_id = int(owner_user_id) if owner_user_id is not None else None
         self.get_connection_repository = get_connection_repository
         self.open_index_callback = open_index_callback
         self.resolve_user_username = resolve_user_username
         self.delete_channel_messages = delete_channel_messages
+        self.get_channel_messages = get_channel_messages
         self._repository: MongoChannelManagementRepository | None = None
         self._inputs: dict[int, dict[str, Any]] = {}
         self._visibility_cache: dict[int, tuple[float, bool]] = {}
@@ -2402,9 +2404,8 @@ class ChannelManager:
         page = max(0, int(page))
         page_size = 10
         try:
-            records = await asyncio.to_thread(
-                repository.list_records, channel_id, "post", ["published"],
-                None, True, page_size + 1, page * page_size,
+            records = await self._list_verified_published_posts(
+                repository, channel_id, page, page_size,
             )
         except Exception as exc:
             logger.warning(
@@ -2431,13 +2432,96 @@ class ChannelManager:
         if navigation:
             rows.append(navigation)
         rows.append(self._back_button(f"cm:channel:{channel_id}"))
-        text = "<b>Published posts</b>\nChoose a post Annie sent to edit or delete it."
+        text = "<b>Published posts</b>\nChoose a post Annie sent to edit or delete it. Posts deleted directly in Telegram are cleaned up when this list opens."
         if not records:
             text = (
                 "<b>Published posts</b>\nNo saved posts here yet. "
                 "This list only shows posts Annie published through Channel Manager."
             )
         await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _list_verified_published_posts(
+        self, repository: MongoChannelManagementRepository,
+        channel_id: int, page: int, page_size: int,
+    ) -> list[dict[str, Any]]:
+        """Filter manually deleted channel posts and backfill the visible page."""
+        offset = page * page_size
+        visible: list[dict[str, Any]] = []
+        while len(visible) < page_size + 1:
+            needed = page_size + 1 - len(visible)
+            batch = await asyncio.to_thread(
+                repository.list_records, channel_id, "post", ["published"],
+                None, True, max(needed, 1), offset + len(visible),
+            )
+            if not batch:
+                break
+            if self.get_channel_messages is None:
+                visible.extend(batch[:needed])
+                break
+
+            main_ids: dict[int, dict[str, Any]] = {}
+            for record in batch:
+                message_id = self._published_main_message_id(record)
+                if message_id is not None:
+                    main_ids[message_id] = record
+            found_messages: Any = None
+            if main_ids:
+                try:
+                    found_messages = await self.get_channel_messages(channel_id, list(main_ids))
+                except Exception as exc:
+                    logger.warning(
+                        "[channel-manager] published post verification failed channel_id=%s error=%s; showing saved entries",
+                        channel_id, type(exc).__name__,
+                    )
+            if found_messages is None and main_ids:
+                # A transient MTProto failure must never hide valid posts.
+                visible.extend(batch[:needed])
+                break
+            found_ids = set(found_messages or {}) if found_messages is not None else set()
+            stale: list[dict[str, Any]] = []
+            for record in batch:
+                message_id = self._published_main_message_id(record)
+                if message_id is None:
+                    visible.append(record)
+                elif message_id in found_ids:
+                    visible.append(record)
+                else:
+                    stale.append(record)
+
+            removed_records = 0
+            for record in stale:
+                record_id = str(record.get("_id") or "")
+                if not record_id:
+                    continue
+                try:
+                    removed = await asyncio.to_thread(repository.update, record_id, {
+                        "status": "deleted",
+                        "published_message_ids": [],
+                        "published_message_id": None,
+                        "published_main_message_id": None,
+                        "deleted_at": datetime.now(timezone.utc),
+                        "deleted_externally": True,
+                    })
+                    if removed:
+                        removed_records += 1
+                        logger.info(
+                            "[channel-manager] manually deleted published post reconciled channel_id=%s post_id=%s title=%s",
+                            channel_id, record_id, self._record_label(record, "Published post"),
+                        )
+                    else:
+                        logger.warning("[channel-manager] manually deleted post record not updated channel_id=%s post_id=%s", channel_id, record_id)
+                except Exception as exc:
+                    logger.warning(
+                        "[channel-manager] deleted post record cleanup failed channel_id=%s post_id=%s error=%s",
+                        channel_id, record_id, type(exc).__name__,
+                    )
+
+            if len(batch) < needed:
+                break
+            if stale and not removed_records:
+                # Avoid looping forever if the database is temporarily read-only.
+                break
+        return visible[:page_size + 1]
 
     @staticmethod
     def _published_main_message_id(record: dict[str, Any]) -> int | None:

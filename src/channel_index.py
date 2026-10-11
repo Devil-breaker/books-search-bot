@@ -46,7 +46,10 @@ class MongoChannelIndexRepository:
     def list_enabled(self) -> list[dict[str, Any]]:
         return list(self.configs.find(
             {"enabled": True},
-            {"_id": 1, "entries": 1, "pending_posts": 1, "targets": 1},
+            {
+                "_id": 1, "entries": 1, "pending_posts": 1, "targets": 1,
+                "sort_order": 1, "entry_bullet": 1,
+            },
         ))
 
     def update(self, channel_id: int, fields: dict[str, Any]) -> None:
@@ -127,13 +130,17 @@ class MongoChannelIndexRepository:
 
 
 class ChannelIndexRuntime:
-    """Run a bot-authenticated MTProto update listener beside polling only.
+    """Run isolated MTProto listeners beside bot polling.
 
-    It is deliberately independent from the Bot API polling transport. If
-    MTProto cannot start, the ordinary bot continues running normally.
+    The bot-authenticated client handles existing index features. An optional
+    user-authenticated client listens only for channel deletion updates. Both
+    are independent from Bot API polling; listener failures do not stop the bot.
     """
 
     MAX_INDEX_TEXT = 4096
+    # Telegram deletion updates remain the fast path; this is a low-frequency
+    # fallback for updates missed by either authenticated session.
+    RECONCILE_INTERVAL_SECONDS = 300
 
     @staticmethod
     def _excluded_sender_ids(config: dict[str, Any]) -> set[int]:
@@ -147,17 +154,23 @@ class ChannelIndexRuntime:
                 excluded.add(sender_id)
         return excluded
 
-    def __init__(self, bot: Any, repository: MongoChannelIndexRepository, api_id: int, api_hash: str, token: str) -> None:
+    def __init__(
+        self, bot: Any, repository: MongoChannelIndexRepository, api_id: int,
+        api_hash: str, token: str, user_session: str | None = None,
+    ) -> None:
         self.bot = bot
         self.repository = repository
         self.api_id = api_id
         self.api_hash = api_hash
         self.token = token
+        self.user_session = str(user_session or "").strip()
         self.client: Any = None
+        self.user_client: Any = None
         self.bot_user_id: int | None = None
         self._pending: dict[tuple[int, int], asyncio.Task] = {}
         self._retry_counts: dict[tuple[int, int], int] = {}
         self._lock = asyncio.Lock()
+        self._reconcile_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         from telethon import TelegramClient, events
@@ -182,6 +195,70 @@ class ChannelIndexRuntime:
                     int(config["_id"]), int(pending["message_id"]),
                     str(pending["title"]), pending.get("due_at"),
                 )
+        await self._start_user_deletion_listener(TelegramClient, StringSession, events)
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_enabled_indexes(), name="channel-index-reconcile"
+        )
+
+    async def _start_user_deletion_listener(
+        self, telegram_client_type: Any, string_session_type: Any, events: Any,
+    ) -> bool:
+        """Start an optional, read-only user session without interactive login."""
+        from src.utils import logger
+
+        if not self.user_session:
+            logger.info("[channel-index] user-session deletion listener not configured")
+            return False
+
+        user_client = None
+        try:
+            user_client = telegram_client_type(
+                string_session_type(self.user_session), self.api_id, self.api_hash,
+                receive_updates=True, auto_reconnect=True,
+            )
+            await user_client.connect()
+            if not await user_client.is_user_authorized():
+                raise RuntimeError("session is not authorized")
+            account = await user_client.get_me()
+            if account is None or bool(getattr(account, "bot", False)):
+                raise RuntimeError("session must belong to a Telegram user account")
+            user_client.add_event_handler(
+                self._on_user_deleted_posts, events.MessageDeleted()
+            )
+            self.user_client = user_client
+            logger.info("[channel-index] user-session deletion listener started")
+            return True
+        except Exception as exc:
+            if user_client is not None:
+                try:
+                    await user_client.disconnect()
+                except Exception:
+                    pass
+            logger.warning(
+                "[channel-index] user-session deletion listener unavailable; bot listener and reconciliation remain active error=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    async def _on_user_deleted_posts(self, event: Any) -> None:
+        """Ignore deletions outside enabled Index channels before touching state."""
+        from src.utils import logger
+
+        raw_channel_id = getattr(event, "chat_id", None)
+        if raw_channel_id is None:
+            return
+        try:
+            channel_id = int(raw_channel_id)
+            config = await asyncio.to_thread(self.repository.get, channel_id)
+        except Exception as exc:
+            logger.warning(
+                "[channel-index] user-session deletion scope check failed channel_id=%s error=%s",
+                raw_channel_id, type(exc).__name__,
+            )
+            return
+        if not config or not config.get("enabled"):
+            return
+        await self._on_deleted_posts(event)
 
     async def _messages_by_id(self, channel_id: int, message_ids: list[int]) -> dict[int, Any]:
         """Fetch specific channel messages; unlike history, this is bot-supported."""
@@ -256,6 +333,7 @@ class ChannelIndexRuntime:
             return False
 
         kept_entries = []
+        removed_entry_records = []
         removed_entries = 0
         for entry in entries:
             source_id = int(entry.get("source_message_id", -1))
@@ -263,6 +341,7 @@ class ChannelIndexRuntime:
             target = messages.get(int(entry.get("target_message_id", -1)))
             if source is None or isinstance(source, MessageEmpty):
                 removed_entries += 1
+                removed_entry_records.append(entry)
                 continue
             # If the placeholder still exists, its live link entities tell us
             # whether an admin removed this entry manually while Annie was off.
@@ -271,6 +350,7 @@ class ChannelIndexRuntime:
                 entry_url = str(entry.get("url") or "")
                 if entry_url and entry_url not in target_urls:
                     removed_entries += 1
+                    removed_entry_records.append(entry)
                     continue
             kept_entries.append(entry)
 
@@ -290,22 +370,100 @@ class ChannelIndexRuntime:
             fields["pending_posts"] = kept_pending
         if fields:
             await asyncio.to_thread(self.repository.update, channel_id, fields)
+            if removed_entries:
+                removed_target_ids = {
+                    int(entry.get("target_message_id", -1))
+                    for entry in removed_entry_records
+                    if str(entry.get("target_message_id", "")).lstrip("-").isdigit()
+                }
+                for target in targets:
+                    try:
+                        target_id = int(target.get("message_id", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if target_id not in removed_target_ids:
+                        continue
+                    remaining = [
+                        entry for entry in kept_entries
+                        if int(entry.get("target_message_id", -1)) == target_id
+                    ]
+                    rendered = self._render_target(
+                        str(target.get("base_html") or ""), remaining,
+                        str(config.get("sort_order") or "added"),
+                        str(target.get("entry_bullet") or config.get("entry_bullet") or "🔹"),
+                    )
+                    try:
+                        await self.bot.edit_message_text(
+                            chat_id=channel_id, message_id=target_id,
+                            text=rendered, parse_mode="HTML", disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        if "message is not modified" not in str(exc).casefold():
+                            logger.warning(
+                                "[channel-index] reconciled entries saved but index refresh failed channel_id=%s index_post_id=%s error=%s",
+                                channel_id, target_id, type(exc).__name__,
+                            )
             logger.info(
                 "[channel-index] reconciled saved entries channel_id=%s removed_entries=%s removed_pending=%s",
                 channel_id, removed_entries, removed_pending,
             )
         return True
 
+    async def _reconcile_enabled_indexes(self) -> None:
+        """Periodically catch deletions missed by Telegram's update stream."""
+        from src.utils import logger
+
+        try:
+            while True:
+                await asyncio.sleep(self.RECONCILE_INTERVAL_SECONDS)
+                try:
+                    configs = await asyncio.to_thread(self.repository.list_enabled)
+                except Exception as exc:
+                    logger.warning(
+                        "[channel-index] periodic reconciliation could not load indexes error=%s",
+                        type(exc).__name__,
+                    )
+                    continue
+                for config in configs:
+                    try:
+                        async with self._lock:
+                            await self._reconcile_saved_entries(config)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[channel-index] periodic reconciliation failed channel_id=%s error=%s",
+                            config.get("_id"), type(exc).__name__,
+                        )
+        except asyncio.CancelledError:
+            raise
+
     async def close(self) -> None:
+        from src.utils import logger
+
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            await asyncio.gather(self._reconcile_task, return_exceptions=True)
+            self._reconcile_task = None
         tasks = list(self._pending.values())
         for task in tasks:
             task.cancel()
         self._pending.clear()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if self.client is not None:
-            await self.client.disconnect()
-            self.client = None
+        for name in ("client", "user_client"):
+            client = getattr(self, name)
+            if client is None:
+                continue
+            try:
+                await client.disconnect()
+            except Exception as exc:
+                logger.warning(
+                    "[channel-index] MTProto client disconnect failed client=%s error=%s",
+                    name, type(exc).__name__,
+                )
+            finally:
+                setattr(self, name, None)
 
     async def cancel_channel(self, channel_id: int) -> None:
         for key, task in list(self._pending.items()):

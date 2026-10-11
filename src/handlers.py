@@ -148,6 +148,7 @@ class GoodreadsBot:
             self._open_channel_manager_index,
             self._resolve_channel_admin_username,
             self._delete_channel_messages_mtproto,
+            self._get_channel_messages_mtproto,
         )
         self._channel_manager_task: asyncio.Task | None = None
         self.setup_handlers()
@@ -1483,11 +1484,13 @@ class GoodreadsBot:
             return True
         api_id = os.getenv("API_ID", "").strip()
         api_hash = os.getenv("API_HASH", "").strip()
+        user_session = os.getenv("TELEGRAM_USER_SESSION", "").strip()
         repository = self._get_channel_index_repository()
         if repository is None or not api_id or not api_hash:
             return False
         runtime = ChannelIndexRuntime(
-            bot or self.app.bot, repository, int(api_id), api_hash, self.token
+            bot or self.app.bot, repository, int(api_id), api_hash, self.token,
+            user_session=user_session,
         )
         try:
             await runtime.start()
@@ -1548,6 +1551,37 @@ class GoodreadsBot:
             return False
         finally:
             if started_for_delete:
+                await self._stop_channel_index_listener_if_idle()
+
+    async def _get_channel_messages_mtproto(
+        self, channel_id: int, message_ids: list[int],
+    ) -> dict[int, Any] | None:
+        """Check saved channel message IDs using the shared MTProto session."""
+        if not message_ids:
+            return {}
+        started_for_lookup = self._channel_index_runtime is None
+        if started_for_lookup and not await self._ensure_channel_index_listener():
+            return None
+        runtime = self._channel_index_runtime
+        if runtime is None or runtime.client is None:
+            return None
+        try:
+            from telethon.tl.types import MessageEmpty
+
+            messages = await runtime._messages_by_id(int(channel_id), message_ids)
+            return {
+                int(message_id): message
+                for message_id, message in messages.items()
+                if not isinstance(message, MessageEmpty)
+            }
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] saved message verification unavailable channel_id=%s count=%s error=%s",
+                channel_id, len(message_ids), type(exc).__name__,
+            )
+            return None
+        finally:
+            if started_for_lookup:
                 await self._stop_channel_index_listener_if_idle()
 
     async def _stop_channel_index_listener_if_idle(self) -> None:
