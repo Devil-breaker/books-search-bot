@@ -5771,12 +5771,27 @@ class ChannelManager:
         if not record or channel is None or record.get("status") != "draft":
             await self._access_denied(update)
             return
+        if record.get("pending_followups"):
+            await self._edit_or_send(
+                update, "Finish adding extra messages with Done or Cancel before saving this template.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("← Draft", callback_data=f"cm:keep:{record_id}")]]),
+            )
+            return
         self._inputs[int(update.effective_user.id)] = {
             "kind": "save_template", "record_id": record_id,
             "channel_id": int(record["channel_id"]),
             "expires_at": time.time() + self.INPUT_TTL_SECONDS,
         }
-        await self._edit_or_send(update, "Send a short name for this template. It will be shared with this channel’s admins.", InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:draft:{record_id}")]]))
+        await self._edit_or_send(update, "Send a short name for this template. Annie saves the post, extra messages, and their buttons for this channel’s admins.", InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:draft:{record_id}")]]))
+
+    @staticmethod
+    def _template_content_fields(record: dict[str, Any]) -> dict[str, Any]:
+        """Fields that make a reusable, potentially multi-message post template."""
+        keys = (
+            "text", "caption", "entities", "format_mode", "media",
+            "post_buttons", "followups",
+        )
+        return {key: record[key] for key in keys if key in record}
 
     async def _begin_schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
@@ -6515,9 +6530,7 @@ class ChannelManager:
                 self._inputs.pop(user_id, None)
                 await message.reply_text("That draft is no longer available.")
                 return
-            template = {
-                key: source.get(key) for key in ("text", "caption", "entities", "format_mode", "media")
-            }
+            template = self._template_content_fields(source)
             try:
                 template_id = await asyncio.to_thread(repo.create, {
                     **template, "channel_id": channel_id, "kind": "template", "status": "active",
@@ -6706,7 +6719,7 @@ class ChannelManager:
         if repo is None:
             await self._storage_error(update)
             return
-        fields = {key: template.get(key) for key in ("text", "caption", "entities", "format_mode", "media")}
+        fields = self._template_content_fields(template)
         try:
             draft_id = await asyncio.to_thread(repo.create, {
                 **fields, "channel_id": int(template["channel_id"]), "kind": "post", "status": "draft",
