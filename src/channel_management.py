@@ -1186,6 +1186,9 @@ class ChannelManager:
                 kwargs["caption"] = text or None
         else:
             kwargs["text"] = text
+            # Keep URL entities/Markdown links intact, but do not expand a web
+            # page preview in the private draft or the published channel post.
+            kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
         if preview:
             # Put the real post URL buttons first so they sit directly under
             # the content, as they will in the published channel post.
@@ -1202,12 +1205,32 @@ class ChannelManager:
                 rows.append([InlineKeyboardButton(
                     "Add text / caption", callback_data=f"cm:edit_append:{record['_id']}"
                 )])
-            rows.append([
-                InlineKeyboardButton(
-                    f"Main buttons ({len(record.get('post_buttons') or [])})",
+            current_item_index = int(record.get("preview_item_index", 0))
+            current_button_count = (
+                len((record.get("followups") or [])[current_item_index - 1].get("post_buttons") or [])
+                if current_item_index > 0 and current_item_index - 1 < len(record.get("followups") or [])
+                else len(record.get("post_buttons") or [])
+            )
+            current_buttons_callback = (
+                f"cm:followup_buttons:{record['_id']}:{current_item_index - 1}"
+                if current_item_index > 0 else f"cm:buttons:{record['_id']}"
+            )
+            current_buttons_label = (
+                "Buttons for this item" if current_item_index > 0 and record.get("batch_mode")
+                else "Buttons for this message" if current_item_index > 0
+                else "Buttons for first item" if record.get("batch_mode")
+                else "Post buttons"
+            )
+            rows.append([InlineKeyboardButton(
+                f"{current_buttons_label} ({current_button_count})",
+                callback_data=current_buttons_callback,
+            )])
+            if current_item_index > 0:
+                first_label = "Buttons for first item" if record.get("batch_mode") else "Post buttons"
+                rows.append([InlineKeyboardButton(
+                    f"{first_label} ({len(record.get('post_buttons') or [])})",
                     callback_data=f"cm:buttons:{record['_id']}",
-                ),
-            ])
+                )])
             rows.append([InlineKeyboardButton(
                 "＋ Add next post" if record.get("batch_mode") else "＋ Add content below",
                 callback_data=f"cm:add_followup:{record['_id']}"
@@ -1301,7 +1324,10 @@ class ChannelManager:
             await send_margin_items(header_items, "header")
         for index, item in enumerate(post_items):
             is_last = index == len(post_items) - 1
-            message_record = {**record, **item, "_id": str(record.get("_id")), "followups": []}
+            message_record = {
+                **record, **item, "_id": str(record.get("_id")), "followups": [],
+                "preview_item_index": index,
+            }
             # Channel post URL buttons belong to the main post, even when
             # extra messages follow it. The preview controls stay on the last item.
             if index != 0:
@@ -1440,7 +1466,7 @@ class ChannelManager:
         if can_manage_posts:
             rows = [
                 [InlineKeyboardButton("✍️ Create post", callback_data=f"cm:create:{channel_id}")],
-                [InlineKeyboardButton("🧩 Create batch", callback_data=f"cm:batch_create:{channel_id}")],
+                [InlineKeyboardButton("📦 Create batch posts", callback_data=f"cm:batch_create:{channel_id}")],
                 [InlineKeyboardButton("🧩 Header & Footer", callback_data=f"cm:marginals:{channel_id}")],
                 [InlineKeyboardButton("📝 Drafts", callback_data=f"cm:drafts:{channel_id}"),
                  InlineKeyboardButton("🕒 Scheduled", callback_data=f"cm:scheduled:{channel_id}")],
@@ -2331,7 +2357,7 @@ class ChannelManager:
                 elif updated_record.get("source_message"):
                     continue
                 elif send_kwargs.get("text") is not None:
-                    text_options = {key: send_kwargs[key] for key in ("parse_mode", "entities") if key in send_kwargs}
+                    text_options = {key: send_kwargs[key] for key in ("parse_mode", "entities", "link_preview_options") if key in send_kwargs}
                     await bot.edit_message_text(chat_id=destination_id, message_id=backup_id, text=send_kwargs.get("text") or "", **text_options, **options)
                 else:
                     caption_options = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
@@ -3455,7 +3481,7 @@ class ChannelManager:
                 data.update({"caption": text, "entities": content.get("entities") or [], "format_mode": "telegram"})
             else:
                 send_kwargs = self._send_kwargs({**data, "text": text, "entities": content.get("entities") or []})
-                format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "entities") if key in send_kwargs}
+                format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "entities", "link_preview_options") if key in send_kwargs}
                 await context.bot.edit_message_text(
                     chat_id=channel_id, message_id=message_id,
                     text=text, **format_kwargs,
@@ -4357,6 +4383,14 @@ class ChannelManager:
                 is_published = len(parts) > 5 and parts[5] == "published"
                 await self._remove_followup_button(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
+            if action == "followup_button_style":
+                is_published = len(parts) > 5 and parts[5] == "published"
+                await self._show_followup_button_style(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
+                return
+            if action == "followup_button_set_style":
+                is_published = len(parts) > 6 and parts[6] == "published"
+                await self._set_followup_button_style(update, context, parts[2], int(parts[3]), int(parts[4]), parts[5], int(parts[7]) if is_published else None)
+                return
             if action == "followup_done":
                 await self._finish_followup_input(update, context, parts[2])
                 return
@@ -5021,7 +5055,7 @@ class ChannelManager:
                     callback_data=f"cm:followup_edit:{record_id}:{index}",
                 ),
                 InlineKeyboardButton(
-                    f"URL buttons ({len(item.get('post_buttons') or [])})",
+                    f"Buttons ({len(item.get('post_buttons') or [])})",
                     callback_data=f"cm:followup_buttons:{record_id}:{index}",
                 ),
             ])
@@ -5034,7 +5068,7 @@ class ChannelManager:
         item_label = "Batch item" if record.get("batch_mode") else "Extra content"
         await self._edit_or_send(
             update,
-            f"<b>{heading}</b>\nEach {item_label.lower()} can be edited, removed, or given URL buttons below it. Main buttons stay under the first item.",
+            f"<b>{heading}</b>\nEach {item_label.lower()} can be edited, removed, or given buttons that appear directly below it. Main post buttons stay on the first item.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
 
@@ -5055,7 +5089,7 @@ class ChannelManager:
             "Replace media" if item.get("media") else "Replace content",
             callback_data=f"cm:followup_media:{record_id}:{index}" if item.get("media") else f"cm:followup_replace:{record_id}:{index}",
         )])
-        rows.append([InlineKeyboardButton(f"URL buttons ({len(item.get('post_buttons') or [])})", callback_data=f"cm:followup_buttons:{record_id}:{index}")])
+        rows.append([InlineKeyboardButton(f"Buttons ({len(item.get('post_buttons') or [])})", callback_data=f"cm:followup_buttons:{record_id}:{index}")])
         rows.append([InlineKeyboardButton("Remove this message", callback_data=f"cm:followup_remove:{record_id}:{index}")])
         rows.append([InlineKeyboardButton("← Extra content", callback_data=f"cm:followups:{record_id}")])
         note = "\nTelegram doesn’t allow captions on stickers or video notes; use Replace content to turn this into text." if media_type in {"sticker", "video_note"} else ""
@@ -5108,7 +5142,7 @@ class ChannelManager:
         back = (f"cm:pub_comps:{record_id}:{published_page}" if published_page is not None
                 else f"cm:followup_edit:{record_id}:{index}")
         rows.append([InlineKeyboardButton("← Batch item" if record.get("batch_mode") else "← Extra message", callback_data=back)])
-        await self._edit_or_send(update, "<b>Message URL buttons</b>\nThese buttons appear directly below this message.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+        await self._edit_or_send(update, "<b>Buttons on this message</b>\nThese URL buttons appear directly below this message. Choose a button to edit its label, link, or color.", InlineKeyboardMarkup(rows), ParseMode.HTML)
 
     async def _start_followup_button_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                                           record_id: str, item_index: int,
@@ -5157,10 +5191,90 @@ class ChannelManager:
         rows = [
             [InlineKeyboardButton("Edit label", callback_data=f"cm:followup_button_label:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("Change link", callback_data=f"cm:followup_button_url:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
+            [InlineKeyboardButton("Button color", callback_data=f"cm:followup_button_style:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("Remove button", callback_data=f"cm:followup_button_remove:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("← All buttons", callback_data=f"cm:pub_comp_buttons:{record_id}:{item_index}:{published_page}" if published_page is not None else f"cm:followup_buttons:{record_id}:{item_index}")],
         ]
         await self._edit_or_send(update, f"<b>{html_escape(str(button.get('text') or 'Link'))}</b>\n{html_escape(str(button.get('url') or ''))}", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _show_followup_button_style(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, item_index: int, button_index: int,
+        published_page: int | None = None,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        buttons = list(items[item_index].get("post_buttons") or []) if 0 <= item_index < len(items) else []
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if not record or channel is None or record.get("status") not in allowed_status or not 0 <= button_index < len(buttons):
+            await self._access_denied(update)
+            return
+        style = str(buttons[button_index].get("style") or "default")
+        choices = [("default", "Default"), ("primary", "Blue"), ("success", "Green"), ("danger", "Red")]
+        rows = [[InlineKeyboardButton(
+            f"{'✓ ' if style == value else ''}{label}",
+            callback_data=f"cm:followup_button_set_style:{record_id}:{item_index}:{button_index}:{value}" + (f":published:{published_page}" if published_page is not None else ""),
+        )] for value, label in choices]
+        rows.append([InlineKeyboardButton(
+            "← Button options",
+            callback_data=f"cm:followup_button_item:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""),
+        )])
+        await self._edit_or_send(
+            update, "<b>URL button color</b>\nChoose a Telegram preset. Colors may vary by Telegram app and theme.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _set_followup_button_style(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, item_index: int, button_index: int, style: str,
+        published_page: int | None = None,
+    ) -> None:
+        allowed_styles = {"default", "primary", "success", "danger"}
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        buttons = list(items[item_index].get("post_buttons") or []) if 0 <= item_index < len(items) else []
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if (style not in allowed_styles or not record or channel is None
+                or record.get("status") not in allowed_status or not 0 <= button_index < len(buttons)):
+            await self._access_denied(update)
+            return
+        if style == "default":
+            buttons[button_index].pop("style", None)
+        else:
+            buttons[button_index]["style"] = style
+        items[item_index]["post_buttons"] = buttons
+        component = None
+        if published_page is not None:
+            component = next((part for part in self._published_components(record)
+                              if part.get("kind") == "extra" and part.get("source_index") == item_index), None)
+            try:
+                if not component:
+                    raise ValueError("published item message was not found")
+                await context.bot.edit_message_reply_markup(
+                    chat_id=int(record["channel_id"]), message_id=int(component["message_id"]),
+                    reply_markup=self._post_keyboard(items[item_index]),
+                )
+            except Exception as exc:
+                logger.warning("[channel-manager] published item button color change failed channel_id=%s post_id=%s item=%s error=%s", record["channel_id"], record_id, item_index, type(exc).__name__)
+                await self._edit_or_send(update, "I couldn’t change that button color in the channel. Nothing was saved.", None)
+                return
+        try:
+            saved = await asyncio.to_thread(self._get_repository().update, record_id, {"followups": items})
+        except Exception as exc:
+            logger.warning("[channel-manager] item button color save failed channel_id=%s post_id=%s item=%s error=%s", record["channel_id"], record_id, item_index, type(exc).__name__)
+            saved = False
+        if not saved:
+            await self._edit_or_send(update, "The button changed in the channel, but Annie couldn’t save its settings. Refresh the item before making more changes.", None) if published_page is not None else await self._storage_error(update)
+            return
+        logger.info("[channel-manager] item button color changed channel_id=%s user_id=%s post_id=%s item=%s button=%s style=%s", record["channel_id"], update.effective_user.id, record_id, item_index, button_index, style)
+        if published_page is not None and component:
+            await self._mirror_edit_to_backups(
+                context.bot, int(record["channel_id"]), int(component["message_id"]),
+                items[item_index], reply_markup=self._post_keyboard(items[item_index]),
+            )
+            await self._show_followup_button_item(update, context, record_id, item_index, button_index, published_page)
+        else:
+            await self._preview(update, context, record_id)
 
     async def _remove_followup_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                                      record_id: str, item_index: int, button_index: int,
@@ -5201,7 +5315,10 @@ class ChannelManager:
             await self._edit_or_send(update, "The channel buttons changed, but Annie couldn’t save the updated details. Please refresh the item before making more changes.", None) if published_page is not None else await self._storage_error(update)
             return
         if published_page is not None:
-            await self._mirror_edit_to_backups(context.bot, int(record["channel_id"]), int(component["message_id"]), items[item_index], preserve_reply_markup=True)
+            await self._mirror_edit_to_backups(
+                context.bot, int(record["channel_id"]), int(component["message_id"]),
+                items[item_index], reply_markup=self._post_keyboard(items[item_index]),
+            )
             await self._show_followup_buttons(update, context, record_id, item_index, published_page)
         else:
             await self._preview(update, context, record_id)
@@ -5364,7 +5481,7 @@ class ChannelManager:
         if published_component:
             await self._mirror_edit_to_backups(
                 context.bot, int(record["channel_id"]), int(published_component["message_id"]),
-                item, preserve_reply_markup=True,
+                item, reply_markup=self._post_keyboard(item),
             )
             await self._show_followup_buttons(update, context, record_id, item_index, int(state.get("page", 0)))
         else:
@@ -5726,7 +5843,7 @@ class ChannelManager:
                 send_kwargs = self._send_kwargs(updated_record)
                 text_kwargs = {
                     key: send_kwargs[key]
-                    for key in ("parse_mode", "entities")
+                    for key in ("parse_mode", "entities", "link_preview_options")
                     if key in send_kwargs
                 }
                 await context.bot.edit_message_text(
