@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
-from src.channel_index import ChannelIndexRuntime
+from src.channel_index import ChannelIndexRuntime, MongoChannelIndexRepository
 
 
 class MemoryIndexRepository:
@@ -29,6 +29,35 @@ class MemoryIndexRepository:
             item for item in self.config.get("pending_posts", [])
             if int(item.get("message_id", -1)) != int(post_id)
         ]
+
+
+class TestMongoChannelIndexCloneEligibility(unittest.TestCase):
+    def test_recognizes_cloned_main_post_but_not_cloned_extra_message(self):
+        class Collection:
+            def __init__(self, mapping=None):
+                self.mapping = mapping
+                self.queries = []
+
+            def find_one(self, query, projection=None):
+                self.queries.append(query)
+                if "destination_channel_id" in query:
+                    return self.mapping
+                if query.get("channel_id") == -1001 and query.get("published_main_message_id") == 15:
+                    return {"_id": "original-record"}
+                return None
+
+        repository = MongoChannelIndexRepository.__new__(MongoChannelIndexRepository)
+        repository.channel_manager_records = Collection()
+        repository.channel_manager_clone_messages = Collection({
+            "source_channel_id": -1001, "source_message_id": 15,
+        })
+
+        self.assertTrue(repository.is_channel_manager_main_post(-1002, 900))
+
+        repository.channel_manager_clone_messages.mapping = {
+            "source_channel_id": -1001, "source_message_id": 16,
+        }
+        self.assertFalse(repository.is_channel_manager_main_post(-1002, 901))
 
 
 def _runtime(config: dict, *, managed_main: bool = True, bot=None):

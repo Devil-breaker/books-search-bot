@@ -156,6 +156,7 @@ class MongoChannelManagementRepository:
         self.marginals = self.client[database_name]["bot_channel_manager_marginals"]
         self.clone_pairs = self.client[database_name]["bot_channel_manager_clone_pairs"]
         self.clone_messages = self.client[database_name]["bot_channel_manager_clone_messages"]
+        self.index_configs = self.client[database_name]["bot_channel_indexes"]
         self._indexes_ready = False
 
     def ensure_indexes(self) -> None:
@@ -392,6 +393,17 @@ class MongoChannelManagementRepository:
             ],
         }).sort([("published_at", 1), ("_id", 1)]))
 
+    def get_index_config(self, channel_id: int) -> dict[str, Any] | None:
+        return self.index_configs.find_one({"_id": int(channel_id)})
+
+    def save_cloned_index_config(self, channel_id: int, fields: dict[str, Any]) -> None:
+        values = dict(fields)
+        values.pop("_id", None)
+        values["updated_at"] = datetime.now(timezone.utc)
+        self.index_configs.update_one(
+            {"_id": int(channel_id)}, {"$set": values}, upsert=True,
+        )
+
     def get_clone_message(self, source_channel_id: int, destination_channel_id: int, source_message_id: int) -> dict[str, Any] | None:
         pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
         return self.clone_messages.find_one({"pair_id": pair_id, "source_message_id": int(source_message_id)})
@@ -407,6 +419,18 @@ class MongoChannelManagementRepository:
                 {"source_message_id": 1},
             )
         }
+
+    def list_clone_mappings(
+        self, source_channel_id: int, destination_channel_id: int,
+        source_message_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        if not source_message_ids:
+            return []
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        return list(self.clone_messages.find(
+            {"pair_id": pair_id, "source_message_id": {"$in": [int(value) for value in source_message_ids]}},
+            {"source_message_id": 1, "destination_message_id": 1},
+        ))
 
     def save_clone_message(
         self, source_channel_id: int, destination_channel_id: int,
@@ -430,6 +454,38 @@ class MongoChannelManagementRepository:
         return self.clone_messages.delete_one({
             "pair_id": pair_id, "source_message_id": int(source_message_id),
         }).deleted_count > 0
+
+    def delete_clone_pair(self, source_channel_id: int, destination_channel_id: int) -> bool:
+        pair_id = self.clone_pair_id(source_channel_id, destination_channel_id)
+        self.clone_messages.delete_many({"pair_id": pair_id})
+        return self.clone_pairs.delete_one({"_id": pair_id}).deleted_count > 0
+
+    def reconfigure_clone_pair(
+        self, old_source_id: int, old_destination_id: int,
+        new_source_id: int, new_destination_id: int,
+        source_name: str, destination_name: str, configured_by: int,
+    ) -> bool:
+        old_pair = self.get_clone_pair(old_source_id, old_destination_id)
+        if not old_pair:
+            return False
+        if (int(old_source_id), int(old_destination_id)) == (int(new_source_id), int(new_destination_id)):
+            self.clone_pairs.update_one(
+                {"_id": self.clone_pair_id(old_source_id, old_destination_id)},
+                {"$set": {"source_name": str(source_name), "destination_name": str(destination_name),
+                          "configured_by": int(configured_by), "updated_at": datetime.now(timezone.utc)}},
+            )
+            return True
+        if self.get_clone_pair(new_source_id, new_destination_id):
+            raise ValueError("That channel pair already exists.")
+        new_pair = self.save_clone_pair(
+            new_source_id, new_destination_id, source_name, destination_name, configured_by,
+        )
+        if old_pair.get("auto_forward"):
+            self.set_auto_forward(new_source_id, new_destination_id, True)
+        if not new_pair:
+            return False
+        self.delete_clone_pair(old_source_id, old_destination_id)
+        return True
 
     def claim_due(self, now: datetime) -> dict[str, Any] | None:
         """Atomically claim one scheduled post so concurrent workers cannot send it twice."""
@@ -499,6 +555,12 @@ class ChannelManager:
         self._ambiguous_send_ids: set[str] = set()
         self._published_previews: dict[int, list[int]] = {}
         self._clone_pair_locks: dict[str, asyncio.Lock] = {}
+        self._clone_pair_edits: dict[int, dict[str, Any]] = {}
+        self._clone_send_lock = asyncio.Lock()
+        self._clone_last_send_at = 0.0
+        # Stay below Telegram's documented 20 messages/minute per group limit
+        # when a destination is subject to that cap.
+        self.CLONE_SEND_INTERVAL_SECONDS = 3.1
 
     def _get_repository(self) -> MongoChannelManagementRepository | None:
         uri = os.getenv("MONGODB_URI", "").strip()
@@ -1144,7 +1206,7 @@ class ChannelManager:
             # Channel post URL buttons belong to the main post, even when
             # extra messages follow it. The preview controls stay on the last item.
             if index != 0:
-                message_record["post_buttons"] = []
+                message_record["post_buttons"] = list(item.get("post_buttons") or [])
             try:
                 sent.append(await self._send_content(
                     bot, chat_id, message_record, preview=preview and is_last
@@ -1331,10 +1393,15 @@ class ChannelManager:
                 callback_data=f"cm:clone_toggle:{source_id}:{destination_id}:{0 if pair.get('auto_forward') else 1}",
             )])
             rows.append([InlineKeyboardButton("Clone missing posts", callback_data=f"cm:clone_pair:{source_id}:{destination_id}")])
+            rows.append([
+                InlineKeyboardButton("Change pair", callback_data=f"cm:clone_edit:{source_id}:{destination_id}"),
+                InlineKeyboardButton("Remove pair", callback_data=f"cm:clone_remove:{source_id}:{destination_id}"),
+            ])
         rows.append([InlineKeyboardButton("← Channel Manager", callback_data=f"cm:channel:{int(channel_id)}" if channel_id else "cm:home")])
         text = (
             "<b>Cloning</b>\nCopy saved posts from one connected channel to another.\n\n"
             "• Clone copies only posts Annie published through Channel Manager.\n"
+            "• Cloning does not enable Auto-forward; save a pair separately to enable it.\n"
             "• Auto-forward copies new Annie posts and mirrors Annie’s edits while it is on.\n"
             "• Other admins’ posts aren’t included.\n\n"
             "<b>Commands</b>\n"
@@ -1388,6 +1455,8 @@ class ChannelManager:
         repository = self._get_repository()
         try:
             records = await asyncio.to_thread(repository.list_published_records_for_clone, source_channel_id) if repository else []
+            source_index = await asyncio.to_thread(repository.get_index_config, source_channel_id) if repository else None
+            destination_index = await asyncio.to_thread(repository.get_index_config, destination_channel_id) if repository else None
             rows = []
             if records:
                 rows.append([InlineKeyboardButton(f"Clone {len(records)} saved post{'s' if len(records) != 1 else ''}", callback_data=f"cm:clone_confirm:{source_channel_id}:{destination_channel_id}")])
@@ -1402,6 +1471,10 @@ class ChannelManager:
                 f"Annie found {len(records)} saved published post{'s' if len(records) != 1 else ''}. "
                 "Only posts Annie recorded in Channel Manager can be cloned."
             )
+            if source_index and source_index.get("targets"):
+                text += "\n\nThe source Index will be recreated with destination links and automatic updates."
+                if destination_index and destination_index.get("targets"):
+                    text += " The destination’s current Index settings will be replaced."
             await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
         except Exception as exc:
             logger.warning("[channel-manager] clone confirmation failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
@@ -1487,6 +1560,155 @@ class ChannelManager:
             logger.exception("[channel-manager] clone pair save failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
             await self._edit_or_send(update, "I couldn’t save this channel pair. Please try again.", None)
 
+    async def _begin_clone_pair_reconfigure(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        source_channel_id: int, destination_channel_id: int,
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        repository = self._get_repository()
+        pair = await asyncio.to_thread(repository.get_clone_pair, source_channel_id, destination_channel_id) if repository else None
+        if not pair:
+            await self._edit_or_send(update, "That saved pair is no longer available.", None)
+            return
+        self._clone_pair_edits[user_id] = {
+            "kind": "clone_pair_reconfigure", "old_source_id": source_channel_id,
+            "old_destination_id": destination_channel_id,
+            "expires_at": time.time() + self.INPUT_TTL_SECONDS,
+        }
+        channels = await self._eligible_channels(user_id, context.bot)
+        channels = [item for item in channels if self._can_post(item.get("_bot_member")) and
+                    (item.get("_actor_member") is None or self._can_post(item.get("_actor_member")))]
+        rows = [[InlineKeyboardButton(
+            str(item.get("name") or item["id"])[:55],
+            callback_data=f"cm:clone_edit_source:{int(item['id'])}",
+        )] for item in channels]
+        rows.append([InlineKeyboardButton("Cancel", callback_data="cm:clone_edit_cancel")])
+        await self._edit_or_send(update, "<b>Change pair</b>\nChoose the new source channel.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _choose_clone_pair_destination(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, source_channel_id: int,
+    ) -> None:
+        state = self._clone_pair_edits.get(int(update.effective_user.id)) or {}
+        if state.get("kind") != "clone_pair_reconfigure" or time.time() > float(state.get("expires_at", 0)):
+            await self._edit_or_send(update, "That change step expired. Open Cloning and try again.", None)
+            return
+        channels = await self._eligible_channels(int(update.effective_user.id), context.bot)
+        channels = [item for item in channels if int(item["id"]) != source_channel_id
+                    and self._can_post(item.get("_bot_member"))
+                    and (item.get("_actor_member") is None or self._can_post(item.get("_actor_member")))]
+        state.update({"new_source_id": source_channel_id, "expires_at": time.time() + self.INPUT_TTL_SECONDS})
+        rows = [[InlineKeyboardButton(
+            str(item.get("name") or item["id"])[:55],
+            callback_data=f"cm:clone_edit_dest:{int(item['id'])}",
+        )] for item in channels]
+        rows.append([InlineKeyboardButton("Cancel", callback_data="cm:clone_edit_cancel")])
+        await self._edit_or_send(update, "<b>Change pair</b>\nChoose the new destination channel.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _confirm_clone_pair_reconfigure(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, destination_channel_id: int,
+    ) -> None:
+        state = self._clone_pair_edits.get(int(update.effective_user.id)) or {}
+        if state.get("kind") != "clone_pair_reconfigure" or time.time() > float(state.get("expires_at", 0)):
+            await self._edit_or_send(update, "That change step expired. Open Cloning and try again.", None)
+            return
+        state["new_destination_id"] = int(destination_channel_id)
+        state["expires_at"] = time.time() + self.INPUT_TTL_SECONDS
+        channels = {int(item["id"]): item for item in await self._eligible_channels(int(update.effective_user.id), context.bot)}
+        source = channels.get(int(state.get("new_source_id", 0)))
+        destination = channels.get(int(destination_channel_id))
+        if not source or not destination:
+            await self._access_denied(update)
+            return
+        await self._edit_or_send(
+            update,
+            "<b>Confirm pair change</b>\n"
+            f"Source: {html_escape(str(source.get('name') or source['id']))}\n"
+            f"Destination: {html_escape(str(destination.get('name') or destination['id']))}\n\n"
+            "Auto-forward keeps its current on/off setting. Clone history is cleared if you choose a different pair.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirm change", callback_data="cm:clone_edit_confirm")],
+                [InlineKeyboardButton("Cancel", callback_data="cm:clone_edit_cancel")],
+            ]), ParseMode.HTML,
+        )
+
+    async def _apply_clone_pair_reconfigure(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        state = self._clone_pair_edits.get(user_id) or {}
+        if state.get("kind") != "clone_pair_reconfigure" or time.time() > float(state.get("expires_at", 0)):
+            await self._edit_or_send(update, "That change step expired. Open Cloning and try again.", None)
+            return
+        old_source, old_destination = int(state["old_source_id"]), int(state["old_destination_id"])
+        new_source, new_destination = int(state["new_source_id"]), int(state["new_destination_id"])
+        source, destination = await asyncio.gather(
+            self._channel_for_action(new_source, user_id, context.bot),
+            self._channel_for_action(new_destination, user_id, context.bot),
+        )
+        repository = self._get_repository()
+        if not source or not destination or new_source == new_destination or repository is None:
+            await self._access_denied(update)
+            return
+        try:
+            changed = await asyncio.to_thread(
+                repository.reconfigure_clone_pair, old_source, old_destination,
+                new_source, new_destination,
+                str(source.get("name") or new_source), str(destination.get("name") or new_destination), user_id,
+            )
+        except ValueError as exc:
+            await self._edit_or_send(update, html_escape(str(exc)), None, ParseMode.HTML)
+            return
+        except Exception as exc:
+            logger.warning("[channel-manager] clone pair change failed user_id=%s error=%s", user_id, type(exc).__name__)
+            changed = False
+        if not changed:
+            await self._edit_or_send(update, "I couldn’t change that pair. It may have been removed already.", None)
+            return
+        self._clone_pair_edits.pop(user_id, None)
+        logger.info("[channel-manager] clone pair changed old_source=%s old_destination=%s source=%s destination=%s user_id=%s", old_source, old_destination, new_source, new_destination, user_id)
+        await self._show_cloning_home(update, context, new_source)
+
+    async def _confirm_remove_clone_pair(
+        self, update: Update, source_channel_id: int, destination_channel_id: int,
+    ) -> None:
+        repository = self._get_repository()
+        pair = await asyncio.to_thread(repository.get_clone_pair, source_channel_id, destination_channel_id) if repository else None
+        if not pair:
+            await self._edit_or_send(update, "That saved pair is no longer available.", None)
+            return
+        await self._edit_or_send(
+            update,
+            f"Remove the saved pair <b>{html_escape(str(pair.get('source_name') or source_channel_id))} → {html_escape(str(pair.get('destination_name') or destination_channel_id))}</b>?\n\nThis also turns Auto-forward off and clears clone history for this pair.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("Remove pair", callback_data=f"cm:clone_remove_confirm:{source_channel_id}:{destination_channel_id}")],
+                [InlineKeyboardButton("Cancel", callback_data="cm:cloning")],
+            ]), ParseMode.HTML,
+        )
+
+    async def _remove_clone_pair(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        source_channel_id: int, destination_channel_id: int,
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        source, destination = await asyncio.gather(
+            self._channel_for_action(source_channel_id, user_id, context.bot),
+            self._channel_for_action(destination_channel_id, user_id, context.bot),
+        )
+        repository = self._get_repository()
+        if source is None or destination is None or repository is None:
+            await self._access_denied(update)
+            return
+        try:
+            removed = await asyncio.to_thread(repository.delete_clone_pair, source_channel_id, destination_channel_id)
+        except Exception as exc:
+            logger.warning("[channel-manager] clone pair removal failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
+            removed = False
+        if not removed:
+            await self._edit_or_send(update, "I couldn’t remove that pair. It may already be gone.", None)
+            return
+        logger.info("[channel-manager] clone pair removed source=%s destination=%s user_id=%s", source_channel_id, destination_channel_id, user_id)
+        await self._show_cloning_home(update, context, source_channel_id)
+
     @staticmethod
     def _clone_message_ids(record: dict[str, Any]) -> list[int]:
         values = record.get("published_message_ids") or []
@@ -1510,6 +1732,8 @@ class ChannelManager:
             kind = component.get("kind")
             if kind == "main":
                 return self._post_keyboard(record)
+            if kind == "extra":
+                return self._post_keyboard(component.get("data") or {})
             settings = record.get("marginal_snapshot") or {}
             field = "header" if kind == "header" else "footer" if kind == "footer" else None
             if field:
@@ -1534,17 +1758,30 @@ class ChannelManager:
             )
             if existing:
                 return None
-            try:
-                copied = await bot.copy_message(
-                    chat_id=destination_channel_id, from_chat_id=source_channel_id,
-                    message_id=source_message_id, reply_markup=markup,
-                )
-            except RetryAfter as exc:
-                await asyncio.sleep(max(1, int(getattr(exc, "retry_after", 1))))
-                copied = await bot.copy_message(
-                    chat_id=destination_channel_id, from_chat_id=source_channel_id,
-                    message_id=source_message_id, reply_markup=markup,
-                )
+            async with self._clone_send_lock:
+                copied = None
+                for attempt in range(4):
+                    elapsed = time.monotonic() - self._clone_last_send_at
+                    if elapsed < self.CLONE_SEND_INTERVAL_SECONDS:
+                        await asyncio.sleep(self.CLONE_SEND_INTERVAL_SECONDS - elapsed)
+                    self._clone_last_send_at = time.monotonic()
+                    try:
+                        copied = await bot.copy_message(
+                            chat_id=destination_channel_id, from_chat_id=source_channel_id,
+                            message_id=source_message_id, reply_markup=markup,
+                        )
+                        break
+                    except RetryAfter as exc:
+                        delay = max(1.0, float(getattr(exc, "retry_after", 1))) + 0.25
+                        logger.warning(
+                            "[channel-manager] clone rate limited source=%s destination=%s message_id=%s retry_after=%.2f attempt=%s",
+                            source_channel_id, destination_channel_id, source_message_id, delay, attempt + 1,
+                        )
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(delay)
+                if copied is None:
+                    return None
             destination_message_id = int(copied.message_id)
             await asyncio.to_thread(
                 repository.save_clone_message, source_channel_id,
@@ -1561,11 +1798,6 @@ class ChannelManager:
             await self._access_denied(update)
             return
         try:
-            await asyncio.to_thread(
-                repository.save_clone_pair, source_channel_id, destination_channel_id,
-                str(source.get("name") or source_channel_id),
-                str(destination.get("name") or destination_channel_id), int(update.effective_user.id),
-            )
             records = await asyncio.to_thread(repository.list_published_records_for_clone, source_channel_id)
         except Exception as exc:
             logger.exception("[channel-manager] clone load failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
@@ -1576,17 +1808,49 @@ class ChannelManager:
             for record in records for source_message_id in self._clone_message_ids(record)
         ]
         total = len(all_source_ids)
-        mapped_ids: set[int] = set()
+        mappings: list[dict[str, Any]] = []
         try:
             for start in range(0, len(all_source_ids), 500):
-                mapped_ids.update(await asyncio.to_thread(
-                    repository.list_cloned_source_ids, source_channel_id,
+                mappings.extend(await asyncio.to_thread(
+                    repository.list_clone_mappings, source_channel_id,
                     destination_channel_id, all_source_ids[start:start + 500],
                 ))
         except Exception as exc:
             logger.warning("[channel-manager] clone mapping lookup failed source=%s destination=%s error=%s", source_channel_id, destination_channel_id, type(exc).__name__)
             await self._edit_or_send(update, "I couldn’t check which posts are already copied. Nothing was copied; please try again.", None)
             return
+        mapped_ids: set[int] = set()
+        if mappings:
+            if self.get_channel_messages is None:
+                await self._edit_or_send(update, "I can’t verify the saved copies right now, so I stopped to avoid creating duplicates. Please try again later.", None)
+                return
+            for start in range(0, len(mappings), 100):
+                batch = mappings[start:start + 100]
+                destination_ids = [int(item["destination_message_id"]) for item in batch]
+                try:
+                    live_messages = await self.get_channel_messages(destination_channel_id, destination_ids)
+                except Exception as exc:
+                    logger.warning("[channel-manager] clone destination verification failed destination=%s count=%s error=%s", destination_channel_id, len(batch), type(exc).__name__)
+                    live_messages = None
+                if live_messages is None:
+                    await self._edit_or_send(update, "I couldn’t verify the destination posts, so nothing was copied. Check Annie’s access and try again.", None)
+                    return
+                for mapping in batch:
+                    source_id = int(mapping["source_message_id"])
+                    destination_id = int(mapping["destination_message_id"])
+                    if destination_id in live_messages:
+                        mapped_ids.add(source_id)
+                        continue
+                    try:
+                        await asyncio.to_thread(
+                            repository.delete_clone_message, source_channel_id,
+                            destination_channel_id, source_id,
+                        )
+                        logger.info("[channel-manager] stale clone mapping removed source=%s destination=%s source_message_id=%s destination_message_id=%s", source_channel_id, destination_channel_id, source_id, destination_id)
+                    except Exception as exc:
+                        logger.warning("[channel-manager] stale clone mapping cleanup failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_channel_id, source_id, type(exc).__name__)
+                        await self._edit_or_send(update, "I found an old copy record but couldn’t clear it. Nothing was copied; please try again.", None)
+                        return
         await self._edit_or_send(update, f"Cloning Annie’s saved posts… 0 of {total} messages copied.", None)
         copied = skipped = already_copied = processed = 0
         for record in records:
@@ -1618,10 +1882,180 @@ class ChannelManager:
             result_text += f" {already_copied} were already there."
         if skipped:
             result_text += f" {skipped} couldn’t be copied; check Annie’s channel access and the log."
+        index_result = await self._clone_index_configuration(
+            context.bot, repository, source_channel_id, destination_channel_id,
+        )
+        if index_result["status"] == "updated":
+            result_text += f" Destination Index updated with {index_result['entries']} mapped entr{'y' if index_result['entries'] == 1 else 'ies'}."
+            result_text += (
+                " It will track future posts."
+                if index_result["enabled"] else
+                " Index updates remain off, as they are off in the source channel."
+            )
+            if index_result["omitted"]:
+                result_text += f" {index_result['omitted']} entries were omitted because their source posts weren’t cloned."
+        elif index_result["status"] == "unavailable":
+            result_text += " The Index couldn’t be transferred completely because one or more placeholder posts were not cloned; its settings were left unchanged."
+        elif index_result["status"] == "failed":
+            result_text += " Annie couldn’t finish setting up the destination Index; check the log before relying on automatic updates."
         await self._edit_or_send(
             update, result_text,
             InlineKeyboardMarkup([[InlineKeyboardButton("← Cloning", callback_data=f"cm:cloning:{source_channel_id}")]]),
         )
+
+    async def _clone_index_configuration(
+        self, bot: Any, repository: MongoChannelManagementRepository,
+        source_channel_id: int, destination_channel_id: int,
+    ) -> dict[str, Any]:
+        """Translate saved Index targets and entries to their cloned message IDs."""
+        try:
+            source_config = await asyncio.to_thread(repository.get_index_config, source_channel_id)
+            if not source_config or not source_config.get("targets"):
+                return {"status": "none", "entries": 0, "omitted": 0, "enabled": False}
+
+            targets = list(source_config.get("targets") or [])
+            entries = list(source_config.get("entries") or [])
+            source_ids = {int(target["message_id"]) for target in targets}
+            source_ids.update(int(entry["source_message_id"]) for entry in entries)
+            source_ids.update(
+                int(item["message_id"])
+                for item in source_config.get("pending_posts") or []
+                if item.get("message_id") is not None
+            )
+            mappings: list[dict[str, Any]] = []
+            source_id_list = list(source_ids)
+            for start in range(0, len(source_id_list), 500):
+                mappings.extend(await asyncio.to_thread(
+                    repository.list_clone_mappings, source_channel_id,
+                    destination_channel_id, source_id_list[start:start + 500],
+                ))
+            message_map = {
+                int(item["source_message_id"]): int(item["destination_message_id"])
+                for item in mappings
+            }
+            missing_targets = [
+                int(target["message_id"]) for target in targets
+                if int(target["message_id"]) not in message_map
+            ]
+            if missing_targets:
+                logger.warning(
+                    "[channel-manager] cloned Index setup incomplete source=%s destination=%s missing_targets=%s",
+                    source_channel_id, destination_channel_id, missing_targets,
+                )
+                return {"status": "unavailable", "entries": 0, "omitted": 0, "enabled": False}
+
+            from src.channel_index import ChannelIndexRuntime
+
+            destination_targets = []
+            for target in targets:
+                base_html = str(target.get("base_html") or "")
+                for source_post_id, destination_post_id in message_map.items():
+                    base_html = base_html.replace(
+                        ChannelIndexRuntime._post_url(source_channel_id, source_post_id),
+                        ChannelIndexRuntime._post_url(destination_channel_id, destination_post_id),
+                    )
+                destination_targets.append({
+                    **target, "message_id": message_map[int(target["message_id"])],
+                    "base_html": base_html,
+                })
+            destination_entries = []
+            omitted = 0
+            for entry in entries:
+                source_post_id = int(entry.get("source_message_id", -1))
+                source_target_id = int(entry.get("target_message_id", -1))
+                if source_post_id not in message_map or source_target_id not in message_map:
+                    omitted += 1
+                    continue
+                destination_post_id = message_map[source_post_id]
+                destination_entries.append({
+                    **entry,
+                    "source_message_id": destination_post_id,
+                    "target_message_id": message_map[source_target_id],
+                    "url": ChannelIndexRuntime._post_url(destination_channel_id, destination_post_id),
+                })
+
+            indexed_destination_ids = {int(item["source_message_id"]) for item in destination_entries}
+            for pending in source_config.get("pending_posts") or []:
+                source_post_id = int(pending.get("message_id", -1))
+                if (source_post_id not in message_map
+                        or message_map[source_post_id] in indexed_destination_ids):
+                    omitted += 1
+                    continue
+                marker = str(pending.get("category_marker") or "").strip().casefold()
+                if pending.get("categorized") and marker:
+                    candidates = [
+                        target for target in targets
+                        if str(target.get("category_marker") or "").strip().casefold() == marker
+                    ]
+                else:
+                    candidates = [target for target in targets
+                                  if not str(target.get("category_marker") or "").strip()]
+                if not candidates:
+                    candidates = list(targets[:1])
+                source_target_id = int(candidates[0]["message_id"]) if candidates else -1
+                if source_target_id not in message_map:
+                    omitted += 1
+                    continue
+                destination_post_id = message_map[source_post_id]
+                destination_entries.append({
+                    "source_message_id": destination_post_id,
+                    "target_message_id": message_map[source_target_id],
+                    "title": str(pending.get("title") or "Untitled post"),
+                    "url": ChannelIndexRuntime._post_url(destination_channel_id, destination_post_id),
+                    "category_marker": pending.get("category_marker"),
+                    "categorized": bool(pending.get("categorized")),
+                })
+                indexed_destination_ids.add(destination_post_id)
+
+            # Repair the visible copied placeholder text first. Save its new
+            # tracking configuration only after all Telegram edits succeed.
+            for target in destination_targets:
+                target_id = int(target["message_id"])
+                target_entries = [
+                    entry for entry in destination_entries
+                    if int(entry.get("target_message_id", -1)) == target_id
+                ]
+                rendered = ChannelIndexRuntime._render_target(
+                    str(target.get("base_html") or ""), target_entries,
+                    str(source_config.get("sort_order") or "added"),
+                    str(target.get("entry_bullet") or source_config.get("entry_bullet") or "🔹"),
+                )
+                if len(rendered.encode("utf-16-le")) // 2 > ChannelIndexRuntime.MAX_INDEX_TEXT:
+                    raise ValueError("translated Index placeholder exceeds Telegram’s message limit")
+                await bot.edit_message_text(
+                    chat_id=int(destination_channel_id), message_id=target_id,
+                    text=rendered, parse_mode="HTML", disable_web_page_preview=True,
+                )
+
+            config_fields = {
+                key: value for key, value in source_config.items()
+                if key not in {"_id", "updated_at", "entries", "targets", "pending_posts"}
+            }
+            config_fields.update({
+                "targets": destination_targets,
+                "entries": destination_entries,
+                # Pending source posts were rendered into the copied targets
+                # above because their source delay has already elapsed here.
+                "pending_posts": [],
+            })
+            await asyncio.to_thread(
+                repository.save_cloned_index_config, destination_channel_id, config_fields,
+            )
+            logger.info(
+                "[channel-manager] cloned Index configuration source=%s destination=%s targets=%s entries=%s omitted=%s enabled=%s",
+                source_channel_id, destination_channel_id, len(destination_targets),
+                len(destination_entries), omitted, bool(source_config.get("enabled")),
+            )
+            return {
+                "status": "updated", "entries": len(destination_entries), "omitted": omitted,
+                "enabled": bool(source_config.get("enabled")),
+            }
+        except Exception as exc:
+            logger.exception(
+                "[channel-manager] cloned Index configuration failed source=%s destination=%s error=%s",
+                source_channel_id, destination_channel_id, type(exc).__name__,
+            )
+            return {"status": "failed", "entries": 0, "omitted": 0, "enabled": False}
 
     async def _auto_forward_published(self, bot: Any, source_channel_id: int, sent_messages: list[Any], record: dict[str, Any]) -> int:
         repository = self._get_repository()
@@ -3155,6 +3589,28 @@ class ChannelManager:
             if action == "clone_save":
                 await self._save_clone_pair(update, context, int(parts[2]), int(parts[3]))
                 return
+            if action == "clone_edit":
+                await self._begin_clone_pair_reconfigure(update, context, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_edit_source":
+                await self._choose_clone_pair_destination(update, context, int(parts[2]))
+                return
+            if action == "clone_edit_dest":
+                await self._confirm_clone_pair_reconfigure(update, context, int(parts[2]))
+                return
+            if action == "clone_edit_confirm":
+                await self._apply_clone_pair_reconfigure(update, context)
+                return
+            if action == "clone_edit_cancel":
+                self._clone_pair_edits.pop(int(update.effective_user.id), None)
+                await self._show_cloning_home(update, context)
+                return
+            if action == "clone_remove":
+                await self._confirm_remove_clone_pair(update, int(parts[2]), int(parts[3]))
+                return
+            if action == "clone_remove_confirm":
+                await self._remove_clone_pair(update, context, int(parts[2]), int(parts[3]))
+                return
             if action == "clone_pair":
                 await self._clone_confirm_prompt(update, context, int(parts[2]), int(parts[3]))
                 return
@@ -3598,8 +4054,39 @@ class ChannelManager:
             if action == "add_followup":
                 await self._start_followup_input(update, context, parts[2])
                 return
+            if action in {"followups", "followup_edit", "followup_buttons"}:
+                pending_input = self._inputs.get(int(update.effective_user.id)) or {}
+                if (str(pending_input.get("kind") or "").startswith("followup_")
+                        and pending_input.get("record_id") == parts[2]):
+                    self._inputs.pop(int(update.effective_user.id), None)
+                    await self._clear_input_prompt(context, pending_input)
             if action == "followups":
                 await self._show_followups(update, context, parts[2])
+                return
+            if action == "followup_edit":
+                await self._show_followup_edit(update, context, parts[2], int(parts[3]))
+                return
+            if action in {"followup_text", "followup_media", "followup_replace"}:
+                mode = {"followup_text": "text", "followup_media": "media", "followup_replace": "replace"}[action]
+                await self._start_followup_edit(update, context, parts[2], int(parts[3]), mode)
+                return
+            if action == "followup_buttons":
+                await self._show_followup_buttons(update, context, parts[2], int(parts[3]))
+                return
+            if action == "followup_button_add":
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]))
+                return
+            if action == "followup_button_item":
+                await self._show_followup_button_item(update, context, parts[2], int(parts[3]), int(parts[4]))
+                return
+            if action == "followup_button_label":
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "text")
+                return
+            if action == "followup_button_url":
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "url")
+                return
+            if action == "followup_button_remove":
+                await self._remove_followup_button(update, context, parts[2], int(parts[3]), int(parts[4]))
                 return
             if action == "followup_done":
                 await self._finish_followup_input(update, context, parts[2])
@@ -4250,16 +4737,293 @@ class ChannelManager:
             await self._access_denied(update)
             return
         followups = list(record.get("followups") or [])
-        rows = [[InlineKeyboardButton(
-            f"Remove {self._followup_label(item, index)}"[:60],
-            callback_data=f"cm:followup_remove:{record_id}:{index}",
-        )] for index, item in enumerate(followups)]
+        rows = [[
+            InlineKeyboardButton(f"Edit {self._followup_label(item, index)}"[:30], callback_data=f"cm:followup_edit:{record_id}:{index}"),
+            InlineKeyboardButton("Remove", callback_data=f"cm:followup_remove:{record_id}:{index}"),
+        ] for index, item in enumerate(followups)]
         rows.append([InlineKeyboardButton("← Back to post", callback_data=f"cm:post_preview:{record_id}")])
         await self._edit_or_send(
             update,
-            "<b>Extra content</b>\nThese items appear below your main post. Remove any item you don’t want.",
+            "<b>Extra content</b>\nEdit an item, add URL buttons under it, or remove it.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
+
+    async def _show_followup_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  record_id: str, index: int) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(items):
+            await self._access_denied(update)
+            return
+        item = items[index]
+        media_type = str((item.get("media") or {}).get("type") or "")
+        if not item.get("source_message") and media_type not in {"sticker", "video_note"}:
+            rows = [[InlineKeyboardButton("Edit text / caption", callback_data=f"cm:followup_text:{record_id}:{index}")]]
+        else:
+            rows = []
+        rows.append([InlineKeyboardButton(
+            "Replace media" if item.get("media") else "Replace content",
+            callback_data=f"cm:followup_media:{record_id}:{index}" if item.get("media") else f"cm:followup_replace:{record_id}:{index}",
+        )])
+        rows.append([InlineKeyboardButton(f"URL buttons ({len(item.get('post_buttons') or [])})", callback_data=f"cm:followup_buttons:{record_id}:{index}")])
+        rows.append([InlineKeyboardButton("Remove this message", callback_data=f"cm:followup_remove:{record_id}:{index}")])
+        rows.append([InlineKeyboardButton("← Extra content", callback_data=f"cm:followups:{record_id}")])
+        note = "\nTelegram doesn’t allow captions on stickers or video notes; use Replace content to turn this into text." if media_type in {"sticker", "video_note"} else ""
+        await self._edit_or_send(update, f"<b>{html_escape(self._followup_label(item, index))}</b>\nChoose what to change.{note}", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _start_followup_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                   record_id: str, index: int, mode: str) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(items):
+            await self._access_denied(update)
+            return
+        mode_kind = {"text": "followup_edit_text", "media": "followup_edit_media", "replace": "followup_replace"}.get(mode)
+        if mode_kind is None:
+            await self._access_denied(update)
+            return
+        if mode == "media" and not items[index].get("media"):
+            await self._edit_or_send(update, "This item has no media. Use Replace content to add media.", None)
+            return
+        prompt_message = update.callback_query.message
+        self._inputs[int(update.effective_user.id)] = {
+            "kind": mode_kind, "record_id": record_id, "channel_id": int(record["channel_id"]),
+            "followup_index": index, "expires_at": time.time() + self.INPUT_TTL_SECONDS,
+            "prompt_chat_id": int(prompt_message.chat.id), "prompt_message_id": int(prompt_message.message_id),
+        }
+        instruction = {
+            "text": "Send the new text or caption.",
+            "media": "Send a replacement photo, video, animation, audio, or file. The current caption is kept when supported.",
+            "replace": "Send replacement text, media, sticker, file, or a forwarded post.",
+        }[mode]
+        await self._edit_or_send(update, instruction, InlineKeyboardMarkup([[
+            InlineKeyboardButton("Cancel", callback_data=f"cm:followup_edit:{record_id}:{index}")
+        ]]))
+
+    async def _show_followup_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     record_id: str, index: int) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(items):
+            await self._access_denied(update)
+            return
+        buttons = list(items[index].get("post_buttons") or [])
+        rows = [[InlineKeyboardButton("＋ Add URL button", callback_data=f"cm:followup_button_add:{record_id}:{index}")]]
+        for button_index, button in enumerate(buttons):
+            rows.append([InlineKeyboardButton(
+                f"🔗 {button_index + 1}. {str(button.get('text') or 'Link')[:35]}",
+                callback_data=f"cm:followup_button_item:{record_id}:{index}:{button_index}",
+            )])
+        rows.append([InlineKeyboardButton("← Extra message", callback_data=f"cm:followup_edit:{record_id}:{index}")])
+        await self._edit_or_send(update, "<b>Extra message buttons</b>\nThese URL buttons appear under this extra message in the channel post.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _start_followup_button_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                          record_id: str, item_index: int,
+                                          button_index: int | None = None, field: str | None = None) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+            await self._access_denied(update)
+            return
+        buttons = list(items[item_index].get("post_buttons") or [])
+        adding = button_index is None
+        if (adding and len(buttons) >= 8) or (not adding and
+                (field not in {"text", "url"} or not 0 <= int(button_index) < len(buttons))):
+            await self._edit_or_send(update, "That button list is full or the selected button is no longer available.", None)
+            return
+        state_kind = "followup_button_label" if adding else f"followup_button_edit_{'label' if field == 'text' else 'url'}"
+        prompt_message = update.callback_query.message
+        state = {
+            "kind": state_kind, "record_id": record_id, "channel_id": int(record["channel_id"]),
+            "followup_index": item_index, "expires_at": time.time() + self.INPUT_TTL_SECONDS,
+            "prompt_chat_id": int(prompt_message.chat.id), "prompt_message_id": int(prompt_message.message_id),
+        }
+        if button_index is not None:
+            state["button_index"] = int(button_index)
+        self._inputs[int(update.effective_user.id)] = state
+        prompt = "Send the button label (up to 40 characters)." if adding or field == "text" else "Send its link, starting with https:// or http://."
+        await self._edit_or_send(update, prompt, InlineKeyboardMarkup([[
+            InlineKeyboardButton("Cancel", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")
+        ]]))
+
+    async def _show_followup_button_item(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                         record_id: str, item_index: int, button_index: int) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        buttons = list(items[item_index].get("post_buttons") or []) if 0 <= item_index < len(items) else []
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= button_index < len(buttons):
+            await self._access_denied(update)
+            return
+        button = buttons[button_index]
+        rows = [
+            [InlineKeyboardButton("Edit label", callback_data=f"cm:followup_button_label:{record_id}:{item_index}:{button_index}")],
+            [InlineKeyboardButton("Change link", callback_data=f"cm:followup_button_url:{record_id}:{item_index}:{button_index}")],
+            [InlineKeyboardButton("Remove button", callback_data=f"cm:followup_button_remove:{record_id}:{item_index}:{button_index}")],
+            [InlineKeyboardButton("← All buttons", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")],
+        ]
+        await self._edit_or_send(update, f"<b>{html_escape(str(button.get('text') or 'Link'))}</b>\n{html_escape(str(button.get('url') or ''))}", InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _remove_followup_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     record_id: str, item_index: int, button_index: int) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+            await self._access_denied(update)
+            return
+        buttons = list(items[item_index].get("post_buttons") or [])
+        if not 0 <= button_index < len(buttons):
+            await self._access_denied(update)
+            return
+        buttons.pop(button_index)
+        items[item_index]["post_buttons"] = buttons
+        repository = self._get_repository()
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, {"followups": items}) if repository else False
+        except Exception as exc:
+            logger.warning("[channel-manager] extra message button removal failed channel_id=%s post_id=%s error=%s", record["channel_id"], record_id, type(exc).__name__)
+            saved = False
+        if not saved:
+            await self._storage_error(update)
+            return
+        await self._preview(update, context, record_id)
+
+    async def _process_followup_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                      state: dict[str, Any]) -> None:
+        user_id = int(update.effective_user.id)
+        message = update.effective_message
+        record_id = str(state.get("record_id") or "")
+        record, channel = await self._record_for_user(record_id, user_id, context.bot)
+        items = list((record or {}).get("followups") or [])
+        item_index = int(state.get("followup_index", -1))
+        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+            self._inputs.pop(user_id, None)
+            await message.reply_text("That draft item is no longer available.")
+            return
+        repository = self._get_repository()
+        if repository is None:
+            self._inputs.pop(user_id, None)
+            await message.reply_text("I couldn’t save that change because storage is unavailable. Please try again later.")
+            return
+        item = dict(items[item_index])
+        kind = str(state.get("kind") or "")
+        preserved_source: dict[str, int] | None = None
+        if kind in {"followup_button_label", "followup_button_url", "followup_button_edit_label", "followup_button_edit_url"}:
+            field = "text" if kind.endswith("label") else "url"
+            value = (message.text or "").strip()
+            if field == "text" and (not value or len(value) > 40):
+                await message.reply_text("Send a button label between 1 and 40 characters.")
+                return
+            if field == "url":
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(character.isspace() for character in value):
+                    await message.reply_text("That link doesn’t look right. Send a full http:// or https:// link.")
+                    return
+            buttons = list(item.get("post_buttons") or [])
+            if kind == "followup_button_label":
+                state.update({"kind": "followup_button_url", "button_label": value,
+                              "expires_at": time.time() + self.INPUT_TTL_SECONDS})
+                prompt = await message.reply_text(
+                    "Now send the full link, starting with https:// or http://.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Cancel", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")
+                    ]]),
+                )
+                await self._clear_input_prompt(context, state)
+                await self._delete_message(context.bot, message.chat.id, message.message_id)
+                state["prompt_chat_id"], state["prompt_message_id"] = int(prompt.chat.id), int(prompt.message_id)
+                return
+            if kind == "followup_button_url":
+                if len(buttons) >= 8:
+                    await message.reply_text("This extra message already has 8 URL buttons.")
+                    return
+                buttons.append({"text": str(state.get("button_label") or "Link"), "url": value})
+            else:
+                index = int(state.get("button_index", -1))
+                if not 0 <= index < len(buttons):
+                    self._inputs.pop(user_id, None)
+                    await message.reply_text("That URL button is no longer available.")
+                    return
+                buttons[index][field] = value
+            item["post_buttons"] = buttons
+        else:
+            content = self._content_from_message(message, str(record.get("format_mode") or "telegram"))
+            if not content:
+                await message.reply_text("Send text, media, or a forwarded post for this extra message.")
+                return
+            input_message_id = content.pop("input_message_id", None)
+            text_value = str(content.get("text") or content.get("caption") or "")
+            if kind == "followup_edit_text":
+                if content.get("media") or content.get("source_message") or not text_value.strip():
+                    await message.reply_text("Send text only, or use Replace content to change the message type.")
+                    return
+                media_type = str((item.get("media") or {}).get("type") or "")
+                if item.get("source_message") or media_type in {"sticker", "video_note"}:
+                    await message.reply_text("Telegram can’t edit text on this message type. Use Replace content instead.")
+                    return
+                field = "caption" if item.get("media") else "text"
+                if len(text_value) > (1024 if item.get("media") else 4096):
+                    await message.reply_text("That text is too long for this message.")
+                    return
+                item[field] = text_value
+                item["entities"] = list(content.get("entities") or [])
+            elif kind == "followup_edit_media":
+                if not content.get("media"):
+                    await message.reply_text("Send one photo, video, animation, audio, or file to replace the media.")
+                    return
+                media = content["media"]
+                item.update({"media": media, "source_message": None})
+                if media.get("type") in {"sticker", "video_note"}:
+                    item.update({"text": "", "caption": "", "entities": []})
+                else:
+                    item["caption"] = str(item.get("caption") or item.get("text") or "")
+                    item["text"] = ""
+            else:
+                if content.get("media"):
+                    media = content["media"]
+                    item.update({"media": media, "text": "", "caption": str(content.get("caption") or ""),
+                                 "entities": list(content.get("entities") or []), "source_message": None})
+                    if media.get("type") in {"sticker", "video_note"}:
+                        item.update({"caption": "", "entities": []})
+                elif content.get("source_message"):
+                    source = content["source_message"]
+                    try:
+                        copied = await context.bot.copy_message(
+                            chat_id=user_id, from_chat_id=int(source["chat_id"]),
+                            message_id=int(source["message_id"]),
+                        )
+                    except Exception as exc:
+                        logger.warning("[channel-manager] extra message replacement preservation failed post_id=%s index=%s error=%s", record_id, item_index, type(exc).__name__)
+                        await message.reply_text("I couldn’t safely save that forwarded item. Nothing changed; forward it again.")
+                        return
+                    preserved_source = {"chat_id": user_id, "message_id": int(copied.message_id)}
+                    item.update({"source_message": preserved_source,
+                                 "media": None, "text": "", "caption": "", "entities": []})
+                else:
+                    if not text_value.strip() or len(text_value) > 4096:
+                        await message.reply_text("Send non-empty text up to 4,096 characters, or replace it with media.")
+                        return
+                    item.update({"text": text_value, "caption": "", "entities": list(content.get("entities") or []),
+                                 "media": None, "source_message": None})
+        items[item_index] = item
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, {"followups": items})
+        except Exception as exc:
+            logger.warning("[channel-manager] extra message edit save failed channel_id=%s user_id=%s post_id=%s index=%s error=%s", record["channel_id"], user_id, record_id, item_index, type(exc).__name__)
+            saved = False
+        if not saved:
+            if preserved_source:
+                await self._delete_message(context.bot, preserved_source["chat_id"], preserved_source["message_id"])
+            await message.reply_text("I couldn’t save that change. The extra message is unchanged; please try again.")
+            return
+        old_source = (record.get("followups") or [])[item_index].get("source_message") or {}
+        new_source = item.get("source_message") or {}
+        if old_source and old_source != new_source:
+            await self._delete_message(context.bot, int(old_source.get("chat_id", user_id)), int(old_source.get("message_id", 0)))
+        self._inputs.pop(user_id, None)
+        await self._delete_message(context.bot, message.chat.id, message.message_id)
+        await self._clear_input_prompt(context, state)
+        logger.info("[channel-manager] extra message updated channel_id=%s user_id=%s post_id=%s index=%s action=%s", record["channel_id"], user_id, record_id, item_index, kind)
+        await self._preview(update, context, record_id)
 
     async def _remove_followup(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -4673,6 +5437,11 @@ class ChannelManager:
             f"Edit URL buttons ({len(record.get('post_buttons') or [])})",
             callback_data=f"cm:edit_buttons:{record_id}",
         )])
+        if record.get("followups"):
+            rows.append([InlineKeyboardButton(
+                f"Edit extra content ({len(record['followups'])})",
+                callback_data=f"cm:followups:{record_id}",
+            )])
         rows.append([InlineKeyboardButton("Replace entire post", callback_data=f"cm:edit_replace:{record_id}")])
         rows.append([InlineKeyboardButton("Preview post", callback_data=f"cm:edit_back:{record_id}")])
         rows.append([InlineKeyboardButton("Cancel", callback_data=f"cm:edit_cancel:{record_id}")])
@@ -5123,6 +5892,13 @@ class ChannelManager:
             return
         kind = state["kind"]
         message = update.effective_message
+        if kind in {
+            "followup_edit_text", "followup_edit_media", "followup_replace",
+            "followup_button_label", "followup_button_url",
+            "followup_button_edit_label", "followup_button_edit_url",
+        }:
+            await self._process_followup_input(update, context, state)
+            return
         if kind in {"published_quick_text", "published_quick_replace"}:
             record_id = str(state.get("record_id") or "")
             record, channel = await self._record_for_user(record_id, user_id, context.bot)

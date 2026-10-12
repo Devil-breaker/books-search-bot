@@ -27,13 +27,33 @@ class MongoChannelIndexRepository:
         )
         self.configs = self.client[database_name]["bot_channel_indexes"]
         self.channel_manager_records = self.client[database_name]["bot_channel_manager_records"]
+        self.channel_manager_clone_messages = self.client[database_name]["bot_channel_manager_clone_messages"]
 
     def is_channel_manager_main_post(self, channel_id: int, message_id: int) -> bool:
-        """Only allow Annie-authored posts that Channel Manager recorded as main content."""
-        return self.channel_manager_records.find_one(
+        """Allow saved Channel Manager mains, including their cloned copies."""
+        if self.channel_manager_records.find_one(
             {
                 "channel_id": int(channel_id),
                 "published_main_message_id": int(message_id),
+                "kind": "post",
+                "status": "published",
+            },
+            {"_id": 1},
+        ) is not None:
+            return True
+        clone = self.channel_manager_clone_messages.find_one(
+            {
+                "destination_channel_id": int(channel_id),
+                "destination_message_id": int(message_id),
+            },
+            {"source_channel_id": 1, "source_message_id": 1},
+        )
+        if not clone:
+            return False
+        return self.channel_manager_records.find_one(
+            {
+                "channel_id": int(clone.get("source_channel_id", 0)),
+                "published_main_message_id": int(clone.get("source_message_id", 0)),
                 "kind": "post",
                 "status": "published",
             },
