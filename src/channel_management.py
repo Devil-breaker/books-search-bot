@@ -1204,16 +1204,17 @@ class ChannelManager:
                 )])
             rows.append([
                 InlineKeyboardButton(
-                    f"Buttons ({len(record.get('post_buttons') or [])})",
+                    f"Main buttons ({len(record.get('post_buttons') or [])})",
                     callback_data=f"cm:buttons:{record['_id']}",
                 ),
             ])
             rows.append([InlineKeyboardButton(
-                "＋ Add content below", callback_data=f"cm:add_followup:{record['_id']}"
+                "＋ Add next post" if record.get("batch_mode") else "＋ Add content below",
+                callback_data=f"cm:add_followup:{record['_id']}"
             )])
             if record.get("followups"):
                 rows.append([InlineKeyboardButton(
-                    f"Extra content ({len(record['followups'])})",
+                    f"Batch items ({len(record['followups'])})" if record.get("batch_mode") else f"Extra content ({len(record['followups'])})",
                     callback_data=f"cm:followups:{record['_id']}",
                 )])
             rows.append([
@@ -1231,6 +1232,7 @@ class ChannelManager:
                 "chat_id": chat_id,
                 "from_chat_id": int(source_message["chat_id"]),
                 "message_id": int(source_message["message_id"]),
+                "disable_notification": not preview,
                 "reply_markup": (
                     self._send_kwargs(record, preview=True)["reply_markup"]
                     if preview else self._post_keyboard(record)
@@ -1238,6 +1240,8 @@ class ChannelManager:
             }
             return await bot.copy_message(**kwargs)
         kwargs = self._send_kwargs(record, preview)
+        if not preview:
+            kwargs["disable_notification"] = True
         media = record.get("media")
         if not media:
             return await bot.send_message(chat_id=chat_id, **kwargs)
@@ -1436,6 +1440,7 @@ class ChannelManager:
         if can_manage_posts:
             rows = [
                 [InlineKeyboardButton("✍️ Create post", callback_data=f"cm:create:{channel_id}")],
+                [InlineKeyboardButton("🧩 Create batch", callback_data=f"cm:batch_create:{channel_id}")],
                 [InlineKeyboardButton("🧩 Header & Footer", callback_data=f"cm:marginals:{channel_id}")],
                 [InlineKeyboardButton("📝 Drafts", callback_data=f"cm:drafts:{channel_id}"),
                  InlineKeyboardButton("🕒 Scheduled", callback_data=f"cm:scheduled:{channel_id}")],
@@ -3211,6 +3216,20 @@ class ChannelManager:
             header_items.append(settings["header_content"])
         return ids[len(header_items)] if len(header_items) < len(ids) else ids[0]
 
+    @staticmethod
+    def _batch_main_message_ids(record: dict[str, Any], message_ids: list[int], settings: dict[str, Any]) -> list[int]:
+        """Return batch content message IDs, excluding any shared header/footer."""
+        if not record.get("batch_mode"):
+            return []
+        media_type = str((record.get("media") or {}).get("type") or "text")
+        header_count = 0
+        if media_type in set(settings.get("types") or []):
+            header_count = len(settings.get("header_items") or [])
+            if not header_count and ((settings.get("header") or {}).get("text") or settings.get("header_content")):
+                header_count = 1
+        content_count = 1 + len(record.get("followups") or [])
+        return [int(value) for value in message_ids[header_count:header_count + content_count]]
+
     @classmethod
     def _published_components(cls, record: dict[str, Any]) -> list[dict[str, Any]]:
         """Map saved message IDs to the main post, margins, and extra messages."""
@@ -3277,7 +3296,7 @@ class ChannelManager:
             kind = str(component["kind"])
             data = component.get("data") or {}
             media_type = str((data.get("media") or {}).get("type") or "")
-            label = {"header": "Header", "footer": "Footer", "extra": "Extra content"}.get(kind, "Message")
+            label = {"header": "Header", "footer": "Footer", "extra": "Batch item" if record.get("batch_mode") else "Extra content"}.get(kind, "Message")
             if media_type:
                 label += f" · {media_type.title()}"
             else:
@@ -3286,7 +3305,8 @@ class ChannelManager:
         rows.append(self._back_button(f"cm:pub_edit:{record_id}:{page}", "← Edit published post"))
         await self._edit_or_send(
             update,
-            "<b>Header, footer & extra messages</b>\nChoose an item to edit or remove. Changes apply to this published post only.",
+            ("<b>Batch items and shared messages</b>\nChoose a batch item to edit or remove. Changes apply to this published batch only."
+             if record.get("batch_mode") else "<b>Header, footer & extra messages</b>\nChoose an item to edit or remove. Changes apply to this published post only."),
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
 
@@ -3309,8 +3329,14 @@ class ChannelManager:
         if media_type in {"photo", "video", "animation", "document", "audio"}:
             rows.append([InlineKeyboardButton("Replace media", callback_data=f"cm:pub_comp_med:{record_id}:{index}:{page}")])
         rows.append([InlineKeyboardButton("Remove this message", callback_data=f"cm:pub_comp_ask:{record_id}:{index}:{page}")])
+        if component.get("kind") == "extra":
+            rows.append([InlineKeyboardButton(
+                f"Edit URL buttons ({len(data.get('post_buttons') or [])})",
+                callback_data=f"cm:pub_comp_buttons:{record_id}:{int(component.get('source_index', 0))}:{page}",
+            )])
         rows.append(self._back_button(f"cm:pub_comps:{record_id}:{page}", "← All extra messages"))
-        label = str(component.get("kind") or "message").replace("extra", "extra content").title()
+        label = ("Batch item" if record.get("batch_mode") and component.get("kind") == "extra"
+                 else str(component.get("kind") or "message").replace("extra", "extra content").title())
         note = (
             "Telegram doesn’t let Annie edit a sticker in place. You can remove this message."
             if media_type == "sticker" else
@@ -3607,7 +3633,7 @@ class ChannelManager:
                 return
             prompt = (
                 f"<b>Publish this post to {html_escape(str(channel.get('name') or 'the channel'))}?</b>\n\n"
-                f"{title}\n\nAnnie will send the post and its extra messages. You can’t undo this."
+                f"{title}\n\nAnnie will send {'all batch items in order' if record.get('batch_mode') else 'the post and its extra messages'}. You can’t undo this."
             )
             confirm_label, confirm_action = "Publish now", "confirm_publish"
             cancel_action = "cancel_publish"
@@ -3638,7 +3664,8 @@ class ChannelManager:
                 return
             prompt = (
                 f"<b>Delete this published post?</b>\n\n{title}\n\n"
-                "Annie will remove the post and its extra messages from the channel."
+                + ("Annie will remove every message in this batch from the channel."
+                   if record.get("batch_mode") else "Annie will remove the post and its extra messages from the channel.")
             )
             confirm_label, confirm_action = "Delete published post", "confirm_published_delete"
             cancel_action = "cancel_published_delete"
@@ -4046,10 +4073,26 @@ class ChannelManager:
                     markup, ParseMode.HTML,
                 )
                 return
+            if action == "batch_create":
+                channel_id = int(parts[2])
+                if await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+                    await self._access_denied(update)
+                    return
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Use Telegram formatting", callback_data=f"cm:compose:{channel_id}:telegram:batch")],
+                    [InlineKeyboardButton("Paste MarkdownV2", callback_data=f"cm:compose:{channel_id}:markdownv2:batch")],
+                    self._back_button(f"cm:channel:{channel_id}"),
+                ])
+                await self._edit_or_send(
+                    update,
+                    "<b>Create a batch</b>\n\nA batch sends several messages in order. Start with the first item, then use <b>Add next post</b> to add more. Each item can have its own text, media, and URL buttons. Annie can edit each item later.",
+                    markup, ParseMode.HTML,
+                )
+                return
             if action == "compose":
                 channel_id = int(parts[2])
                 mode = parts[3]
-                await self._begin_composition(update, context, channel_id, mode)
+                await self._begin_composition(update, context, channel_id, mode, batch_mode=len(parts) > 4 and parts[4] == "batch")
                 return
             if action == "compose_begin":
                 await self._begin_composition(update, context, int(parts[2]), parts[3])
@@ -4289,20 +4332,30 @@ class ChannelManager:
             if action == "followup_buttons":
                 await self._show_followup_buttons(update, context, parts[2], int(parts[3]))
                 return
+            if action == "pub_comp_buttons":
+                await self._show_followup_buttons(
+                    update, context, parts[2], int(parts[3]), published_page=int(parts[4])
+                )
+                return
             if action == "followup_button_add":
-                await self._start_followup_button_input(update, context, parts[2], int(parts[3]))
+                is_published = len(parts) > 4 and parts[4] == "published"
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), published_page=int(parts[5]) if is_published else None)
                 return
             if action == "followup_button_item":
-                await self._show_followup_button_item(update, context, parts[2], int(parts[3]), int(parts[4]))
+                is_published = len(parts) > 5 and parts[5] == "published"
+                await self._show_followup_button_item(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
             if action == "followup_button_label":
-                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "text")
+                is_published = len(parts) > 5 and parts[5] == "published"
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "text", int(parts[6]) if is_published else None)
                 return
             if action == "followup_button_url":
-                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "url")
+                is_published = len(parts) > 5 and parts[5] == "published"
+                await self._start_followup_button_input(update, context, parts[2], int(parts[3]), int(parts[4]), "url", int(parts[6]) if is_published else None)
                 return
             if action == "followup_button_remove":
-                await self._remove_followup_button(update, context, parts[2], int(parts[3]), int(parts[4]))
+                is_published = len(parts) > 5 and parts[5] == "published"
+                await self._remove_followup_button(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
             if action == "followup_done":
                 await self._finish_followup_input(update, context, parts[2])
@@ -4528,7 +4581,7 @@ class ChannelManager:
 
     async def _begin_composition(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-        channel_id: int, mode: str,
+        channel_id: int, mode: str, batch_mode: bool = False,
     ) -> None:
         if mode not in {"telegram", "markdownv2"}:
             await self._edit_or_send(update, "Choose a supported text format.", None)
@@ -4547,6 +4600,7 @@ class ChannelManager:
                 "created_by": int(update.effective_user.id), "shared": False,
                 "text": "", "caption": "", "entities": [], "media": None,
                 "format_mode": mode,
+                "batch_mode": bool(batch_mode),
             })
         except Exception as exc:
             logger.warning("[channel-manager] draft create failed channel_id=%s user_id=%s error=%s", channel_id, update.effective_user.id, type(exc).__name__)
@@ -4561,7 +4615,8 @@ class ChannelManager:
         }
         await self._edit_or_send(
             update,
-            "Send your post content here. It can be text, a photo, video, file, sticker, or a forwarded post.\n\nYou can add a caption, more text, or buttons after Annie shows the preview.",
+            ("Send the first item in your batch. It can be text, photo, video, file, sticker, or a forwarded post. After the preview, tap Add next post for each additional item."
+             if batch_mode else "Send your post content here. It can be text, a photo, video, file, sticker, or a forwarded post.\n\nYou can add a caption, more text, or buttons after Annie shows the preview."),
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("Formatting examples", callback_data=f"cm:format_help:{record_id}")],
                 [InlineKeyboardButton("Cancel post", callback_data=f"cm:delete:{record_id}")],
@@ -4586,7 +4641,8 @@ class ChannelManager:
         }
         await self._edit_or_send(
             update,
-            "Send your post content here. It can be text, a photo, video, file, sticker, or a forwarded post.\n\nYou can add a caption, more text, or buttons after Annie shows the preview.",
+            ("Send the first item in your batch. It can be text, photo, video, file, sticker, or a forwarded post. After the preview, tap Add next post for each additional item."
+             if record.get("batch_mode") else "Send your post content here. It can be text, a photo, video, file, sticker, or a forwarded post.\n\nYou can add a caption, more text, or buttons after Annie shows the preview."),
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("Formatting examples", callback_data=f"cm:format_help:{record_id}")],
                 [InlineKeyboardButton("Cancel post", callback_data=f"cm:delete:{record_id}")],
@@ -4823,14 +4879,16 @@ class ChannelManager:
             await self._edit_or_send(update, "A post can have up to 10 extra messages.", None)
             return
         query_message = update.callback_query.message
+        batch_mode = bool(record.get("batch_mode"))
         state = {
             "kind": "add_followup", "record_id": record_id,
             "channel_id": int(record["channel_id"]),
             "mode": str(record.get("format_mode") or "telegram"),
+            "batch_mode": batch_mode,
             "expires_at": time.time() + self.INPUT_TTL_SECONDS,
         }
         prompt = await query_message.reply_text(
-            self._followup_prompt_text(len(pending)),
+            self._followup_prompt_text(len(pending), batch_mode),
             reply_markup=self._followup_prompt_markup(record_id),
         )
         state["prompt_chat_id"] = int(prompt.chat.id)
@@ -4838,10 +4896,12 @@ class ChannelManager:
         self._inputs[int(update.effective_user.id)] = state
 
     @staticmethod
-    def _followup_prompt_text(count: int) -> str:
-        heading = f"Captured {count} extra message{'s' if count != 1 else ''}.\n\n" if count else ""
+    def _followup_prompt_text(count: int, batch_mode: bool = False) -> str:
+        label = "batch item" if batch_mode else "extra message"
+        heading = f"Captured {count} {label}{'s' if count != 1 else ''}.\n\n" if count else ""
+        content_kind = "batch items" if batch_mode else "extra messages"
         return (
-            f"{heading}Send as many extra messages as you need, one at a time. "
+            f"{heading}Send as many {content_kind} as you need, one at a time. "
             "Text, photos, videos, files, stickers, and forwarded posts are supported. "
             "Tap Done when finished. Annie removes your sent messages after saving them."
         )
@@ -4860,7 +4920,7 @@ class ChannelManager:
             await context.bot.edit_message_text(
                 chat_id=int(state["prompt_chat_id"]),
                 message_id=int(state["prompt_message_id"]),
-                text=self._followup_prompt_text(count),
+                text=self._followup_prompt_text(count, bool(state.get("batch_mode"))),
                 reply_markup=self._followup_prompt_markup(str(state["record_id"])),
             )
         except BadRequest as exc:
@@ -4953,14 +5013,28 @@ class ChannelManager:
             await self._access_denied(update)
             return
         followups = list(record.get("followups") or [])
-        rows = [[
-            InlineKeyboardButton(f"Edit {self._followup_label(item, index)}"[:30], callback_data=f"cm:followup_edit:{record_id}:{index}"),
-            InlineKeyboardButton("Remove", callback_data=f"cm:followup_remove:{record_id}:{index}"),
-        ] for index, item in enumerate(followups)]
+        rows = []
+        for index, item in enumerate(followups):
+            rows.append([
+                InlineKeyboardButton(
+                    f"Edit {self._followup_label(item, index)}"[:30],
+                    callback_data=f"cm:followup_edit:{record_id}:{index}",
+                ),
+                InlineKeyboardButton(
+                    f"URL buttons ({len(item.get('post_buttons') or [])})",
+                    callback_data=f"cm:followup_buttons:{record_id}:{index}",
+                ),
+            ])
+            rows.append([InlineKeyboardButton(
+                f"Remove {self._followup_label(item, index)}"[:35],
+                callback_data=f"cm:followup_remove:{record_id}:{index}",
+            )])
         rows.append([InlineKeyboardButton("← Back to post", callback_data=f"cm:post_preview:{record_id}")])
+        heading = "Batch items" if record.get("batch_mode") else "Extra content"
+        item_label = "Batch item" if record.get("batch_mode") else "Extra content"
         await self._edit_or_send(
             update,
-            "<b>Extra content</b>\nEdit an item, add URL buttons under it, or remove it.",
+            f"<b>{heading}</b>\nEach {item_label.lower()} can be edited, removed, or given URL buttons below it. Main buttons stay under the first item.",
             InlineKeyboardMarkup(rows), ParseMode.HTML,
         )
 
@@ -5017,28 +5091,33 @@ class ChannelManager:
         ]]))
 
     async def _show_followup_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                     record_id: str, index: int) -> None:
+                                     record_id: str, index: int, published_page: int | None = None) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         items = list((record or {}).get("followups") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= index < len(items):
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if not record or channel is None or record.get("status") not in allowed_status or not 0 <= index < len(items):
             await self._access_denied(update)
             return
         buttons = list(items[index].get("post_buttons") or [])
-        rows = [[InlineKeyboardButton("＋ Add URL button", callback_data=f"cm:followup_button_add:{record_id}:{index}")]]
+        rows = [[InlineKeyboardButton("＋ Add URL button", callback_data=f"cm:followup_button_add:{record_id}:{index}" + (f":published:{published_page}" if published_page is not None else ""))]]
         for button_index, button in enumerate(buttons):
             rows.append([InlineKeyboardButton(
                 f"🔗 {button_index + 1}. {str(button.get('text') or 'Link')[:35]}",
-                callback_data=f"cm:followup_button_item:{record_id}:{index}:{button_index}",
+                callback_data=f"cm:followup_button_item:{record_id}:{index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""),
             )])
-        rows.append([InlineKeyboardButton("← Extra message", callback_data=f"cm:followup_edit:{record_id}:{index}")])
-        await self._edit_or_send(update, "<b>Extra message buttons</b>\nThese URL buttons appear under this extra message in the channel post.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+        back = (f"cm:pub_comps:{record_id}:{published_page}" if published_page is not None
+                else f"cm:followup_edit:{record_id}:{index}")
+        rows.append([InlineKeyboardButton("← Batch item" if record.get("batch_mode") else "← Extra message", callback_data=back)])
+        await self._edit_or_send(update, "<b>Message URL buttons</b>\nThese buttons appear directly below this message.", InlineKeyboardMarkup(rows), ParseMode.HTML)
 
     async def _start_followup_button_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                                           record_id: str, item_index: int,
-                                          button_index: int | None = None, field: str | None = None) -> None:
+                                          button_index: int | None = None, field: str | None = None,
+                                          published_page: int | None = None) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         items = list((record or {}).get("followups") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if not record or channel is None or record.get("status") not in allowed_status or not 0 <= item_index < len(items):
             await self._access_denied(update)
             return
         buttons = list(items[item_index].get("post_buttons") or [])
@@ -5054,36 +5133,42 @@ class ChannelManager:
             "followup_index": item_index, "expires_at": time.time() + self.INPUT_TTL_SECONDS,
             "prompt_chat_id": int(prompt_message.chat.id), "prompt_message_id": int(prompt_message.message_id),
         }
+        if published_page is not None:
+            state.update({"published_edit": True, "page": published_page})
         if button_index is not None:
             state["button_index"] = int(button_index)
         self._inputs[int(update.effective_user.id)] = state
         prompt = "Send the button label (up to 40 characters)." if adding or field == "text" else "Send its link, starting with https:// or http://."
         await self._edit_or_send(update, prompt, InlineKeyboardMarkup([[
-            InlineKeyboardButton("Cancel", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")
+            InlineKeyboardButton("Cancel", callback_data=(f"cm:pub_comp_buttons:{record_id}:{item_index}:{published_page}" if published_page is not None else f"cm:followup_buttons:{record_id}:{item_index}"))
         ]]))
 
     async def _show_followup_button_item(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                         record_id: str, item_index: int, button_index: int) -> None:
+                                         record_id: str, item_index: int, button_index: int,
+                                         published_page: int | None = None) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         items = list((record or {}).get("followups") or [])
         buttons = list(items[item_index].get("post_buttons") or []) if 0 <= item_index < len(items) else []
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= button_index < len(buttons):
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if not record or channel is None or record.get("status") not in allowed_status or not 0 <= button_index < len(buttons):
             await self._access_denied(update)
             return
         button = buttons[button_index]
         rows = [
-            [InlineKeyboardButton("Edit label", callback_data=f"cm:followup_button_label:{record_id}:{item_index}:{button_index}")],
-            [InlineKeyboardButton("Change link", callback_data=f"cm:followup_button_url:{record_id}:{item_index}:{button_index}")],
-            [InlineKeyboardButton("Remove button", callback_data=f"cm:followup_button_remove:{record_id}:{item_index}:{button_index}")],
-            [InlineKeyboardButton("← All buttons", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")],
+            [InlineKeyboardButton("Edit label", callback_data=f"cm:followup_button_label:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
+            [InlineKeyboardButton("Change link", callback_data=f"cm:followup_button_url:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
+            [InlineKeyboardButton("Remove button", callback_data=f"cm:followup_button_remove:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
+            [InlineKeyboardButton("← All buttons", callback_data=f"cm:pub_comp_buttons:{record_id}:{item_index}:{published_page}" if published_page is not None else f"cm:followup_buttons:{record_id}:{item_index}")],
         ]
         await self._edit_or_send(update, f"<b>{html_escape(str(button.get('text') or 'Link'))}</b>\n{html_escape(str(button.get('url') or ''))}", InlineKeyboardMarkup(rows), ParseMode.HTML)
 
     async def _remove_followup_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                     record_id: str, item_index: int, button_index: int) -> None:
+                                     record_id: str, item_index: int, button_index: int,
+                                     published_page: int | None = None) -> None:
         record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
         items = list((record or {}).get("followups") or [])
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+        allowed_status = {"draft", "published"} if published_page is not None else {"draft"}
+        if not record or channel is None or record.get("status") not in allowed_status or not 0 <= item_index < len(items):
             await self._access_denied(update)
             return
         buttons = list(items[item_index].get("post_buttons") or [])
@@ -5093,15 +5178,33 @@ class ChannelManager:
         buttons.pop(button_index)
         items[item_index]["post_buttons"] = buttons
         repository = self._get_repository()
+        if published_page is not None:
+            component = next((part for part in self._published_components(record)
+                              if part.get("kind") == "extra" and part.get("source_index") == item_index), None)
+            try:
+                if not component:
+                    raise ValueError("published batch item message was not found")
+                await context.bot.edit_message_reply_markup(
+                    chat_id=int(record["channel_id"]), message_id=int(component["message_id"]),
+                    reply_markup=self._post_keyboard(items[item_index]),
+                )
+            except Exception as exc:
+                logger.warning("[channel-manager] published batch button removal failed channel_id=%s post_id=%s item=%s error=%s", record["channel_id"], record_id, item_index, type(exc).__name__)
+                await self._edit_or_send(update, "I couldn’t change that item’s buttons in the channel. Nothing was saved.", None)
+                return
         try:
             saved = await asyncio.to_thread(repository.update, record_id, {"followups": items}) if repository else False
         except Exception as exc:
             logger.warning("[channel-manager] extra message button removal failed channel_id=%s post_id=%s error=%s", record["channel_id"], record_id, type(exc).__name__)
             saved = False
         if not saved:
-            await self._storage_error(update)
+            await self._edit_or_send(update, "The channel buttons changed, but Annie couldn’t save the updated details. Please refresh the item before making more changes.", None) if published_page is not None else await self._storage_error(update)
             return
-        await self._preview(update, context, record_id)
+        if published_page is not None:
+            await self._mirror_edit_to_backups(context.bot, int(record["channel_id"]), int(component["message_id"]), items[item_index], preserve_reply_markup=True)
+            await self._show_followup_buttons(update, context, record_id, item_index, published_page)
+        else:
+            await self._preview(update, context, record_id)
 
     async def _process_followup_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                                       state: dict[str, Any]) -> None:
@@ -5111,7 +5214,8 @@ class ChannelManager:
         record, channel = await self._record_for_user(record_id, user_id, context.bot)
         items = list((record or {}).get("followups") or [])
         item_index = int(state.get("followup_index", -1))
-        if not record or channel is None or record.get("status") != "draft" or not 0 <= item_index < len(items):
+        expected_status = "published" if state.get("published_edit") else "draft"
+        if not record or channel is None or record.get("status") != expected_status or not 0 <= item_index < len(items):
             self._inputs.pop(user_id, None)
             await message.reply_text("That draft item is no longer available.")
             return
@@ -5141,7 +5245,7 @@ class ChannelManager:
                 prompt = await message.reply_text(
                     "Now send the full link, starting with https:// or http://.",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("Cancel", callback_data=f"cm:followup_buttons:{record_id}:{item_index}")
+                        InlineKeyboardButton("Cancel", callback_data=(f"cm:pub_comp_buttons:{record_id}:{item_index}:{state.get('page', 0)}" if state.get("published_edit") else f"cm:followup_buttons:{record_id}:{item_index}"))
                     ]]),
                 )
                 await self._clear_input_prompt(context, state)
@@ -5221,6 +5325,24 @@ class ChannelManager:
                     item.update({"text": text_value, "caption": "", "entities": list(content.get("entities") or []),
                                  "media": None, "source_message": None})
         items[item_index] = item
+        published_component = None
+        if state.get("published_edit") and kind in {
+            "followup_button_url", "followup_button_edit_label", "followup_button_edit_url"
+        }:
+            published_component = next((part for part in self._published_components(record)
+                                         if part.get("kind") == "extra" and part.get("source_index") == item_index), None)
+            try:
+                if not published_component:
+                    raise ValueError("published batch item message was not found")
+                await context.bot.edit_message_reply_markup(
+                    chat_id=int(record["channel_id"]),
+                    message_id=int(published_component["message_id"]),
+                    reply_markup=self._post_keyboard(item),
+                )
+            except Exception as exc:
+                logger.warning("[channel-manager] published batch button edit failed channel_id=%s post_id=%s item=%s error=%s", record["channel_id"], record_id, item_index, type(exc).__name__)
+                await message.reply_text("I couldn’t update those buttons in the channel. Annie kept the saved version.")
+                return
         try:
             saved = await asyncio.to_thread(repository.update, record_id, {"followups": items})
         except Exception as exc:
@@ -5229,7 +5351,7 @@ class ChannelManager:
         if not saved:
             if preserved_source:
                 await self._delete_message(context.bot, preserved_source["chat_id"], preserved_source["message_id"])
-            await message.reply_text("I couldn’t save that change. The extra message is unchanged; please try again.")
+            await message.reply_text("I couldn’t save that change. The extra message is unchanged; please try again." if not published_component else "The channel buttons changed, but Annie couldn’t save their details. Refresh the item before making more changes.")
             return
         old_source = (record.get("followups") or [])[item_index].get("source_message") or {}
         new_source = item.get("source_message") or {}
@@ -5239,7 +5361,14 @@ class ChannelManager:
         await self._delete_message(context.bot, message.chat.id, message.message_id)
         await self._clear_input_prompt(context, state)
         logger.info("[channel-manager] extra message updated channel_id=%s user_id=%s post_id=%s index=%s action=%s", record["channel_id"], user_id, record_id, item_index, kind)
-        await self._preview(update, context, record_id)
+        if published_component:
+            await self._mirror_edit_to_backups(
+                context.bot, int(record["channel_id"]), int(published_component["message_id"]),
+                item, preserve_reply_markup=True,
+            )
+            await self._show_followup_buttons(update, context, record_id, item_index, int(state.get("page", 0)))
+        else:
+            await self._preview(update, context, record_id)
 
     async def _remove_followup(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -5655,7 +5784,7 @@ class ChannelManager:
         )])
         if record.get("followups"):
             rows.append([InlineKeyboardButton(
-                f"Edit extra content ({len(record['followups'])})",
+                f"Edit {'batch items' if record.get('batch_mode') else 'extra content'} ({len(record['followups'])})",
                 callback_data=f"cm:followups:{record_id}",
             )])
         rows.append([InlineKeyboardButton("Replace entire post", callback_data=f"cm:edit_replace:{record_id}")])
@@ -5789,7 +5918,7 @@ class ChannelManager:
         """Fields that make a reusable, potentially multi-message post template."""
         keys = (
             "text", "caption", "entities", "format_mode", "media",
-            "post_buttons", "followups",
+            "post_buttons", "followups", "batch_mode",
         )
         return {key: record[key] for key in keys if key in record}
 
@@ -6878,6 +7007,7 @@ class ChannelManager:
                     **record, "published_message_ids": sent_ids,
                     "marginal_snapshot": settings,
                 }),
+                "batch_main_message_ids": self._batch_main_message_ids(record, sent_ids, settings),
                 "published_message_ids": sent_ids, "last_error": None,
                 "marginal_snapshot": settings,
                 "publishing_at": None,
@@ -7130,6 +7260,7 @@ class ChannelManager:
                         **record, "published_message_ids": sent_ids,
                         "marginal_snapshot": settings,
                     }),
+                    "batch_main_message_ids": self._batch_main_message_ids(record, sent_ids, settings),
                     "published_message_ids": sent_ids, "last_error": None,
                     "marginal_snapshot": settings,
                 })

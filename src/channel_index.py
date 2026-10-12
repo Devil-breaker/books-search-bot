@@ -41,6 +41,16 @@ class MongoChannelIndexRepository:
             {"_id": 1},
         ) is not None:
             return True
+        if self.channel_manager_records.find_one(
+            {
+                "channel_id": int(channel_id),
+                "batch_main_message_ids": int(message_id),
+                "kind": "post",
+                "status": "published",
+            },
+            {"_id": 1},
+        ) is not None:
+            return True
         clone = self.channel_manager_clone_messages.find_one(
             {
                 "destination_channel_id": int(channel_id),
@@ -50,10 +60,22 @@ class MongoChannelIndexRepository:
         )
         if not clone:
             return False
+        source_channel_id = int(clone.get("source_channel_id", 0))
+        source_message_id = int(clone.get("source_message_id", 0))
+        if self.channel_manager_records.find_one(
+            {
+                "channel_id": source_channel_id,
+                "published_main_message_id": source_message_id,
+                "kind": "post",
+                "status": "published",
+            },
+            {"_id": 1},
+        ) is not None:
+            return True
         return self.channel_manager_records.find_one(
             {
-                "channel_id": int(clone.get("source_channel_id", 0)),
-                "published_main_message_id": int(clone.get("source_message_id", 0)),
+                "channel_id": source_channel_id,
+                "batch_main_message_ids": source_message_id,
                 "kind": "post",
                 "status": "published",
             },
