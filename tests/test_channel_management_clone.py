@@ -14,9 +14,14 @@ class CloneRepository:
         self.deleted = []
         self.index_config = None
         self.saved_index_config = None
+        self.saved_posts = []
 
     def list_published_records_for_clone(self, source_id):
         return self.records
+
+    @staticmethod
+    def clone_pair_id(source_id, destination_id):
+        return f"{int(source_id)}:{int(destination_id)}"
 
     def list_clone_mappings(self, source_id, destination_id, ids):
         return [item for item in self.mappings if item["source_message_id"] in ids]
@@ -31,6 +36,11 @@ class CloneRepository:
 
     def save_cloned_index_config(self, channel_id, fields):
         self.saved_index_config = (channel_id, fields)
+
+    def save_cloned_published_record(self, source_record, pair_id, destination_channel_id,
+                                     destination_message_ids, destination_main_message_id):
+        self.saved_posts.append((source_record, pair_id, destination_channel_id,
+                                 destination_message_ids, destination_main_message_id))
 
     def update(self, record_id, changes):
         self.updated = (record_id, changes)
@@ -162,6 +172,27 @@ class TestChannelManagerCloning(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["targets"][0]["message_id"], 901)
         self.assertEqual(config["entries"][0]["source_message_id"], 900)
         self.assertEqual(config["entries"][0]["target_message_id"], 901)
+
+    async def test_cloned_posts_get_destination_published_records(self):
+        manager = self.make_manager()
+        repository = CloneRepository()
+        repository.mappings = [
+            {"source_message_id": 10, "destination_message_id": 900},
+            {"source_message_id": 11, "destination_message_id": 901},
+        ]
+        record = {
+            "_id": "source-record", "channel_id": -1001, "kind": "post", "status": "published",
+            "published_message_ids": [10, 11], "published_main_message_id": 10,
+            "text": "A cloned post", "post_buttons": [],
+        }
+
+        saved, incomplete = await manager._save_cloned_published_records(
+            repository, [record], -1001, -1002,
+        )
+
+        self.assertEqual((saved, incomplete), (1, 0))
+        self.assertEqual(len(repository.saved_posts), 1)
+        self.assertEqual(repository.saved_posts[0][2:], (-1002, [900, 901], 900))
 
 
 if __name__ == "__main__":

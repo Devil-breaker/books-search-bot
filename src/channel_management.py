@@ -165,6 +165,14 @@ class MongoChannelManagementRepository:
         self.records.create_index([("channel_id", 1), ("kind", 1), ("status", 1)])
         self.records.create_index([("status", 1), ("scheduled_at", 1)])
         self.records.create_index([("channel_id", 1), ("published_main_message_id", 1)])
+        self.records.create_index(
+            [("cloned_from_pair_id", 1), ("cloned_from_record_id", 1)],
+            unique=True,
+            partialFilterExpression={
+                "cloned_from_pair_id": {"$exists": True},
+                "cloned_from_record_id": {"$exists": True},
+            },
+        )
         self.approvals.create_index([("updated_at", -1)])
         self.marginals.create_index([("channel_id", 1)], unique=True)
         self.clone_pairs.create_index([("source_channel_id", 1), ("destination_channel_id", 1)], unique=True)
@@ -392,6 +400,93 @@ class MongoChannelManagementRepository:
                 {"published_message_id": {"$exists": True, "$ne": None}},
             ],
         }).sort([("published_at", 1), ("_id", 1)]))
+
+    def save_cloned_published_record(
+        self, source_record: dict[str, Any], pair_id: str,
+        destination_channel_id: int, destination_message_ids: list[int],
+        destination_main_message_id: int,
+    ) -> str:
+        """Create or refresh the destination-side Published posts record."""
+        source_record_id = str(source_record.get("_id") or "")
+        if not source_record_id or not destination_message_ids:
+            raise ValueError("source record ID and copied message IDs are required")
+        now = datetime.now(timezone.utc)
+        query = {
+            "channel_id": int(destination_channel_id), "kind": "post",
+            "cloned_from_pair_id": str(pair_id),
+            "cloned_from_record_id": source_record_id,
+        }
+        current_fields = {
+            "channel_id": int(destination_channel_id), "kind": "post", "status": "published",
+            "published_at": now, "published_message_id": int(destination_message_ids[0]),
+            "published_message_ids": [int(value) for value in destination_message_ids],
+            "published_main_message_id": int(destination_main_message_id),
+            "cloned_from_pair_id": str(pair_id), "cloned_from_record_id": source_record_id,
+            "updated_at": now,
+        }
+        insert_fields = {
+            key: value for key, value in source_record.items()
+            if key != "_id" and key not in current_fields
+        }
+        result = self.records.find_one_and_update(
+            query,
+            {"$set": current_fields, "$setOnInsert": insert_fields,
+             "$unset": {"deleted_at": "", "deleted_externally": ""}},
+            upsert=True, return_document=ReturnDocument.AFTER,
+        )
+        if not result:
+            raise RuntimeError("could not save the destination post record")
+        return str(result["_id"])
+
+    def update_cloned_published_content(
+        self, pair_id: str, source_record_id: str, source_record: dict[str, Any],
+    ) -> bool:
+        fields = {
+            key: source_record[key]
+            for key in ("name", "title", "text", "caption", "entities", "media",
+                        "post_buttons", "followups", "marginal_snapshot", "format_mode")
+            if key in source_record
+        }
+        if not fields:
+            return False
+        fields["updated_at"] = datetime.now(timezone.utc)
+        result = self.records.update_one(
+            {"cloned_from_pair_id": str(pair_id),
+             "cloned_from_record_id": str(source_record_id), "status": "published"},
+            {"$set": fields},
+        )
+        return result.matched_count > 0
+
+    def remove_cloned_published_message(
+        self, pair_id: str, source_record_id: str, destination_message_id: int,
+    ) -> bool:
+        query = {
+            "cloned_from_pair_id": str(pair_id),
+            "cloned_from_record_id": str(source_record_id),
+            "status": "published",
+        }
+        record = self.records.find_one(query)
+        if not record:
+            return False
+        message_ids = []
+        for value in record.get("published_message_ids") or []:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed != int(destination_message_id):
+                message_ids.append(parsed)
+        main_was_removed = int(record.get("published_main_message_id") or 0) == int(destination_message_id)
+        fields = {
+            "published_message_ids": message_ids,
+            "published_message_id": message_ids[0] if message_ids else None,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if main_was_removed or not message_ids:
+            fields.update({"status": "deleted", "published_main_message_id": None,
+                           "deleted_at": datetime.now(timezone.utc)})
+        result = self.records.update_one(query, {"$set": fields})
+        return result.matched_count > 0
 
     def get_index_config(self, channel_id: int) -> dict[str, Any] | None:
         return self.index_configs.find_one({"_id": int(channel_id)})
@@ -1882,6 +1977,13 @@ class ChannelManager:
             result_text += f" {already_copied} were already there."
         if skipped:
             result_text += f" {skipped} couldn’t be copied; check Annie’s channel access and the log."
+        saved_records, incomplete_records = await self._save_cloned_published_records(
+            repository, records, source_channel_id, destination_channel_id,
+        )
+        if saved_records:
+            result_text += f" {saved_records} cloned post{'s are' if saved_records != 1 else ' is'} now available under Destination → Published posts."
+        if incomplete_records:
+            result_text += f" {incomplete_records} incomplete post{'s were' if incomplete_records != 1 else ' was'} not added to Published posts yet; run Clone missing posts after resolving copy errors."
         index_result = await self._clone_index_configuration(
             context.bot, repository, source_channel_id, destination_channel_id,
         )
@@ -1902,6 +2004,54 @@ class ChannelManager:
             update, result_text,
             InlineKeyboardMarkup([[InlineKeyboardButton("← Cloning", callback_data=f"cm:cloning:{source_channel_id}")]]),
         )
+
+    async def _save_cloned_published_records(
+        self, repository: MongoChannelManagementRepository, records: list[dict[str, Any]],
+        source_channel_id: int, destination_channel_id: int,
+    ) -> tuple[int, int]:
+        saved = incomplete = 0
+        pair_id = repository.clone_pair_id(source_channel_id, destination_channel_id)
+        for source_record in records:
+            source_ids = self._clone_message_ids(source_record)
+            source_main_id = self._published_main_message_id(source_record)
+            if not source_ids or source_main_id not in source_ids:
+                incomplete += 1
+                logger.warning(
+                    "[channel-manager] cloned post record missing message IDs source=%s destination=%s record_id=%s",
+                    source_channel_id, destination_channel_id, source_record.get("_id"),
+                )
+                continue
+            try:
+                mappings = await asyncio.to_thread(
+                    repository.list_clone_mappings, source_channel_id,
+                    destination_channel_id, source_ids,
+                )
+                message_map = {
+                    int(item["source_message_id"]): int(item["destination_message_id"])
+                    for item in mappings
+                }
+                if any(message_id not in message_map for message_id in source_ids):
+                    incomplete += 1
+                    logger.info(
+                        "[channel-manager] cloned post not yet manageable source=%s destination=%s record_id=%s mapped=%s total=%s",
+                        source_channel_id, destination_channel_id, source_record.get("_id"),
+                        len(message_map), len(source_ids),
+                    )
+                    continue
+                await asyncio.to_thread(
+                    repository.save_cloned_published_record, source_record, pair_id,
+                    destination_channel_id,
+                    [message_map[message_id] for message_id in source_ids],
+                    message_map[source_main_id],
+                )
+                saved += 1
+            except Exception as exc:
+                incomplete += 1
+                logger.warning(
+                    "[channel-manager] cloned post record save failed source=%s destination=%s record_id=%s error=%s",
+                    source_channel_id, destination_channel_id, source_record.get("_id"), type(exc).__name__,
+                )
+        return saved, incomplete
 
     async def _clone_index_configuration(
         self, bot: Any, repository: MongoChannelManagementRepository,
@@ -2084,6 +2234,39 @@ class ChannelManager:
                 except Exception as exc:
                     failed += 1
                     logger.warning("[channel-manager] autoforward message failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
+            try:
+                mappings = await asyncio.to_thread(
+                    repository.list_clone_mappings, source_channel_id, destination_id, source_ids,
+                )
+                message_map = {
+                    int(item["source_message_id"]): int(item["destination_message_id"])
+                    for item in mappings
+                }
+                main_source_id = self._published_main_message_id({
+                    **record, "published_message_ids": source_ids,
+                })
+                if (source_ids and main_source_id in message_map
+                        and all(message_id in message_map for message_id in source_ids)):
+                    await asyncio.to_thread(
+                        repository.save_cloned_published_record,
+                        {**record, "published_message_ids": source_ids},
+                        repository.clone_pair_id(source_channel_id, destination_id),
+                        destination_id,
+                        [message_map[message_id] for message_id in source_ids],
+                        message_map[main_source_id],
+                    )
+                else:
+                    failed += 1
+                    logger.warning(
+                        "[channel-manager] autoforward post record incomplete source=%s destination=%s mapped=%s total=%s",
+                        source_channel_id, destination_id, len(message_map), len(source_ids),
+                    )
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "[channel-manager] autoforward destination record failed source=%s destination=%s record_id=%s error=%s",
+                    source_channel_id, destination_id, record.get("_id"), type(exc).__name__,
+                )
         return failed
 
     async def _mirror_edit_to_backups(
@@ -2136,6 +2319,13 @@ class ChannelManager:
                 else:
                     caption_options = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
                     await bot.edit_message_caption(chat_id=destination_id, message_id=backup_id, caption=send_kwargs.get("caption") or "", **caption_options, **options)
+                source_record_id = str(mapping.get("record_id") or updated_record.get("_id") or "")
+                if source_record_id:
+                    await asyncio.to_thread(
+                        repository.update_cloned_published_content,
+                        repository.clone_pair_id(source_channel_id, destination_id),
+                        source_record_id, updated_record,
+                    )
             except BadRequest as exc:
                 if "message is not modified" not in str(exc).casefold():
                     logger.warning("[channel-manager] backup edit failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
@@ -2160,7 +2350,21 @@ class ChannelManager:
                     mapping = await asyncio.to_thread(repository.get_clone_message, source_channel_id, destination_id, source_message_id)
                     if not mapping:
                         continue
-                    await bot.delete_message(chat_id=destination_id, message_id=int(mapping["destination_message_id"]))
+                    destination_message_id = int(mapping["destination_message_id"])
+                    await bot.delete_message(chat_id=destination_id, message_id=destination_message_id)
+                    source_record_id = str(mapping.get("record_id") or "")
+                    if source_record_id:
+                        try:
+                            await asyncio.to_thread(
+                                repository.remove_cloned_published_message,
+                                repository.clone_pair_id(source_channel_id, destination_id),
+                                source_record_id, destination_message_id,
+                            )
+                        except Exception as record_exc:
+                            logger.warning(
+                                "[channel-manager] backup published record cleanup failed source=%s destination=%s message_id=%s error=%s",
+                                source_channel_id, destination_id, source_message_id, type(record_exc).__name__,
+                            )
                     await asyncio.to_thread(repository.delete_clone_message, source_channel_id, destination_id, source_message_id)
                 except Exception as exc:
                     logger.warning("[channel-manager] backup delete failed source=%s destination=%s message_id=%s error=%s", source_channel_id, destination_id, source_message_id, type(exc).__name__)
