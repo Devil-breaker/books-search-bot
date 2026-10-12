@@ -2172,10 +2172,22 @@ class ChannelManager:
                 )
                 if len(rendered.encode("utf-16-le")) // 2 > ChannelIndexRuntime.MAX_INDEX_TEXT:
                     raise ValueError("translated Index placeholder exceeds Telegram’s message limit")
-                await bot.edit_message_text(
-                    chat_id=int(destination_channel_id), message_id=target_id,
-                    text=rendered, parse_mode="HTML", disable_web_page_preview=True,
-                )
+                try:
+                    await bot.edit_message_text(
+                        chat_id=int(destination_channel_id), message_id=target_id,
+                        text=rendered, parse_mode="HTML", disable_web_page_preview=True,
+                    )
+                except BadRequest as exc:
+                    # A prior clone attempt may already have rewritten this
+                    # placeholder before failing on a later one. Telegram
+                    # reports an identical retry as BadRequest, but the target
+                    # is already correct and config migration should continue.
+                    if "message is not modified" not in str(exc).casefold():
+                        raise
+                    logger.info(
+                        "[channel-manager] cloned Index placeholder already current destination=%s message_id=%s",
+                        destination_channel_id, target_id,
+                    )
 
             config_fields = {
                 key: value for key, value in source_config.items()

@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from telegram.error import BadRequest
+
 from src.channel_management import ChannelManager
 
 
@@ -172,6 +174,26 @@ class TestChannelManagerCloning(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["targets"][0]["message_id"], 901)
         self.assertEqual(config["entries"][0]["source_message_id"], 900)
         self.assertEqual(config["entries"][0]["target_message_id"], 901)
+
+    async def test_cloned_index_retry_accepts_already_updated_placeholder(self):
+        manager = self.make_manager()
+        repository = CloneRepository()
+        repository.index_config = {
+            "_id": -1001, "enabled": True, "sort_order": "added",
+            "targets": [{"message_id": 50, "base_html": "Books"}],
+            "entries": [], "pending_posts": [],
+        }
+        repository.mappings = [
+            {"source_message_id": 50, "destination_message_id": 901},
+        ]
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(side_effect=BadRequest("Message is not modified")),
+        )
+
+        result = await manager._clone_index_configuration(bot, repository, -1001, -1002)
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(repository.saved_index_config[0], -1002)
 
     async def test_cloned_posts_get_destination_published_records(self):
         manager = self.make_manager()
