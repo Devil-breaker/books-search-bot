@@ -4367,8 +4367,9 @@ class ChannelManager:
                 is_published = len(parts) > 4 and parts[4] == "published"
                 await self._start_followup_button_input(update, context, parts[2], int(parts[3]), published_page=int(parts[5]) if is_published else None)
                 return
-            if action == "followup_button_item":
-                is_published = len(parts) > 5 and parts[5] == "published"
+            if action in {"followup_button_item", "fbi"}:
+                published_markers = {"published", "p"}
+                is_published = len(parts) > 5 and parts[5] in published_markers
                 await self._show_followup_button_item(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
             if action == "followup_button_label":
@@ -4383,12 +4384,12 @@ class ChannelManager:
                 is_published = len(parts) > 5 and parts[5] == "published"
                 await self._remove_followup_button(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
-            if action == "followup_button_style":
-                is_published = len(parts) > 5 and parts[5] == "published"
+            if action in {"followup_button_style", "fbs"}:
+                is_published = len(parts) > 5 and parts[5] in {"published", "p"}
                 await self._show_followup_button_style(update, context, parts[2], int(parts[3]), int(parts[4]), int(parts[6]) if is_published else None)
                 return
-            if action == "followup_button_set_style":
-                is_published = len(parts) > 6 and parts[6] == "published"
+            if action in {"followup_button_set_style", "fbv"}:
+                is_published = len(parts) > 6 and parts[6] in {"published", "p"}
                 await self._set_followup_button_style(update, context, parts[2], int(parts[3]), int(parts[4]), parts[5], int(parts[7]) if is_published else None)
                 return
             if action == "followup_done":
@@ -5191,7 +5192,7 @@ class ChannelManager:
         rows = [
             [InlineKeyboardButton("Edit label", callback_data=f"cm:followup_button_label:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("Change link", callback_data=f"cm:followup_button_url:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
-            [InlineKeyboardButton("Button color", callback_data=f"cm:followup_button_style:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
+            [InlineKeyboardButton("Button color", callback_data=f"cm:fbs:{record_id}:{item_index}:{button_index}" + (f":p:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("Remove button", callback_data=f"cm:followup_button_remove:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""))],
             [InlineKeyboardButton("← All buttons", callback_data=f"cm:pub_comp_buttons:{record_id}:{item_index}:{published_page}" if published_page is not None else f"cm:followup_buttons:{record_id}:{item_index}")],
         ]
@@ -5213,11 +5214,11 @@ class ChannelManager:
         choices = [("default", "Default"), ("primary", "Blue"), ("success", "Green"), ("danger", "Red")]
         rows = [[InlineKeyboardButton(
             f"{'✓ ' if style == value else ''}{label}",
-            callback_data=f"cm:followup_button_set_style:{record_id}:{item_index}:{button_index}:{value}" + (f":published:{published_page}" if published_page is not None else ""),
+            callback_data=f"cm:fbv:{record_id}:{item_index}:{button_index}:{value}" + (f":p:{published_page}" if published_page is not None else ""),
         )] for value, label in choices]
         rows.append([InlineKeyboardButton(
             "← Button options",
-            callback_data=f"cm:followup_button_item:{record_id}:{item_index}:{button_index}" + (f":published:{published_page}" if published_page is not None else ""),
+            callback_data=f"cm:fbi:{record_id}:{item_index}:{button_index}" + (f":p:{published_page}" if published_page is not None else ""),
         )])
         await self._edit_or_send(
             update, "<b>URL button color</b>\nChoose a Telegram preset. Colors may vary by Telegram app and theme.",
