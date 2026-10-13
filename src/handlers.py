@@ -4472,7 +4472,10 @@ Save books to My Books or move favourites into their own list. Search, sort, and
                 # for the book description.
                 groups.append("\n".join(metadata))
             if description:
-                groups.append(f"📄 <b>Summary</b>\n\n{html_escape(description)}")
+                groups.append(
+                    f"📄 <b>Summary</b>\n\n"
+                    f"<blockquote expandable>{html_escape(description)}</blockquote>"
+                )
             groups.append("\n".join(footer))
             return "\n\n".join(groups)
 
