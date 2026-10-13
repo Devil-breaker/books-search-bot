@@ -30,27 +30,40 @@ class MongoChannelIndexRepository:
         self.channel_manager_clone_messages = self.client[database_name]["bot_channel_manager_clone_messages"]
 
     def is_channel_manager_main_post(self, channel_id: int, message_id: int) -> bool:
-        """Allow saved Channel Manager mains, including their cloned copies."""
+        """Return whether a message is a saved post main, including clones."""
+        query = {
+            "channel_id": int(channel_id),
+            "kind": "post",
+            "status": "published",
+            "$or": [
+                {"published_main_message_id": int(message_id)},
+                {"batch_main_message_ids": int(message_id)},
+            ],
+        }
         if self.channel_manager_records.find_one(
-            {
-                "channel_id": int(channel_id),
-                "published_main_message_id": int(message_id),
-                "kind": "post",
-                "status": "published",
-            },
+            query,
             {"_id": 1},
         ) is not None:
             return True
-        if self.channel_manager_records.find_one(
-            {
-                "channel_id": int(channel_id),
-                "batch_main_message_ids": int(message_id),
-                "kind": "post",
-                "status": "published",
-            },
-            {"_id": 1},
-        ) is not None:
+        return self._is_cloned_channel_manager_message(channel_id, message_id, main_only=True)
+
+    def is_channel_manager_message(self, channel_id: int, message_id: int) -> bool:
+        """Return whether any saved Channel Manager post component has this ID."""
+        query = {
+            "channel_id": int(channel_id), "kind": "post", "status": "published",
+            "$or": [
+                {"published_main_message_id": int(message_id)},
+                {"batch_main_message_ids": int(message_id)},
+                {"published_message_ids": int(message_id)},
+            ],
+        }
+        if self.channel_manager_records.find_one(query, {"_id": 1}) is not None:
             return True
+        return self._is_cloned_channel_manager_message(channel_id, message_id, main_only=False)
+
+    def _is_cloned_channel_manager_message(
+        self, channel_id: int, message_id: int, *, main_only: bool,
+    ) -> bool:
         clone = self.channel_manager_clone_messages.find_one(
             {
                 "destination_channel_id": int(channel_id),
@@ -62,25 +75,18 @@ class MongoChannelIndexRepository:
             return False
         source_channel_id = int(clone.get("source_channel_id", 0))
         source_message_id = int(clone.get("source_message_id", 0))
-        if self.channel_manager_records.find_one(
-            {
-                "channel_id": source_channel_id,
-                "published_main_message_id": source_message_id,
-                "kind": "post",
-                "status": "published",
-            },
-            {"_id": 1},
-        ) is not None:
-            return True
-        return self.channel_manager_records.find_one(
-            {
-                "channel_id": source_channel_id,
-                "batch_main_message_ids": source_message_id,
-                "kind": "post",
-                "status": "published",
-            },
-            {"_id": 1},
-        ) is not None
+        query = {
+            "channel_id": source_channel_id, "kind": "post", "status": "published",
+            "$or": [
+                {"published_main_message_id": source_message_id},
+                {"batch_main_message_ids": source_message_id},
+            ] if main_only else [
+                {"published_main_message_id": source_message_id},
+                {"batch_main_message_ids": source_message_id},
+                {"published_message_ids": source_message_id},
+            ],
+        }
+        return self.channel_manager_records.find_one(query, {"_id": 1}) is not None
 
     def get(self, channel_id: int) -> dict[str, Any] | None:
         return self.configs.find_one({"_id": int(channel_id)})
@@ -385,6 +391,31 @@ class ChannelIndexRuntime:
                 removed_entries += 1
                 removed_entry_records.append(entry)
                 continue
+            # Older releases could index a separately sent header/footer as
+            # though it were a book. Clean those saved links during normal
+            # reconciliation while preserving Annie's actual main posts.
+            try:
+                source_sender_id = int(getattr(source, "sender_id", 0) or 0)
+            except (TypeError, ValueError):
+                source_sender_id = 0
+            if source_sender_id and source_sender_id in {self.bot_user_id, channel_id}:
+                try:
+                    is_managed_message = await asyncio.to_thread(
+                        self.repository.is_channel_manager_message, channel_id, source_id,
+                    )
+                    is_managed_main = is_managed_message and await asyncio.to_thread(
+                        self.repository.is_channel_manager_main_post, channel_id, source_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[channel-index] Channel Manager saved-entry check failed channel_id=%s post_id=%s error=%s",
+                        channel_id, source_id, type(exc).__name__,
+                    )
+                    return False
+                if is_managed_message and not is_managed_main:
+                    removed_entries += 1
+                    removed_entry_records.append(entry)
+                    continue
             # If the placeholder still exists, its live link entities tell us
             # whether an admin removed this entry manually while Annie was off.
             if target is not None and not isinstance(target, MessageEmpty):
@@ -848,11 +879,36 @@ class ChannelIndexRuntime:
                 sender_is_bot = bool(pending_item.get("sender_is_bot")) or (
                     sender_id is not None and int(sender_id) == self.bot_user_id
                 )
-                if sender_is_bot:
-                    is_managed_main_post = await asyncio.to_thread(
-                        self.repository.is_channel_manager_main_post,
+                sender_is_channel = sender_id is not None and int(sender_id) == channel_id
+                is_managed_main_post = False
+                is_managed_message = False
+                try:
+                    if sender_is_bot or sender_is_channel or sender_id is None:
+                        is_managed_message = await asyncio.to_thread(
+                            self.repository.is_channel_manager_message, channel_id, post_id,
+                        )
+                    if sender_is_bot or sender_is_channel or is_managed_message:
+                        is_managed_main_post = await asyncio.to_thread(
+                            self.repository.is_channel_manager_main_post,
+                            channel_id, post_id,
+                        )
+                except Exception as exc:
+                    from src.utils import logger
+                    logger.warning(
+                        "[channel-index] Channel Manager post check failed channel_id=%s post_id=%s error=%s",
+                        channel_id, post_id, type(exc).__name__,
+                    )
+                    await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+                    return
+                if is_managed_message and not is_managed_main_post:
+                    await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
+                    from src.utils import logger
+                    logger.info(
+                        "[channel-index] skipped Channel Manager auxiliary message channel_id=%s post_id=%s",
                         channel_id, post_id,
                     )
+                    return
+                if sender_is_bot:
                     if not is_managed_main_post:
                         await asyncio.to_thread(self.repository.remove_pending, channel_id, post_id)
                         from src.utils import logger

@@ -247,9 +247,35 @@ class MongoChannelManagementRepository:
             upsert=True,
         )
 
-    def add_marginal_button(self, channel_id: int, field: str, button: dict[str, Any]) -> None:
+    def _migrate_marginal_buttons(self, settings: dict[str, Any], field: str) -> list[dict[str, Any]]:
+        """Move legacy section-wide buttons onto the final item for editing."""
+        items = [dict(item) for item in settings.get(f"{field}_items") or []]
+        legacy = list(settings.get(f"{field}_buttons") or [])
+        if items and legacy:
+            last = dict(items[-1])
+            last["post_buttons"] = [*(last.get("post_buttons") or []), *legacy]
+            items[-1] = last
+        return items
+
+    def add_marginal_button(
+        self, channel_id: int, field: str, button: dict[str, Any], item_index: int | None = None,
+    ) -> bool:
         if field not in {"header", "footer"}:
             raise ValueError("Invalid marginal field")
+        if item_index is not None:
+            settings = self.get_marginals(channel_id)
+            items = self._migrate_marginal_buttons(settings, field)
+            if not 0 <= item_index < len(items):
+                return False
+            buttons = list(items[item_index].get("post_buttons") or [])
+            if len(buttons) >= 8:
+                return False
+            buttons.append(dict(button))
+            items[item_index]["post_buttons"] = buttons
+            self.update_marginals(channel_id, {
+                f"{field}_items": items, f"{field}_buttons": [],
+            })
+            return True
         now = datetime.now(timezone.utc)
         self.marginals.update_one(
             {"channel_id": int(channel_id)},
@@ -257,6 +283,7 @@ class MongoChannelManagementRepository:
              "$setOnInsert": {"channel_id": int(channel_id)}},
             upsert=True,
         )
+        return True
 
     def remove_marginal_item(self, channel_id: int, field: str, index: int) -> bool:
         settings = self.get_marginals(channel_id)
@@ -271,14 +298,43 @@ class MongoChannelManagementRepository:
         self.update_marginals(channel_id, cleared)
         return True
 
-    def remove_marginal_button(self, channel_id: int, field: str, index: int) -> bool:
+    def remove_marginal_button(
+        self, channel_id: int, field: str, index: int, item_index: int | None = None,
+    ) -> bool:
+        if field not in {"header", "footer"}:
+            return False
         settings = self.get_marginals(channel_id)
+        if item_index is not None:
+            items = self._migrate_marginal_buttons(settings, field)
+            if not 0 <= item_index < len(items):
+                return False
+            buttons = list(items[item_index].get("post_buttons") or [])
+            if not 0 <= index < len(buttons):
+                return False
+            del buttons[index]
+            items[item_index]["post_buttons"] = buttons
+            self.update_marginals(channel_id, {
+                f"{field}_items": items, f"{field}_buttons": [],
+            })
+            return True
         key = f"{field}_buttons"
         buttons = list(settings.get(key) or [])
         if field not in {"header", "footer"} or not 0 <= index < len(buttons):
             return False
         del buttons[index]
         self.update_marginals(channel_id, {key: buttons})
+        return True
+
+    def move_marginal_item(self, channel_id: int, field: str, index: int, direction: int) -> bool:
+        if field not in {"header", "footer"} or direction not in {-1, 1}:
+            return False
+        settings = self.get_marginals(channel_id)
+        items = list(settings.get(f"{field}_items") or [])
+        target = index + direction
+        if not 0 <= index < len(items) or not 0 <= target < len(items):
+            return False
+        items[index], items[target] = items[target], items[index]
+        self.update_marginals(channel_id, {f"{field}_items": items})
         return True
 
     def create(self, document: dict[str, Any]) -> str:
@@ -444,7 +500,7 @@ class MongoChannelManagementRepository:
         fields = {
             key: source_record[key]
             for key in ("name", "title", "text", "caption", "entities", "media",
-                        "post_buttons", "followups", "marginal_snapshot", "format_mode")
+                        "post_buttons", "followups", "marginal_snapshot", "marginal_placements", "format_mode")
             if key in source_record
         }
         if not fields:
@@ -1240,6 +1296,11 @@ class ChannelManager:
                     f"Batch items ({len(record['followups'])})" if record.get("batch_mode") else f"Extra content ({len(record['followups'])})",
                     callback_data=f"cm:followups:{record['_id']}",
                 )])
+            if record.get("batch_mode"):
+                rows.append([InlineKeyboardButton(
+                    "Header / Footer placement",
+                    callback_data=f"cm:batch_margins:{record['_id']}",
+                )])
             rows.append([
                 InlineKeyboardButton("Discard", callback_data=f"cm:delete:{record['_id']}")
             ])
@@ -1247,6 +1308,120 @@ class ChannelManager:
         else:
             kwargs["reply_markup"] = ChannelManager._post_keyboard(record)
         return kwargs
+
+    @staticmethod
+    def _batch_marginal_placements(
+        record: dict[str, Any], settings: dict[str, Any], item_count: int,
+    ) -> dict[str, list[int]]:
+        saved = record.get("marginal_placements")
+        if isinstance(saved, dict):
+            result: dict[str, list[int]] = {}
+            for field in ("header", "footer"):
+                values = saved.get(field) or []
+                result[field] = sorted({
+                    int(value) for value in values
+                    if str(value).lstrip("-").isdigit() and 0 <= int(value) < item_count
+                })
+            return result
+        media_type = str((record.get("media") or {}).get("type") or "text")
+        if media_type not in set(settings.get("types") or []):
+            return {"header": [], "footer": []}
+        return {
+            "header": [0] if item_count and settings.get("header_items") else [],
+            "footer": [item_count - 1] if item_count and settings.get("footer_items") else [],
+        }
+
+    async def _show_batch_margins(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft" or not record.get("batch_mode"):
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        settings = record.get("marginal_snapshot")
+        if not isinstance(settings, dict):
+            try:
+                settings = await asyncio.to_thread(repository.get_marginals, int(record["channel_id"])) if repository else {}
+            except Exception as exc:
+                logger.warning("[channel-manager] batch margin settings load failed channel_id=%s post_id=%s error=%s", record.get("channel_id"), record_id, type(exc).__name__)
+                await self._storage_error(update)
+                return
+        items = [record, *(record.get("followups") or [])]
+        placements = self._batch_marginal_placements(record, settings, len(items))
+        header_items = list(settings.get("header_items") or [])
+        footer_items = list(settings.get("footer_items") or [])
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, item in enumerate(items):
+            label = "First post" if index == 0 else f"Post {index + 1}: {self._followup_label(item, index - 1)}"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{'✓' if index in placements['header'] else '＋'} Header · {label[:20]}",
+                    callback_data=f"cm:batch_margin_toggle:{record_id}:header:{index}",
+                ),
+                InlineKeyboardButton(
+                    f"{'✓' if index in placements['footer'] else '＋'} Footer · {label[:20]}",
+                    callback_data=f"cm:batch_margin_toggle:{record_id}:footer:{index}",
+                ),
+            ])
+        rows.append([InlineKeyboardButton("Preview updated layout", callback_data=f"cm:post_preview:{record_id}")])
+        rows.append([InlineKeyboardButton("← Back to post", callback_data=f"cm:post_preview:{record_id}")])
+        note = []
+        if not header_items:
+            note.append("No Header items are configured")
+        if not footer_items:
+            note.append("no Footer items are configured")
+        description = "Toggle Header and Footer independently for each batch post. Annie inserts selected reusable messages immediately before or after that post."
+        if note:
+            description += "\n\n" + "; ".join(note) + ". Set them in Header & Footer settings first."
+        await self._edit_or_send(
+            update, f"<b>Header / Footer placement</b>\n\n{description}",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _toggle_batch_margin(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        record_id: str, field: str, item_index: int,
+    ) -> None:
+        record, channel = await self._record_for_user(record_id, update.effective_user.id, context.bot)
+        if not record or channel is None or record.get("status") != "draft" or not record.get("batch_mode") or field not in {"header", "footer"}:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        if repository is None:
+            await self._storage_error(update)
+            return
+        settings = record.get("marginal_snapshot")
+        if not isinstance(settings, dict):
+            try:
+                settings = await asyncio.to_thread(repository.get_marginals, int(record["channel_id"]))
+            except Exception as exc:
+                logger.warning("[channel-manager] batch margin settings load failed channel_id=%s post_id=%s error=%s", record.get("channel_id"), record_id, type(exc).__name__)
+                await self._storage_error(update)
+                return
+        if not settings.get(f"{field}_items"):
+            await self._edit_or_send(update, f"Add at least one {field.title()} item before attaching it to a batch post.", InlineKeyboardMarkup([[InlineKeyboardButton("Header & Footer settings", callback_data=f"cm:marginals:{record['channel_id']}")]]))
+            return
+        item_count = 1 + len(record.get("followups") or [])
+        if not 0 <= item_index < item_count:
+            await self._edit_or_send(update, "That batch post is no longer available. Reopen the placement menu.", None)
+            return
+        placements = self._batch_marginal_placements(record, settings, item_count)
+        selected = set(placements[field])
+        if item_index in selected:
+            selected.remove(item_index)
+        else:
+            selected.add(item_index)
+        placements[field] = sorted(selected)
+        try:
+            saved = await asyncio.to_thread(repository.update, record_id, {"marginal_placements": placements})
+        except Exception as exc:
+            logger.warning("[channel-manager] batch margin placement save failed channel_id=%s post_id=%s field=%s error=%s", record.get("channel_id"), record_id, field, type(exc).__name__)
+            saved = False
+        if not saved:
+            await self._storage_error(update)
+            return
+        await self._show_batch_margins(update, context, record_id)
 
     async def _send_content(self, bot: Any, chat_id: int, record: dict[str, Any], preview: bool = False) -> Any:
         source_message = record.get("source_message")
@@ -1307,11 +1482,15 @@ class ChannelManager:
                 if sticker.get("file_id"):
                     margin_items.append({"media": {"type": "sticker", "file_id": sticker["file_id"]}})
         async def send_margin_items(items: list[dict[str, Any]], field: str) -> None:
-            buttons = list((marginal_settings or {}).get(f"{field}_buttons") or [])
+            legacy_buttons = list((marginal_settings or {}).get(f"{field}_buttons") or [])
             for margin_index, item in enumerate(items):
+                buttons = list(item.get("post_buttons") or [])
+                # Older configurations attached one button group to the section.
+                if margin_index == len(items) - 1:
+                    buttons.extend(legacy_buttons)
                 margin_record = {
                     **item, "_id": str(record.get("_id")), "followups": [],
-                    "post_buttons": buttons if margin_index == len(items) - 1 else [],
+                    "post_buttons": buttons,
                 }
                 try:
                     sent.append(await self._send_content(bot, chat_id, margin_record))
@@ -1320,9 +1499,7 @@ class ChannelManager:
                         ids = [int(value.message_id) for value in sent if getattr(value, "message_id", None)]
                         raise PartialPostSendError(ids, exc) from exc
                     raise
-        if add_media_margins:
-            await send_margin_items(header_items, "header")
-        for index, item in enumerate(post_items):
+        async def send_post_item(index: int, item: dict[str, Any]) -> None:
             is_last = index == len(post_items) - 1
             message_record = {
                 **record, **item, "_id": str(record.get("_id")), "followups": [],
@@ -1341,8 +1518,24 @@ class ChannelManager:
                     ids = [int(item.message_id) for item in sent if getattr(item, "message_id", None)]
                     raise PartialPostSendError(ids, exc) from exc
                 raise
-        if add_media_margins:
-            await send_margin_items(footer_items, "footer")
+
+        if record.get("batch_mode") and marginal_settings is not None:
+            placements = self._batch_marginal_placements(record, marginal_settings, len(post_items))
+            header_indexes = set(placements["header"])
+            footer_indexes = set(placements["footer"])
+            for index, item in enumerate(post_items):
+                if index in header_indexes:
+                    await send_margin_items(header_items, "header")
+                await send_post_item(index, item)
+                if index in footer_indexes:
+                    await send_margin_items(footer_items, "footer")
+        else:
+            if add_media_margins:
+                await send_margin_items(header_items, "header")
+            for index, item in enumerate(post_items):
+                await send_post_item(index, item)
+            if add_media_margins:
+                await send_margin_items(footer_items, "footer")
         return sent
 
     async def _edit_or_send(
@@ -1860,13 +2053,15 @@ class ChannelManager:
                 return self._post_keyboard(record)
             if kind == "extra":
                 return self._post_keyboard(component.get("data") or {})
-            settings = record.get("marginal_snapshot") or {}
-            field = "header" if kind == "header" else "footer" if kind == "footer" else None
-            if field:
+            if kind in {"header", "footer"}:
+                data = component.get("data") or {}
+                settings = record.get("marginal_snapshot") or {}
                 field_components = [item for item in components if item.get("kind") == kind]
                 last_index = max((int(item.get("source_index", -1)) for item in field_components), default=-1)
+                buttons = list(data.get("post_buttons") or [])
                 if int(component.get("source_index", -1)) == last_index:
-                    return self._post_keyboard({"post_buttons": settings.get(f"{field}_buttons") or []})
+                    buttons.extend(settings.get(f"{kind}_buttons") or [])
+                return self._post_keyboard({"post_buttons": buttons})
             return None
         return None
 
@@ -2884,8 +3079,6 @@ class ChannelManager:
             return
         header_items = settings.get("header_items") or []
         footer_items = settings.get("footer_items") or []
-        header_buttons = settings.get("header_buttons") or []
-        footer_buttons = settings.get("footer_buttons") or []
         name = html_escape(str(channel.get("name") or "Channel"))
         types = set(settings.get("types") or [])
         type_names = ["Text", "Photo", "Video", "File", "Animation", "Audio", "Voice"]
@@ -2893,8 +3086,6 @@ class ChannelManager:
         rows = [
             [InlineKeyboardButton(f"Header items ({len(header_items)})", callback_data=f"cm:marginal_items:{channel_id}:header"),
              InlineKeyboardButton(f"Footer items ({len(footer_items)})", callback_data=f"cm:marginal_items:{channel_id}:footer")],
-            [InlineKeyboardButton(f"Header buttons ({len(header_buttons)})", callback_data=f"cm:marginal_buttons:{channel_id}:header"),
-             InlineKeyboardButton(f"Footer buttons ({len(footer_buttons)})", callback_data=f"cm:marginal_buttons:{channel_id}:footer")],
             [InlineKeyboardButton("Clear header", callback_data=f"cm:marginal_clear:{channel_id}:header"),
              InlineKeyboardButton("Clear footer", callback_data=f"cm:marginal_clear:{channel_id}:footer")],
         ]
@@ -2923,10 +3114,8 @@ class ChannelManager:
             f"<b>Header &amp; Footer · {name}</b>\n\n"
             "Annie adds these to matching messages she publishes. Posts sent directly by other people or bots stay unchanged.\n\n"
             f"<b>Header items:</b> {html_escape(summarize(header_items))}\n"
-            f"<b>Header buttons:</b> {len(header_buttons)}\n"
             f"<b>Footer items:</b> {html_escape(summarize(footer_items))}\n"
-            f"<b>Footer buttons:</b> {len(footer_buttons)}\n\n"
-            "Add several messages to either list. Link buttons appear under the last item. Choose which post types use them below."
+            "\nEach item can have its own link buttons. Add items in order, attach buttons to any item, and move items up or down. Choose which post types use the layout below."
         )
         await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
 
@@ -2944,12 +3133,24 @@ class ChannelManager:
         for index, item in enumerate(items):
             media_type = str((item.get("media") or {}).get("type") or "")
             label = media_type.title() if media_type else str(item.get("text") or item.get("caption") or "Forwarded item").splitlines()[0][:28]
-            rows.append([InlineKeyboardButton(f"{index + 1}. {label} · Remove", callback_data=f"cm:marginal_item_remove:{channel_id}:{field}:{index}")])
+            legacy_buttons = list(settings.get(f"{field}_buttons") or []) if index == len(items) - 1 else []
+            button_count = len(item.get("post_buttons") or []) + len(legacy_buttons)
+            rows.append([InlineKeyboardButton(
+                f"{index + 1}. {label} · Buttons ({button_count})",
+                callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{index}",
+            )])
+            move_buttons = []
+            if index > 0:
+                move_buttons.append(InlineKeyboardButton("↑", callback_data=f"cm:marginal_item_move:{channel_id}:{field}:{index}:-1"))
+            if index < len(items) - 1:
+                move_buttons.append(InlineKeyboardButton("↓", callback_data=f"cm:marginal_item_move:{channel_id}:{field}:{index}:1"))
+            move_buttons.append(InlineKeyboardButton("Remove", callback_data=f"cm:marginal_item_remove:{channel_id}:{field}:{index}"))
+            rows.append(move_buttons)
         rows.append([InlineKeyboardButton("← Header & Footer", callback_data=f"cm:marginals:{channel_id}")])
         title = "Header" if field == "header" else "Footer"
-        await self._edit_or_send(update, f"<b>{title} content</b>\n\nAnnie sends these messages in order. Add more than one if needed.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+        await self._edit_or_send(update, f"<b>{title} layout</b>\n\nItems publish in order. Open an item’s buttons to attach links directly beneath that message. Use ↑ and ↓ to reorder items.", InlineKeyboardMarkup(rows), ParseMode.HTML)
 
-    async def _show_marginal_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int, field: str) -> None:
+    async def _show_marginal_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: int, field: str, item_index: int | None = None) -> None:
         if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
             await self._access_denied(update)
             return
@@ -2958,14 +3159,29 @@ class ChannelManager:
             await self._storage_error(update)
             return
         settings = await asyncio.to_thread(repo.get_marginals, channel_id)
-        buttons = list(settings.get(f"{field}_buttons") or [])
-        rows = [[InlineKeyboardButton("＋ Add link button", callback_data=f"cm:marginal_button_add:{channel_id}:{field}")]]
+        items = list(settings.get(f"{field}_items") or [])
+        if item_index is None:
+            rows = []
+            for index, item in enumerate(items):
+                label = str(item.get("text") or item.get("caption") or (item.get("media") or {}).get("type") or "Content").splitlines()[0][:24]
+                rows.append([InlineKeyboardButton(f"{index + 1}. {label}", callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{index}")])
+            rows.append([InlineKeyboardButton("← Layout", callback_data=f"cm:marginal_items:{channel_id}:{field}")])
+            await self._edit_or_send(update, f"<b>{field.title()} buttons</b>\n\nChoose the content message that should have buttons beneath it.", InlineKeyboardMarkup(rows), ParseMode.HTML)
+            return
+        if not 0 <= item_index < len(items):
+            await self._edit_or_send(update, "That content item is no longer available. Reopen the layout.", None)
+            return
+        buttons = list(items[item_index].get("post_buttons") or [])
+        if item_index == len(items) - 1:
+            buttons = [*buttons, *(settings.get(f"{field}_buttons") or [])]
+        rows = [[InlineKeyboardButton("＋ Add link button", callback_data=f"cm:marginal_button_add:{channel_id}:{field}:{item_index}")]]
         for index, button in enumerate(buttons):
             label = str(button.get("text") or "Open link")[:35]
-            rows.append([InlineKeyboardButton(f"{index + 1}. {label} · Remove", callback_data=f"cm:marginal_button_remove:{channel_id}:{field}:{index}")])
-        rows.append([InlineKeyboardButton("← Header & Footer", callback_data=f"cm:marginals:{channel_id}")])
+            rows.append([InlineKeyboardButton(f"{index + 1}. {label} · Remove", callback_data=f"cm:marginal_button_remove:{channel_id}:{field}:{item_index}:{index}")])
+        rows.append([InlineKeyboardButton("← Layout", callback_data=f"cm:marginal_items:{channel_id}:{field}")])
         title = "Header" if field == "header" else "Footer"
-        text = f"<b>{title} link buttons</b>\n\nButtons are placed under the last {title.lower()} item. Add at least one item first."
+        item_label = str(items[item_index].get("text") or items[item_index].get("caption") or (items[item_index].get("media") or {}).get("type") or "Content").splitlines()[0][:40]
+        text = f"<b>{title} buttons · {html_escape(item_label)}</b>\n\nButtons appear directly beneath this message. Add up to 8 links."
         await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
 
     async def _access_denied(self, update: Update) -> None:
@@ -3232,6 +3448,9 @@ class ChannelManager:
         if not ids:
             return None
         settings = record.get("marginal_snapshot") or {}
+        if record.get("batch_mode"):
+            main_ids = ChannelManager._batch_main_message_ids(record, ids, settings)
+            return main_ids[0] if main_ids else None
         media_type = str((record.get("media") or {}).get("type") or "text")
         if media_type not in set(settings.get("types") or []):
             return ids[0]
@@ -3244,17 +3463,40 @@ class ChannelManager:
 
     @staticmethod
     def _batch_main_message_ids(record: dict[str, Any], message_ids: list[int], settings: dict[str, Any]) -> list[int]:
-        """Return batch content message IDs, excluding any shared header/footer."""
+        """Return batch content IDs while skipping per-item header/footer messages."""
         if not record.get("batch_mode"):
             return []
-        media_type = str((record.get("media") or {}).get("type") or "text")
-        header_count = 0
-        if media_type in set(settings.get("types") or []):
-            header_count = len(settings.get("header_items") or [])
-            if not header_count and ((settings.get("header") or {}).get("text") or settings.get("header_content")):
-                header_count = 1
+        header_items = list(settings.get("header_items") or [])
+        footer_items = list(settings.get("footer_items") or [])
+        layout_settings = dict(settings)
+        if not header_items:
+            if (settings.get("header") or {}).get("text"):
+                header_items = [settings["header"]]
+            elif settings.get("header_content"):
+                header_items = [settings["header_content"]]
+        if not footer_items:
+            if (settings.get("footer") or {}).get("text"):
+                footer_items = [settings["footer"]]
+            elif settings.get("footer_content"):
+                footer_items = [settings["footer_content"]]
+            elif (settings.get("footer_sticker") or {}).get("file_id"):
+                footer_items = [{"media": settings["footer_sticker"]}]
+        layout_settings["header_items"] = header_items
+        layout_settings["footer_items"] = footer_items
         content_count = 1 + len(record.get("followups") or [])
-        return [int(value) for value in message_ids[header_count:header_count + content_count]]
+        placements = ChannelManager._batch_marginal_placements(record, layout_settings, content_count)
+        header_indexes, footer_indexes = set(placements["header"]), set(placements["footer"])
+        cursor = 0
+        content_ids: list[int] = []
+        for index in range(content_count):
+            if index in header_indexes:
+                cursor += len(header_items)
+            if cursor < len(message_ids):
+                content_ids.append(int(message_ids[cursor]))
+            cursor += 1
+            if index in footer_indexes:
+                cursor += len(footer_items)
+        return content_ids
 
     @classmethod
     def _published_components(cls, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3294,15 +3536,41 @@ class ChannelManager:
             return []
 
         components: list[dict[str, Any]] = []
-        if margins_active:
-            components.extend({"kind": "header", "source_index": i, "data": item}
-                              for i, item in enumerate(margin_items("header")))
-        components.append({"kind": "main", "source_index": 0, "data": record})
-        components.extend({"kind": "extra", "source_index": i, "data": item}
-                          for i, item in enumerate(record.get("followups") or []))
-        if margins_active:
-            components.extend({"kind": "footer", "source_index": i, "data": item}
-                              for i, item in enumerate(margin_items("footer")))
+        header = margin_items("header")
+        footer = margin_items("footer")
+        if record.get("batch_mode"):
+            layout_settings = dict(settings)
+            layout_settings["header_items"] = header
+            layout_settings["footer_items"] = footer
+            batch_items = [record, *(record.get("followups") or [])]
+            placements = cls._batch_marginal_placements(record, layout_settings, len(batch_items))
+            header_indexes, footer_indexes = set(placements["header"]), set(placements["footer"])
+            for batch_index, item in enumerate(batch_items):
+                if batch_index in header_indexes:
+                    components.extend({
+                        "kind": "header", "source_index": i,
+                        "batch_item_index": batch_index, "data": margin_item,
+                    } for i, margin_item in enumerate(header))
+                components.append({
+                    "kind": "main" if batch_index == 0 else "extra",
+                    "source_index": 0 if batch_index == 0 else batch_index - 1,
+                    "batch_item_index": batch_index, "data": item,
+                })
+                if batch_index in footer_indexes:
+                    components.extend({
+                        "kind": "footer", "source_index": i,
+                        "batch_item_index": batch_index, "data": margin_item,
+                    } for i, margin_item in enumerate(footer))
+        else:
+            if margins_active:
+                components.extend({"kind": "header", "source_index": i, "data": item}
+                                  for i, item in enumerate(header))
+            components.append({"kind": "main", "source_index": 0, "data": record})
+            components.extend({"kind": "extra", "source_index": i, "data": item}
+                              for i, item in enumerate(record.get("followups") or []))
+            if margins_active:
+                components.extend({"kind": "footer", "source_index": i, "data": item}
+                                  for i, item in enumerate(footer))
         for component, message_id in zip(components, ids):
             component["message_id"] = message_id
         return [item for item in components if item.get("message_id")]
@@ -3429,6 +3697,12 @@ class ChannelManager:
 
         settings = dict(record.get("marginal_snapshot") or {})
         field = kind
+        batch_item_index = component.get("batch_item_index")
+        if field in {"header", "footer"} and batch_item_index is not None and remove:
+            item_count = 1 + len(record.get("followups") or [])
+            placements = ChannelManager._batch_marginal_placements(record, settings, item_count)
+            placements[field] = [value for value in placements[field] if value != int(batch_item_index)]
+            return {"marginal_placements": placements}
         items = list(settings.get(f"{field}_items") or [])
         if not items:
             legacy = settings.get(field) or {}
@@ -3466,6 +3740,13 @@ class ChannelManager:
         data = dict(component.get("data") or {})
         message_id = int(component["message_id"])
         channel_id = int(record["channel_id"])
+        target_message_ids = [message_id]
+        if component.get("kind") in {"header", "footer"} and component.get("batch_item_index") is not None:
+            target_message_ids = [
+                int(item["message_id"]) for item in components
+                if item.get("kind") == component.get("kind")
+                and int(item.get("source_index", -1)) == int(component.get("source_index", -2))
+            ] or [message_id]
         if mode == "text":
             text = str(content.get("text") or "")
             if not text.strip():
@@ -3474,18 +3755,20 @@ class ChannelManager:
             if data.get("media"):
                 send_kwargs = self._send_kwargs({**data, "caption": text, "entities": content.get("entities") or []})
                 format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
-                await context.bot.edit_message_caption(
-                    chat_id=channel_id, message_id=message_id,
-                    caption=text, **format_kwargs,
-                )
+                for target_message_id in target_message_ids:
+                    await context.bot.edit_message_caption(
+                        chat_id=channel_id, message_id=target_message_id,
+                        caption=text, **format_kwargs,
+                    )
                 data.update({"caption": text, "entities": content.get("entities") or [], "format_mode": "telegram"})
             else:
                 send_kwargs = self._send_kwargs({**data, "text": text, "entities": content.get("entities") or []})
                 format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "entities", "link_preview_options") if key in send_kwargs}
-                await context.bot.edit_message_text(
-                    chat_id=channel_id, message_id=message_id,
-                    text=text, **format_kwargs,
-                )
+                for target_message_id in target_message_ids:
+                    await context.bot.edit_message_text(
+                        chat_id=channel_id, message_id=target_message_id,
+                        text=text, **format_kwargs,
+                    )
                 data.update({"text": text, "entities": content.get("entities") or [], "format_mode": "telegram"})
         else:
             media = content.get("media") or {}
@@ -3503,9 +3786,10 @@ class ChannelManager:
             send_kwargs = self._send_kwargs(temp_record)
             format_kwargs = {key: send_kwargs[key] for key in ("parse_mode", "caption_entities") if key in send_kwargs}
             input_media = media_class(media=str(media.get("file_id") or ""), caption=caption or None, **format_kwargs)
-            await context.bot.edit_message_media(
-                chat_id=channel_id, message_id=message_id, media=input_media,
-            )
+            for target_message_id in target_message_ids:
+                await context.bot.edit_message_media(
+                    chat_id=channel_id, message_id=target_message_id, media=input_media,
+                )
             data.update({"media": media, "caption": caption, "text": "", "source_message": None})
 
         changes = await self._component_record_changes(record, component, new_data=data)
@@ -3518,9 +3802,10 @@ class ChannelManager:
         if not saved:
             await update.effective_message.reply_text("The channel message changed, but Annie couldn’t save its details.")
             return False
-        await self._mirror_edit_to_backups(
-            context.bot, channel_id, message_id, data, preserve_reply_markup=True,
-        )
+        for target_message_id in target_message_ids:
+            await self._mirror_edit_to_backups(
+                context.bot, channel_id, target_message_id, data, preserve_reply_markup=True,
+            )
         return True
 
     async def _preview_published_post(
@@ -3923,10 +4208,13 @@ class ChannelManager:
                 await self._show_marginal_items(update, context, int(parts[2]), parts[3])
                 return
             if action == "marginal_buttons":
-                await self._show_marginal_buttons(update, context, int(parts[2]), parts[3])
+                await self._show_marginal_buttons(
+                    update, context, int(parts[2]), parts[3], int(parts[4]) if len(parts) > 4 else None
+                )
                 return
             if action == "marginal_button_add":
                 channel_id, field = int(parts[2]), parts[3]
+                item_index = int(parts[4]) if len(parts) > 4 else None
                 if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
                     await self._access_denied(update)
                     return
@@ -3935,21 +4223,49 @@ class ChannelManager:
                     await self._storage_error(update)
                     return
                 settings = await asyncio.to_thread(repo.get_marginals, channel_id)
-                if not settings.get(f"{field}_items"):
-                    await self._edit_or_send(update, "Add at least one content item before adding its buttons.", InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"cm:marginal_items:{channel_id}:{field}")]]))
+                items = list(settings.get(f"{field}_items") or [])
+                if item_index is None:
+                    await self._show_marginal_buttons(update, context, channel_id, field)
                     return
-                buttons = settings.get(f"{field}_buttons") or []
+                if not 0 <= item_index < len(items):
+                    await self._edit_or_send(update, "That content item is no longer available. Reopen the layout.", None)
+                    return
+                buttons = list(items[item_index].get("post_buttons") or [])
+                if item_index == len(items) - 1:
+                    buttons.extend(settings.get(f"{field}_buttons") or [])
                 if len(buttons) >= 8:
-                    await self._edit_or_send(update, "You can add up to 8 buttons to each header or footer.", InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"cm:marginal_buttons:{channel_id}:{field}")]]))
+                    await self._edit_or_send(update, "You can add up to 8 buttons beneath each content item.", InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{item_index}")]]))
                     return
                 self._inputs[int(update.effective_user.id)] = {
                     "kind": "marginal_button_label", "channel_id": channel_id, "field": field,
+                    "item_index": item_index,
                     "expires_at": time.time() + self.INPUT_TTL_SECONDS,
                 }
-                await self._edit_or_send(update, "Send the button label (up to 40 characters).", InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:marginal_buttons:{channel_id}:{field}")]]))
+                await self._edit_or_send(update, "Send the button label (up to 40 characters).", InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{item_index}")]]))
+                return
+            if action == "marginal_item_move":
+                channel_id, field, index, direction = int(parts[2]), parts[3], int(parts[4]), int(parts[5])
+                if field not in {"header", "footer"} or direction not in {-1, 1} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+                    await self._access_denied(update)
+                    return
+                repo = self._get_repository()
+                if repo is None:
+                    await self._storage_error(update)
+                    return
+                try:
+                    moved = await asyncio.to_thread(repo.move_marginal_item, channel_id, field, index, direction)
+                except Exception as exc:
+                    logger.warning("[channel-manager] marginal item reorder failed channel_id=%s field=%s error=%s", channel_id, field, type(exc).__name__)
+                    moved = False
+                if not moved:
+                    await self._edit_or_send(update, "That item can’t be moved. Reopen the layout and try again.", None)
+                    return
+                await self._show_marginal_items(update, context, channel_id, field)
                 return
             if action in {"marginal_item_remove", "marginal_button_remove"}:
                 channel_id, field, index = int(parts[2]), parts[3], int(parts[4])
+                item_index = int(parts[4]) if action == "marginal_button_remove" and len(parts) > 5 else None
+                button_index = int(parts[5]) if item_index is not None else index
                 if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
                     await self._access_denied(update)
                     return
@@ -3957,9 +4273,11 @@ class ChannelManager:
                 if repo is None:
                     await self._storage_error(update)
                     return
-                remover = repo.remove_marginal_item if action == "marginal_item_remove" else repo.remove_marginal_button
                 try:
-                    removed = await asyncio.to_thread(remover, channel_id, field, index)
+                    if action == "marginal_item_remove":
+                        removed = await asyncio.to_thread(repo.remove_marginal_item, channel_id, field, index)
+                    else:
+                        removed = await asyncio.to_thread(repo.remove_marginal_button, channel_id, field, button_index, item_index)
                 except Exception as exc:
                     logger.warning("[channel-manager] marginal item removal failed channel_id=%s field=%s error=%s", channel_id, field, type(exc).__name__)
                     removed = False
@@ -3969,7 +4287,7 @@ class ChannelManager:
                 if action == "marginal_item_remove":
                     await self._show_marginal_items(update, context, channel_id, field)
                 else:
-                    await self._show_marginal_buttons(update, context, channel_id, field)
+                    await self._show_marginal_buttons(update, context, channel_id, field, item_index)
                 return
             if action == "marginal_set":
                 channel_id, field = int(parts[2]), parts[3]
@@ -4332,6 +4650,12 @@ class ChannelManager:
                 return
             if action == "button_remove":
                 await self._remove_post_button(update, context, parts[2], int(parts[3]))
+                return
+            if action == "batch_margins":
+                await self._show_batch_margins(update, context, parts[2])
+                return
+            if action == "batch_margin_toggle":
+                await self._toggle_batch_margin(update, context, parts[2], parts[3], int(parts[4]))
                 return
             if action == "post_preview":
                 await self._show_post_preview(update, context, parts[2])
@@ -5499,8 +5823,22 @@ class ChannelManager:
             return
         followup = followups.pop(index)
         repository = self._get_repository()
+        changes: dict[str, Any] = {"followups": followups}
+        saved_placements = (record or {}).get("marginal_placements")
+        if record.get("batch_mode") and isinstance(saved_placements, dict):
+            removed_batch_index = index + 1
+            changes["marginal_placements"] = {
+                field: sorted({
+                    value - 1 if value > removed_batch_index else value
+                    for raw in (saved_placements.get(field) or [])
+                    if str(raw).lstrip("-").isdigit()
+                    for value in [int(raw)]
+                    if value != removed_batch_index
+                })
+                for field in ("header", "footer")
+            }
         try:
-            saved = await asyncio.to_thread(repository.update, record_id, {"followups": followups}) if repository else False
+            saved = await asyncio.to_thread(repository.update, record_id, changes) if repository else False
         except Exception as exc:
             logger.warning("[channel-manager] followup removal failed channel_id=%s user_id=%s post_id=%s error=%s", record["channel_id"], update.effective_user.id, record_id, type(exc).__name__)
             saved = False
@@ -6036,7 +6374,7 @@ class ChannelManager:
         """Fields that make a reusable, potentially multi-message post template."""
         keys = (
             "text", "caption", "entities", "format_mode", "media",
-            "post_buttons", "followups", "batch_mode",
+            "post_buttons", "followups", "batch_mode", "marginal_placements",
         )
         return {key: record[key] for key in keys if key in record}
 
@@ -6542,7 +6880,7 @@ class ChannelManager:
             prompt = await message.reply_text(
                 "Now send the full link, starting with https:// or http://.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                    "Cancel", callback_data=f"cm:marginal_buttons:{channel_id}:{state['field']}"
+                    "Cancel", callback_data=f"cm:marginal_buttons:{channel_id}:{state['field']}:{state.get('item_index', 0)}"
                 )]]),
             )
             state["prompt_chat_id"] = int(prompt.chat.id)
@@ -6560,16 +6898,20 @@ class ChannelManager:
                 await message.reply_text("That step expired. Open Channel Manager and try again.")
                 return
             try:
-                await asyncio.to_thread(repo.add_marginal_button, channel_id, field, {
+                saved = await asyncio.to_thread(repo.add_marginal_button, channel_id, field, {
                     "text": str(state["button_label"]), "url": url,
-                })
+                }, int(state.get("item_index", 0)))
             except Exception as exc:
                 logger.warning("[channel-manager] marginal button save failed channel_id=%s user_id=%s field=%s error=%s", channel_id, user_id, field, type(exc).__name__)
                 await message.reply_text("I couldn’t save that button. Please try again.")
                 return
+            if not saved:
+                await message.reply_text("That content item changed before the button could be saved. Reopen Header & Footer and try again.")
+                return
             self._inputs.pop(user_id, None)
             await self._clear_input_prompt(context, state)
-            await message.reply_text("Link button saved. Annie will place it under the last item in this header or footer.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open settings", callback_data=f"cm:marginal_buttons:{channel_id}:{field}")]]))
+            item_index = int(state.get("item_index", 0))
+            await message.reply_text("Link button saved beneath that content item.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Edit its buttons", callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{item_index}")]]))
             return
         if kind == "caption_input":
             content = self._content_from_message(message, str(state.get("mode") or "telegram"))
