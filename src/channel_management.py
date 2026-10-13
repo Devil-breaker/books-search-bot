@@ -140,6 +140,10 @@ def _replace_text_with_entities(
 class MongoChannelManagementRepository:
     """Persist templates, drafts, and scheduled posts independently of connections."""
 
+    PUBLISHED_RECORD_LIMIT = 40
+    DRAFT_RETENTION_DAYS = 30
+    DRAFT_CLEANUP_BATCH_SIZE = 100
+
     def __init__(self, uri: str, database_name: str = "annie_db") -> None:
         self.client = MongoClient(
             uri,
@@ -163,6 +167,10 @@ class MongoChannelManagementRepository:
         if self._indexes_ready:
             return
         self.records.create_index([("channel_id", 1), ("kind", 1), ("status", 1)])
+        self.records.create_index(
+            [("channel_id", 1), ("kind", 1), ("status", 1), ("published_at", 1)]
+        )
+        self.records.create_index([("kind", 1), ("status", 1), ("updated_at", 1)])
         self.records.create_index([("status", 1), ("scheduled_at", 1)])
         self.records.create_index([("channel_id", 1), ("published_main_message_id", 1)])
         self.records.create_index(
@@ -247,6 +255,22 @@ class MongoChannelManagementRepository:
             upsert=True,
         )
 
+    def add_marginal_items(
+        self, channel_id: int, field: str, items: list[dict[str, Any]],
+    ) -> bool:
+        if field not in {"header", "footer"}:
+            raise ValueError("Invalid marginal field")
+        if not items:
+            return False
+        self.marginals.update_one(
+            {"channel_id": int(channel_id)},
+            {"$push": {f"{field}_items": {"$each": items}},
+             "$set": {"updated_at": datetime.now(timezone.utc)},
+             "$setOnInsert": {"channel_id": int(channel_id)}},
+            upsert=True,
+        )
+        return True
+
     def _migrate_marginal_buttons(self, settings: dict[str, Any], field: str) -> list[dict[str, Any]]:
         """Move legacy section-wide buttons onto the final item for editing."""
         items = [dict(item) for item in settings.get(f"{field}_items") or []]
@@ -324,6 +348,28 @@ class MongoChannelManagementRepository:
         del buttons[index]
         self.update_marginals(channel_id, {key: buttons})
         return True
+
+    def set_marginal_button_style(
+        self, channel_id: int, field: str, item_index: int,
+        button_index: int, style: str,
+    ) -> bool:
+        if field not in {"header", "footer"} or style not in {"default", "primary", "success", "danger"}:
+            return False
+        settings = self.get_marginals(channel_id)
+        items = self._migrate_marginal_buttons(settings, field)
+        if not 0 <= item_index < len(items):
+            return False
+        buttons = list(items[item_index].get("post_buttons") or [])
+        if not 0 <= button_index < len(buttons):
+            return False
+        if style == "default":
+            buttons[button_index].pop("style", None)
+        else:
+            buttons[button_index]["style"] = style
+        items[item_index]["post_buttons"] = buttons
+        return self.update_marginals(channel_id, {
+            f"{field}_items": items, f"{field}_buttons": [],
+        })
 
     def move_marginal_item(self, channel_id: int, field: str, index: int, direction: int) -> bool:
         if field not in {"header", "footer"} or direction not in {-1, 1}:
@@ -412,6 +458,75 @@ class MongoChannelManagementRepository:
             .skip(max(0, int(skip))).limit(max(1, int(limit)))
         )
 
+    def prune_published_records(self, channel_id: int, keep: int = PUBLISHED_RECORD_LIMIT) -> list[dict[str, Any]]:
+        """Delete only the oldest excess published post records for one channel."""
+        channel_id = int(channel_id)
+        keep = int(keep)
+        if keep < 1:
+            raise ValueError("Published record retention must keep at least one record")
+        query = {"channel_id": channel_id, "kind": "post", "status": "published"}
+        candidates = self.records.find(
+            query,
+            {"preview_chat_id": 1, "preview_message_id": 1, "preview_message_ids": 1},
+        ).sort([("published_at", 1), ("_id", 1)]).skip(keep)
+
+        removed = []
+        for record in candidates:
+            record_id = record.get("_id")
+            if record_id is None:
+                continue
+            # Recheck the full scope on deletion so a concurrently changed record,
+            # draft, template, or another channel's data can never be removed.
+            result = self.records.delete_one({
+                "_id": record_id, "channel_id": channel_id,
+                "kind": "post", "status": "published",
+            })
+            if result.deleted_count:
+                removed.append(record)
+        return removed
+
+    def delete_stale_drafts(
+        self, cutoff: datetime, limit: int = DRAFT_CLEANUP_BATCH_SIZE,
+    ) -> list[dict[str, Any]]:
+        """Delete a bounded batch of inactive drafts, never other record kinds."""
+        limit = int(limit)
+        if limit < 1:
+            return []
+        stale_when = [
+            {"updated_at": {"$lte": cutoff}},
+            {"updated_at": {"$exists": False}, "created_at": {"$lte": cutoff}},
+        ]
+        query = {"kind": "post", "status": "draft", "$or": stale_when}
+        projection = {
+            "channel_id": 1, "created_by": 1,
+            "preview_chat_id": 1, "preview_message_id": 1,
+            "preview_message_ids": 1,
+        }
+        candidates = self.records.find(query, projection).sort(
+            [("updated_at", 1), ("created_at", 1), ("_id", 1)]
+        ).limit(limit)
+
+        removed = []
+        for record in candidates:
+            record_id = record.get("_id")
+            try:
+                channel_id = int(record.get("channel_id"))
+            except (TypeError, ValueError):
+                # Malformed records are left intact for manual inspection.
+                continue
+            if record_id is None:
+                continue
+            delete_query = {
+                "_id": record_id, "channel_id": channel_id,
+                "kind": "post", "status": "draft", "$or": stale_when,
+            }
+            # This conditional delete prevents removing a draft that was edited
+            # after the stale-record scan began.
+            result = self.records.delete_one(delete_query)
+            if result.deleted_count:
+                removed.append(record)
+        return removed
+
     @staticmethod
     def clone_pair_id(source_channel_id: int, destination_channel_id: int) -> str:
         return f"{int(source_channel_id)}:{int(destination_channel_id)}"
@@ -483,6 +598,7 @@ class MongoChannelManagementRepository:
         insert_fields = {
             key: value for key, value in source_record.items()
             if key != "_id" and key not in current_fields
+            and not key.startswith("preview_")
         }
         result = self.records.find_one_and_update(
             query,
@@ -679,6 +795,8 @@ class ChannelManager:
     """Own the Channel Manager menu, access checks, composer, and durable scheduler."""
 
     INPUT_TTL_SECONDS = 30 * 60
+    RETENTION_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
+    RETENTION_CLEANUP_RETRY_SECONDS = 5 * 60
     ALLOWED_MEDIA = (
         "photo", "video", "document", "animation", "audio", "sticker",
         "voice", "video_note",
@@ -705,6 +823,7 @@ class ChannelManager:
         self._access_cache: dict[int, tuple[float, bool]] = {}
         self._ambiguous_send_ids: set[str] = set()
         self._published_previews: dict[int, list[int]] = {}
+        self._next_retention_cleanup_at = 0.0
         self._clone_pair_locks: dict[str, asyncio.Lock] = {}
         self._clone_pair_edits: dict[int, dict[str, Any]] = {}
         self._clone_send_lock = asyncio.Lock()
@@ -1577,6 +1696,74 @@ class ChannelManager:
         except Exception as exc:
             logger.info("[channel-manager] message cleanup skipped chat_id=%s message_id=%s error=%s", chat_id, message_id, type(exc).__name__)
 
+    async def _delete_retired_record_previews(
+        self, bot: Any, records: list[dict[str, Any]],
+    ) -> None:
+        """Remove saved private previews for deleted records when references are safe."""
+        for record in records:
+            # Clone records may historically have inherited source preview IDs.
+            if record.get("cloned_from_pair_id"):
+                continue
+            try:
+                chat_id = int(record.get("preview_chat_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if chat_id <= 0:
+                continue
+            values = list(record.get("preview_message_ids") or [])
+            if not values and record.get("preview_message_id"):
+                values = [record["preview_message_id"]]
+            seen: set[int] = set()
+            for value in values:
+                try:
+                    message_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if message_id <= 0 or message_id in seen:
+                    continue
+                seen.add(message_id)
+                await self._delete_message(bot, chat_id, message_id)
+
+    async def _enforce_published_record_limit(
+        self, bot: Any, repository: MongoChannelManagementRepository, channel_id: int,
+    ) -> None:
+        try:
+            removed = await asyncio.to_thread(
+                repository.prune_published_records,
+                int(channel_id), repository.PUBLISHED_RECORD_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] published record retention failed channel_id=%s limit=%s error=%s",
+                channel_id, repository.PUBLISHED_RECORD_LIMIT, type(exc).__name__,
+            )
+            return
+        if removed:
+            await self._delete_retired_record_previews(bot, removed)
+            logger.info(
+                "[channel-manager] published records pruned channel_id=%s removed=%s retained=%s",
+                channel_id, len(removed), repository.PUBLISHED_RECORD_LIMIT,
+            )
+
+    async def _cleanup_stale_drafts(
+        self, bot: Any, repository: MongoChannelManagementRepository,
+    ) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=repository.DRAFT_RETENTION_DAYS
+        )
+        removed = await asyncio.to_thread(
+            repository.delete_stale_drafts, cutoff,
+            repository.DRAFT_CLEANUP_BATCH_SIZE,
+        )
+        if removed:
+            await self._delete_retired_record_previews(bot, removed)
+            logger.info(
+                "[channel-manager] stale drafts removed count=%s retention_days=%s more_may_remain=%s",
+                len(removed), repository.DRAFT_RETENTION_DAYS,
+                len(removed) >= repository.DRAFT_CLEANUP_BATCH_SIZE,
+            )
+        return len(removed)
+
     async def _send_clean_menu(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE,
         text: str, markup: InlineKeyboardMarkup | None = None,
@@ -2205,6 +2392,7 @@ class ChannelManager:
             result_text += f" {skipped} couldn’t be copied; check Annie’s channel access and the log."
         saved_records, incomplete_records = await self._save_cloned_published_records(
             repository, records, source_channel_id, destination_channel_id,
+            bot=context.bot,
         )
         if saved_records:
             result_text += f" {saved_records} cloned post{'s are' if saved_records != 1 else ' is'} now available under Destination → Published posts."
@@ -2234,6 +2422,7 @@ class ChannelManager:
     async def _save_cloned_published_records(
         self, repository: MongoChannelManagementRepository, records: list[dict[str, Any]],
         source_channel_id: int, destination_channel_id: int,
+        bot: Any | None = None,
     ) -> tuple[int, int]:
         saved = incomplete = 0
         pair_id = repository.clone_pair_id(source_channel_id, destination_channel_id)
@@ -2277,6 +2466,10 @@ class ChannelManager:
                     "[channel-manager] cloned post record save failed source=%s destination=%s record_id=%s error=%s",
                     source_channel_id, destination_channel_id, source_record.get("_id"), type(exc).__name__,
                 )
+        if saved and bot is not None:
+            await self._enforce_published_record_limit(
+                bot, repository, destination_channel_id,
+            )
         return saved, incomplete
 
     async def _clone_index_configuration(
@@ -2492,6 +2685,9 @@ class ChannelManager:
                         destination_id,
                         [message_map[message_id] for message_id in source_ids],
                         message_map[main_source_id],
+                    )
+                    await self._enforce_published_record_limit(
+                        bot, repository, destination_id,
                     )
                 else:
                     failed += 1
@@ -3086,8 +3282,8 @@ class ChannelManager:
         rows = [
             [InlineKeyboardButton(f"Header items ({len(header_items)})", callback_data=f"cm:marginal_items:{channel_id}:header"),
              InlineKeyboardButton(f"Footer items ({len(footer_items)})", callback_data=f"cm:marginal_items:{channel_id}:footer")],
-            [InlineKeyboardButton("Clear header", callback_data=f"cm:marginal_clear:{channel_id}:header"),
-             InlineKeyboardButton("Clear footer", callback_data=f"cm:marginal_clear:{channel_id}:footer")],
+            [InlineKeyboardButton("Clear header", callback_data=f"cm:mdc:{channel_id}:header"),
+             InlineKeyboardButton("Clear footer", callback_data=f"cm:mdc:{channel_id}:footer")],
         ]
         for index in range(0, len(type_keys), 2):
             row = []
@@ -3144,7 +3340,9 @@ class ChannelManager:
                 move_buttons.append(InlineKeyboardButton("↑", callback_data=f"cm:marginal_item_move:{channel_id}:{field}:{index}:-1"))
             if index < len(items) - 1:
                 move_buttons.append(InlineKeyboardButton("↓", callback_data=f"cm:marginal_item_move:{channel_id}:{field}:{index}:1"))
-            move_buttons.append(InlineKeyboardButton("Remove", callback_data=f"cm:marginal_item_remove:{channel_id}:{field}:{index}"))
+            move_buttons.append(InlineKeyboardButton(
+                "Remove", callback_data=f"cm:mdp:{channel_id}:{field}:item:{index}:-1",
+            ))
             rows.append(move_buttons)
         rows.append([InlineKeyboardButton("← Header & Footer", callback_data=f"cm:marginals:{channel_id}")])
         title = "Header" if field == "header" else "Footer"
@@ -3177,12 +3375,139 @@ class ChannelManager:
         rows = [[InlineKeyboardButton("＋ Add link button", callback_data=f"cm:marginal_button_add:{channel_id}:{field}:{item_index}")]]
         for index, button in enumerate(buttons):
             label = str(button.get("text") or "Open link")[:35]
-            rows.append([InlineKeyboardButton(f"{index + 1}. {label} · Remove", callback_data=f"cm:marginal_button_remove:{channel_id}:{field}:{item_index}:{index}")])
+            style = str(button.get("style") or "default")
+            style_label = {"default": "Default", "primary": "Blue", "success": "Green", "danger": "Red"}.get(style, "Default")
+            rows.append([
+                InlineKeyboardButton(
+                    f"{index + 1}. {label} · {style_label}",
+                    callback_data=f"cm:mbs:{channel_id}:{field}:{item_index}:{index}",
+                ),
+                InlineKeyboardButton(
+                    "Remove", callback_data=f"cm:mdp:{channel_id}:{field}:button:{item_index}:{index}",
+                ),
+            ])
         rows.append([InlineKeyboardButton("← Layout", callback_data=f"cm:marginal_items:{channel_id}:{field}")])
         title = "Header" if field == "header" else "Footer"
         item_label = str(items[item_index].get("text") or items[item_index].get("caption") or (items[item_index].get("media") or {}).get("type") or "Content").splitlines()[0][:40]
-        text = f"<b>{title} buttons · {html_escape(item_label)}</b>\n\nButtons appear directly beneath this message. Add up to 8 links."
+        text = f"<b>{title} buttons · {html_escape(item_label)}</b>\n\nButtons appear directly beneath this message. Tap a button row to choose its color. Removing a button asks for confirmation. Add up to 8 links."
         await self._edit_or_send(update, text, InlineKeyboardMarkup(rows), ParseMode.HTML)
+
+    async def _show_marginal_button_style(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, field: str, item_index: int, button_index: int,
+    ) -> None:
+        if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        settings = await asyncio.to_thread(repository.get_marginals, channel_id) if repository else None
+        items = repository._migrate_marginal_buttons(settings or {}, field) if repository else []
+        buttons = list(items[item_index].get("post_buttons") or []) if 0 <= item_index < len(items) else []
+        if not 0 <= button_index < len(buttons):
+            await self._edit_or_send(update, "That link button is no longer available.", None)
+            return
+        style = str(buttons[button_index].get("style") or "default")
+        choices = [("default", "Default"), ("primary", "Blue"), ("success", "Green"), ("danger", "Red")]
+        rows = [[InlineKeyboardButton(
+            f"{'✓ ' if style == value else ''}{label}",
+            callback_data=f"cm:mbv:{channel_id}:{field}:{item_index}:{button_index}:{value}",
+        )] for value, label in choices]
+        rows.append([InlineKeyboardButton(
+            "← Header/Footer buttons",
+            callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{item_index}",
+        )])
+        await self._edit_or_send(
+            update,
+            "<b>URL button color</b>\nChoose a Telegram preset. Colors may look different across Telegram themes and apps.",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _set_marginal_button_style(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, field: str, item_index: int, button_index: int, style: str,
+    ) -> None:
+        allowed = {"default", "primary", "success", "danger"}
+        if field not in {"header", "footer"} or style not in allowed or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        try:
+            saved = await asyncio.to_thread(
+                repository.set_marginal_button_style,
+                channel_id, field, item_index, button_index, style,
+            ) if repository else False
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] marginal button style update failed channel_id=%s field=%s error=%s",
+                channel_id, field, type(exc).__name__,
+            )
+            saved = False
+        if not saved:
+            await self._edit_or_send(update, "I couldn’t change that button color. Reopen the item and try again.", None)
+            return
+        logger.info(
+            "[channel-manager] marginal button color changed channel_id=%s user_id=%s field=%s item=%s button=%s style=%s",
+            channel_id, update.effective_user.id, field, item_index, button_index, style,
+        )
+        await self._show_marginal_buttons(update, context, channel_id, field, item_index)
+
+    async def _show_marginal_delete_confirmation(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, field: str, target: str,
+        item_index: int, button_index: int = -1,
+    ) -> None:
+        if field not in {"header", "footer"} or target not in {"item", "button"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        settings = await asyncio.to_thread(repository.get_marginals, channel_id) if repository else None
+        items = repository._migrate_marginal_buttons(settings or {}, field) if repository else []
+        if not 0 <= item_index < len(items):
+            await self._edit_or_send(update, "That item is no longer available.", None)
+            return
+        item = items[item_index]
+        if target == "item":
+            label = str(item.get("text") or item.get("caption") or (item.get("media") or {}).get("type") or "content").splitlines()[0][:50]
+            description = f"Remove <b>{html_escape(label)}</b> and its attached link buttons from the {field.title()}? This cannot be undone."
+            cancel_callback = f"cm:marginal_items:{channel_id}:{field}"
+        else:
+            buttons = list(item.get("post_buttons") or [])
+            if not 0 <= button_index < len(buttons):
+                await self._edit_or_send(update, "That link button is no longer available.", None)
+                return
+            label = str(buttons[button_index].get("text") or "Open link")[:50]
+            description = f"Remove the link button <b>{html_escape(label)}</b>? This cannot be undone."
+            cancel_callback = f"cm:marginal_buttons:{channel_id}:{field}:{item_index}"
+        rows = [
+            [InlineKeyboardButton(
+                "Yes, remove", callback_data=f"cm:mdy:{channel_id}:{field}:{target}:{item_index}:{button_index}",
+            )],
+            [InlineKeyboardButton("Cancel", callback_data=cancel_callback)],
+        ]
+        await self._edit_or_send(
+            update, f"<b>Confirm removal</b>\n\n{description}",
+            InlineKeyboardMarkup(rows), ParseMode.HTML,
+        )
+
+    async def _show_marginal_clear_confirmation(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        channel_id: int, field: str,
+    ) -> None:
+        if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        settings = await asyncio.to_thread(repository.get_marginals, channel_id) if repository else {}
+        count = len(settings.get(f"{field}_items") or [])
+        title = field.title()
+        await self._edit_or_send(
+            update,
+            f"<b>Clear {title}?</b>\n\nThis removes all {count} saved {field} items and their link buttons. This cannot be undone.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("Yes, clear all", callback_data=f"cm:mcc:{channel_id}:{field}")],
+                [InlineKeyboardButton("Cancel", callback_data=f"cm:marginals:{channel_id}")],
+            ]), ParseMode.HTML,
+        )
 
     async def _access_denied(self, update: Update) -> None:
         if update.callback_query:
@@ -4114,10 +4439,17 @@ class ChannelManager:
             await query.answer()
             parts = data.split(":")
             action = parts[1] if len(parts) > 1 else ""
-            if action in {"marginals", "marginal_items", "marginal_buttons"}:
+            if (action.startswith("marginal_")
+                    and action not in {"marginal_done", "marginal_cancel", "marginal_remove_staged"}):
                 pending = self._inputs.get(int(update.effective_user.id)) or {}
                 if str(pending.get("kind") or "").startswith("marginal_"):
-                    self._inputs.pop(int(update.effective_user.id), None)
+                    if pending.get("kind") == "marginal_content":
+                        await self._cancel_marginal_content_input(
+                            context, int(update.effective_user.id), pending,
+                            clear_prompt=False,
+                        )
+                    else:
+                        self._inputs.pop(int(update.effective_user.id), None)
             if action == "home":
                 if not await self.has_connected_channel_access(update.effective_user.id, context.bot):
                     await self._access_denied(update)
@@ -4243,6 +4575,54 @@ class ChannelManager:
                 }
                 await self._edit_or_send(update, "Send the button label (up to 40 characters).", InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cm:marginal_buttons:{channel_id}:{field}:{item_index}")]]))
                 return
+            if action == "mbs":
+                await self._show_marginal_button_style(
+                    update, context, int(parts[2]), parts[3], int(parts[4]), int(parts[5]),
+                )
+                return
+            if action == "mbv":
+                await self._set_marginal_button_style(
+                    update, context, int(parts[2]), parts[3], int(parts[4]),
+                    int(parts[5]), parts[6],
+                )
+                return
+            if action == "mdp":
+                await self._show_marginal_delete_confirmation(
+                    update, context, int(parts[2]), parts[3], parts[4],
+                    int(parts[5]), int(parts[6]),
+                )
+                return
+            if action == "mdy":
+                channel_id, field, target = int(parts[2]), parts[3], parts[4]
+                item_index, button_index = int(parts[5]), int(parts[6])
+                if (field not in {"header", "footer"}
+                        or target not in {"item", "button"}
+                        or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None):
+                    await self._access_denied(update)
+                    return
+                repository = self._get_repository()
+                try:
+                    if target == "item":
+                        removed = await asyncio.to_thread(
+                            repository.remove_marginal_item, channel_id, field, item_index,
+                        ) if repository else False
+                    else:
+                        removed = await asyncio.to_thread(
+                            repository.remove_marginal_button, channel_id, field,
+                            button_index, item_index,
+                        ) if repository else False
+                except Exception as exc:
+                    logger.warning("[channel-manager] confirmed marginal removal failed channel_id=%s field=%s target=%s error=%s", channel_id, field, target, type(exc).__name__)
+                    removed = False
+                if not removed:
+                    await self._edit_or_send(update, "That item is no longer available. Reopen the layout and try again.", None)
+                    return
+                logger.info("[channel-manager] marginal content removed channel_id=%s user_id=%s field=%s target=%s item=%s button=%s", channel_id, update.effective_user.id, field, target, item_index, button_index)
+                if target == "item":
+                    await self._show_marginal_items(update, context, channel_id, field)
+                else:
+                    await self._show_marginal_buttons(update, context, channel_id, field, item_index)
+                return
             if action == "marginal_item_move":
                 channel_id, field, index, direction = int(parts[2]), parts[3], int(parts[4]), int(parts[5])
                 if field not in {"header", "footer"} or direction not in {-1, 1} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
@@ -4263,45 +4643,81 @@ class ChannelManager:
                 await self._show_marginal_items(update, context, channel_id, field)
                 return
             if action in {"marginal_item_remove", "marginal_button_remove"}:
-                channel_id, field, index = int(parts[2]), parts[3], int(parts[4])
-                item_index = int(parts[4]) if action == "marginal_button_remove" and len(parts) > 5 else None
-                button_index = int(parts[5]) if item_index is not None else index
+                channel_id, field = int(parts[2]), parts[3]
+                is_button = action == "marginal_button_remove"
+                item_index = int(parts[4]) if is_button else int(parts[4])
+                button_index = int(parts[5]) if is_button else -1
                 if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
                     await self._access_denied(update)
                     return
-                repo = self._get_repository()
-                if repo is None:
-                    await self._storage_error(update)
-                    return
-                try:
-                    if action == "marginal_item_remove":
-                        removed = await asyncio.to_thread(repo.remove_marginal_item, channel_id, field, index)
-                    else:
-                        removed = await asyncio.to_thread(repo.remove_marginal_button, channel_id, field, button_index, item_index)
-                except Exception as exc:
-                    logger.warning("[channel-manager] marginal item removal failed channel_id=%s field=%s error=%s", channel_id, field, type(exc).__name__)
-                    removed = False
-                if not removed:
-                    await self._edit_or_send(update, "That item is no longer available. Please reopen the settings.", None)
-                    return
-                if action == "marginal_item_remove":
-                    await self._show_marginal_items(update, context, channel_id, field)
-                else:
-                    await self._show_marginal_buttons(update, context, channel_id, field, item_index)
+                await self._show_marginal_delete_confirmation(
+                    update, context, channel_id, field,
+                    "button" if is_button else "item", item_index, button_index,
+                )
                 return
             if action == "marginal_set":
                 channel_id, field = int(parts[2]), parts[3]
                 if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
                     await self._access_denied(update)
                     return
+                prompt_message = query.message
                 self._inputs[int(update.effective_user.id)] = {
                     "kind": "marginal_content", "channel_id": channel_id, "field": field,
+                    "pending_marginal_items": [], "preserved_copy_ids": [],
+                    "prompt_chat_id": int(prompt_message.chat.id),
+                    "prompt_message_id": int(prompt_message.message_id),
                     "expires_at": time.time() + self.INPUT_TTL_SECONDS,
                 }
                 await self._edit_or_send(
                     update,
-                    f"Send one message for the {field}: text, photo, video, file, audio, sticker, or a forwarded post. Annie will reuse it automatically. Use /cancel to stop.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"cm:marginals:{channel_id}")]]),
+                    f"Send Header/Footer items one at a time in the order Annie should publish them. You can send text, photos, videos, files, audio, stickers, or forwarded posts. Tap Done when you’re finished.",
+                    self._marginal_prompt_markup(channel_id, field),
+                )
+                return
+            if action in {"marginal_done", "marginal_cancel"}:
+                channel_id, field = int(parts[2]), parts[3]
+                state = self._inputs.get(int(update.effective_user.id)) or {}
+                if (state.get("kind") != "marginal_content"
+                        or int(state.get("channel_id", 0)) != channel_id
+                        or state.get("field") != field):
+                    await self._access_denied(update)
+                    return
+                if action == "marginal_done":
+                    await self._finish_marginal_content_input(update, context, state)
+                else:
+                    await self._cancel_marginal_content_input(
+                        context, int(update.effective_user.id), state,
+                        clear_prompt=False,
+                    )
+                    await self._show_marginal_items(update, context, channel_id, field)
+                return
+            if action == "marginal_remove_staged":
+                channel_id, field, item_index = int(parts[2]), parts[3], int(parts[4])
+                user_id = int(update.effective_user.id)
+                state = self._inputs.get(user_id) or {}
+                items = list(state.get("pending_marginal_items") or [])
+                if (state.get("kind") != "marginal_content"
+                        or int(state.get("channel_id", 0)) != channel_id
+                        or state.get("field") != field
+                        or not 0 <= item_index < len(items)):
+                    await self._access_denied(update)
+                    return
+                removed = items.pop(item_index)
+                source = removed.get("source_message") or {}
+                source_chat_id = source.get("chat_id")
+                source_message_id = source.get("message_id")
+                if source_chat_id and source_message_id:
+                    await self._delete_message(context.bot, int(source_chat_id), int(source_message_id))
+                    state["preserved_copy_ids"] = [
+                        int(value) for value in state.get("preserved_copy_ids") or []
+                        if int(value) != int(source_message_id)
+                    ]
+                state["pending_marginal_items"] = items
+                state["expires_at"] = time.time() + self.INPUT_TTL_SECONDS
+                await self._update_marginal_prompt(context, state)
+                logger.info(
+                    "[channel-manager] staged marginal item removed channel_id=%s user_id=%s field=%s index=%s remaining=%s",
+                    channel_id, user_id, field, item_index, len(items),
                 )
                 return
             if action == "marginal_sticker":
@@ -4311,17 +4727,25 @@ class ChannelManager:
                     return
                 self._inputs[int(update.effective_user.id)] = {
                     "kind": "marginal_content", "channel_id": channel_id, "field": "footer",
+                    "pending_marginal_items": [], "preserved_copy_ids": [],
+                    "prompt_chat_id": int(query.message.chat.id),
+                    "prompt_message_id": int(query.message.message_id),
                     "expires_at": time.time() + self.INPUT_TTL_SECONDS,
                 }
                 await self._edit_or_send(
                     update,
-                    "Send text, a photo, video, file, audio, sticker, or a forwarded post for Annie to reuse as the footer.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"cm:marginals:{channel_id}")]]),
+                    "Send footer items one at a time in the order Annie should publish them. Tap Done when you’re finished.",
+                    self._marginal_prompt_markup(channel_id, "footer"),
                 )
                 return
-            if action == "marginal_clear":
+            if action in {"mdc", "marginal_clear"}:
+                await self._show_marginal_clear_confirmation(
+                    update, context, int(parts[2]), parts[3],
+                )
+                return
+            if action == "mcc":
                 channel_id, field = int(parts[2]), parts[3]
-                if field not in {"header", "footer", "footer_sticker"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
+                if field not in {"header", "footer"} or await self._channel_for_action(channel_id, update.effective_user.id, context.bot) is None:
                     await self._access_denied(update)
                     return
                 repo = self._get_repository()
@@ -6337,6 +6761,98 @@ class ChannelManager:
         except Exception as exc:
             logger.debug("[channel-manager] composer prompt cleanup skipped error=%s", type(exc).__name__)
 
+    @staticmethod
+    def _marginal_prompt_markup(
+        channel_id: int, field: str,
+        items: list[dict[str, Any]] | None = None,
+    ) -> InlineKeyboardMarkup:
+        rows = []
+        for index, item in enumerate(items or []):
+            media_type = str((item.get("media") or {}).get("type") or "")
+            text = str(item.get("text") or item.get("caption") or "").strip()
+            label = media_type.title() if media_type else next(
+                (line.strip() for line in text.splitlines() if line.strip()), "Text"
+            )
+            rows.append([InlineKeyboardButton(
+                f"Remove {index + 1} · {label[:35]}",
+                callback_data=f"cm:marginal_remove_staged:{channel_id}:{field}:{index}",
+            )])
+        rows.extend([
+            [InlineKeyboardButton("Done", callback_data=f"cm:marginal_done:{channel_id}:{field}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"cm:marginal_cancel:{channel_id}:{field}")],
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _update_marginal_prompt(
+        self, context: ContextTypes.DEFAULT_TYPE, state: dict[str, Any],
+    ) -> None:
+        items = list(state.get("pending_marginal_items") or [])
+        field = "Header" if state.get("field") == "header" else "Footer"
+        count = len(items)
+        text = (
+            f"<b>{field} items · {count} added</b>\n\n"
+            "Send another message to add it after these items, or tap Done to save them in this order."
+        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=int(state["prompt_chat_id"]),
+                message_id=int(state["prompt_message_id"]),
+                text=text, parse_mode=ParseMode.HTML,
+                reply_markup=self._marginal_prompt_markup(
+                    int(state["channel_id"]), str(state["field"]), items,
+                ),
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                logger.info("[channel-manager] marginal input prompt update skipped channel_id=%s error=%s", state.get("channel_id"), type(exc).__name__)
+        except Exception as exc:
+            logger.info("[channel-manager] marginal input prompt update failed channel_id=%s error=%s", state.get("channel_id"), type(exc).__name__)
+
+    async def _cancel_marginal_content_input(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int,
+        state: dict[str, Any], *, clear_prompt: bool = True,
+    ) -> None:
+        for message_id in list(state.get("preserved_copy_ids") or []):
+            await self._delete_message(context.bot, user_id, int(message_id))
+        self._inputs.pop(user_id, None)
+        if clear_prompt:
+            await self._clear_input_prompt(context, state)
+
+    async def _finish_marginal_content_input(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        state: dict[str, Any],
+    ) -> None:
+        user_id = int(update.effective_user.id)
+        channel_id = int(state["channel_id"])
+        field = str(state["field"])
+        items = list(state.get("pending_marginal_items") or [])
+        if not items:
+            await update.callback_query.answer("Send at least one item first.", show_alert=True)
+            return
+        if await self._channel_for_action(channel_id, user_id, context.bot) is None:
+            await self._access_denied(update)
+            return
+        repository = self._get_repository()
+        try:
+            saved = await asyncio.to_thread(
+                repository.add_marginal_items, channel_id, field, items,
+            ) if repository else False
+        except Exception as exc:
+            logger.warning(
+                "[channel-manager] marginal batch save failed channel_id=%s user_id=%s field=%s count=%s error=%s",
+                channel_id, user_id, field, len(items), type(exc).__name__,
+            )
+            saved = False
+        if not saved:
+            await update.callback_query.answer("I couldn’t save these items. They’re still staged; try Done again.", show_alert=True)
+            return
+        self._inputs.pop(user_id, None)
+        logger.info(
+            "[channel-manager] marginal batch saved channel_id=%s user_id=%s field=%s count=%s",
+            channel_id, user_id, field, len(items),
+        )
+        await self._show_marginal_items(update, context, channel_id, field)
+
     async def _finish_without_caption(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str,
     ) -> None:
@@ -6631,8 +7147,11 @@ class ChannelManager:
         if not state:
             return
         if float(state.get("expires_at", 0)) < time.time():
-            self._inputs.pop(user_id, None)
-            await self._clear_input_prompt(context, state)
+            if state.get("kind") == "marginal_content":
+                await self._cancel_marginal_content_input(context, user_id, state)
+            else:
+                self._inputs.pop(user_id, None)
+                await self._clear_input_prompt(context, state)
             await update.effective_message.reply_text(
                 "That step expired. Open Channel Manager and start again.",
                 reply_markup=ReplyKeyboardRemove() if state.get("kind") == "channel_admin_target" else None,
@@ -6647,6 +7166,11 @@ class ChannelManager:
                     await update.effective_message.reply_text("I couldn’t clear those extra messages. Please try /cancel again.")
                     return
                 await update.effective_message.reply_text("Cancelled. Your saved draft is unchanged.")
+            elif state.get("kind") == "marginal_content":
+                await self._cancel_marginal_content_input(context, user_id, state)
+                await update.effective_message.reply_text(
+                    f"Cancelled adding {state.get('field')} items. Your saved layout is unchanged."
+                )
             else:
                 self._inputs.pop(user_id, None)
                 await self._clear_input_prompt(context, state)
@@ -6683,6 +7207,11 @@ class ChannelManager:
                     await update.effective_message.reply_text("I couldn’t clear those extra messages. Please try /cancel again.")
                     return
                 await update.effective_message.reply_text("Cancelled. Your saved draft is unchanged.")
+            elif state.get("kind") == "marginal_content":
+                await self._cancel_marginal_content_input(context, user_id, state)
+                await update.effective_message.reply_text(
+                    f"Cancelled adding {state.get('field')} items. Your saved layout is unchanged."
+                )
             else:
                 self._inputs.pop(user_id, None)
                 await self._clear_input_prompt(context, state)
@@ -6698,12 +7227,18 @@ class ChannelManager:
         channel_id = int(state["channel_id"])
         channel = await self._channel_for_action(channel_id, user_id, context.bot)
         if channel is None:
-            self._inputs.pop(user_id, None)
+            if state.get("kind") == "marginal_content":
+                await self._cancel_marginal_content_input(context, user_id, state)
+            else:
+                self._inputs.pop(user_id, None)
             await update.effective_message.reply_text("You no longer have posting access to that channel.")
             return
         repo = self._get_repository()
         if repo is None:
-            self._inputs.pop(user_id, None)
+            if state.get("kind") == "marginal_content":
+                await self._cancel_marginal_content_input(context, user_id, state)
+            else:
+                self._inputs.pop(user_id, None)
             await update.effective_message.reply_text("Channel Manager storage is unavailable. Please try again later.")
             return
         kind = state["kind"]
@@ -6821,13 +7356,14 @@ class ChannelManager:
         if kind in {"marginal_content", "marginal_sticker"}:
             content = self._content_from_message(message, "telegram")
             if content is None:
-                await message.reply_text("Send text, a photo, video, file, audio, sticker, or a forwarded post.")
+                await message.reply_text("Send text, a photo, video, file, audio, sticker, or a forwarded post. Your staged items are unchanged.")
                 return
             field = str(state.get("field") or "")
             if field not in {"header", "footer"}:
                 self._inputs.pop(user_id, None)
                 await message.reply_text("That setting expired. Open Header & Footer and try again.")
                 return
+            pending_items = list(state.get("pending_marginal_items") or [])
             input_id = content.pop("input_message_id", None)
             preserved_copy_id: int | None = None
             if content.get("source_message"):
@@ -6839,6 +7375,7 @@ class ChannelManager:
                     )
                     preserved_copy_id = int(copied.message_id)
                     content["source_message"] = {"chat_id": user_id, "message_id": int(copied.message_id)}
+                    state.setdefault("preserved_copy_ids", []).append(preserved_copy_id)
                 except Exception as exc:
                     logger.warning("[channel-manager] marginal content preservation failed channel_id=%s user_id=%s type=%s error=%s", channel_id, user_id, field, type(exc).__name__)
                     await message.reply_text("I couldn’t save that item for reuse. Try sending it directly or forwarding it again.")
@@ -6848,26 +7385,16 @@ class ChannelManager:
             if len(value) > max_length:
                 await message.reply_text(f"That message is too long. Telegram allows up to {max_length} characters here.")
                 return
-            try:
-                await asyncio.to_thread(repo.add_marginal_item, channel_id, field, content)
-                saved = True
-            except Exception as exc:
-                logger.warning("[channel-manager] post margin save failed channel_id=%s user_id=%s field=%s error=%s", channel_id, user_id, field, type(exc).__name__)
-                saved = False
-            if not saved:
-                if preserved_copy_id:
-                    await self._delete_message(context.bot, user_id, preserved_copy_id)
-                await message.reply_text("I couldn’t save that content. Please try again.")
-                return
-            self._inputs.pop(user_id, None)
-            if input_id and preserved_copy_id:
-                await self._delete_message(context.bot, message.chat.id, int(input_id))
-            await message.reply_text(
-                f"{field.title()} saved for {html_escape(str(channel.get('name') or 'Channel'))}. Annie will add it automatically.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open settings", callback_data=f"cm:marginals:{channel_id}")]]),
+            pending_items.append(content)
+            state["pending_marginal_items"] = pending_items
+            state["expires_at"] = time.time() + self.INPUT_TTL_SECONDS
+            await self._delete_message(context.bot, message.chat.id, int(input_id or message.message_id))
+            await self._update_marginal_prompt(context, state)
+            logger.info(
+                "[channel-manager] marginal item staged channel_id=%s user_id=%s field=%s count=%s type=%s",
+                channel_id, user_id, field, len(pending_items),
+                (content.get("media") or {}).get("type") or "text",
             )
-            logger.info("[channel-manager] post margin saved channel_id=%s user_id=%s field=%s", channel_id, user_id, field)
             return
         if kind == "marginal_button_label":
             label = (message.text or "").strip()
@@ -7478,6 +8005,9 @@ class ChannelManager:
         logger.info("[channel-manager] post published channel_id=%s user_id=%s post_id=%s messages=%s", record["channel_id"], update.effective_user.id, record_id, len(sent_ids))
         backup_failures = 0
         if receipt_saved:
+            await self._enforce_published_record_limit(
+                context.bot, repo, int(record["channel_id"]),
+            )
             backup_failures = await self._auto_forward_published(
                 context.bot, int(record["channel_id"]), sent_messages,
                 {**record, "marginal_snapshot": settings},
@@ -7679,6 +8209,22 @@ class ChannelManager:
                 await asyncio.sleep(30)
         while True:
             try:
+                if time.monotonic() >= self._next_retention_cleanup_at:
+                    try:
+                        await self._cleanup_stale_drafts(bot, repo)
+                        self._next_retention_cleanup_at = (
+                            time.monotonic() + self.RETENTION_CLEANUP_INTERVAL_SECONDS
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self._next_retention_cleanup_at = (
+                            time.monotonic() + self.RETENTION_CLEANUP_RETRY_SECONDS
+                        )
+                        logger.warning(
+                            "[channel-manager] stale draft cleanup failed error=%s",
+                            type(exc).__name__,
+                        )
                 record = await asyncio.to_thread(repo.claim_due, datetime.now(timezone.utc))
                 if record:
                     await self._publish_scheduled(bot, repo, record)
@@ -7728,6 +8274,7 @@ class ChannelManager:
                 logger.error("[channel-manager] scheduled post receipt save failed channel_id=%s post_id=%s error=%s", channel_id, record_id, type(exc).__name__)
                 await self._notify_creator(bot, record, "Your scheduled post was sent, but Annie couldn’t save the receipt. Check the channel before retrying.")
                 return
+            await self._enforce_published_record_limit(bot, repo, channel_id)
             logger.info("[channel-manager] scheduled post published channel_id=%s post_id=%s messages=%s", channel_id, record_id, len(sent_ids))
             backup_failures = await self._auto_forward_published(
                 bot, channel_id, sent_messages, {**record, "marginal_snapshot": settings}
